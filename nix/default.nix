@@ -3,11 +3,34 @@
 # Builds the Python library + CLI as a single derivation.
 # `buildPythonApplication` registers the console_scripts entry point
 # from pyproject.toml and wraps the binary with the correct PYTHONPATH.
+#
+# The kraken-python API wrapper is passed in as a flake input source
+# (`kraken-python-src`) and built inline as a Python module so the trading
+# bot can import `kraken_api` from the same interpreter.
 
 { lib
 , python3
+, kraken-python-src
 }:
 
+let
+  kraken-python = python3.pkgs.buildPythonPackage {
+    pname = "kraken-python";
+    version = "0.4.0";
+    format = "pyproject";
+    src = kraken-python-src;
+    nativeBuildInputs = with python3.pkgs; [
+      setuptools
+      wheel
+    ];
+    propagatedBuildInputs = with python3.pkgs; [
+      requests
+      websocket-client
+      python-dotenv
+    ];
+    doCheck = false;
+  };
+in
 python3.pkgs.buildPythonApplication {
   pname = "kraken-trading-bot";
   version = "0.1.0";
@@ -35,7 +58,7 @@ python3.pkgs.buildPythonApplication {
   ];
 
   propagatedBuildInputs = with python3.pkgs; [
-    (python3.pkgs.toPythonModule (pkgs.callPackage ./nix/kraken-python.nix { }))
+    kraken-python
     python-dotenv
     numpy
     pandas
