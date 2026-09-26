@@ -40,25 +40,15 @@
       nixosModules.default = import ./nix/module.nix;
 
       # ── Dev Shell ─────────────────────────────────────────────────────────
-      # `nix develop` drops you into a shell with Python, the kraken-python
-      # wrapper, pandas/numpy/gymnasium, and pytest on PATH.
+      # `nix develop` drops you into a shell with the kraken-trading-bot CLI,
+      # the kraken-python wrapper, pandas/numpy/gymnasium, and pytest on PATH.
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          kpkg = pkgs.python3.pkgs.buildPythonPackage {
-            pname = "kraken-python";
-            version = "0.4.0";
-            format = "pyproject";
-            src = kraken-python.outPath;
-            nativeBuildInputs = with pkgs.python3.pkgs; [ setuptools wheel ];
-            propagatedBuildInputs = with pkgs.python3.pkgs; [
-              requests
-              websocket-client
-              python-dotenv
-            ];
+          bot-pkg = pkgs.callPackage ./nix/default.nix {
+            kraken-python-src = kraken-python.outPath;
           };
           python = pkgs.python3.withPackages (ps: with ps; [
-            kpkg
             python-dotenv
             pytest
             numpy
@@ -70,10 +60,10 @@
         in
         {
           default = pkgs.mkShell {
-            packages = [ python ];
+            packages = [ python bot-pkg ];
             shellHook = ''
               echo "kraken-trading-bot dev shell"
-              python -c 'import kraken_trading_bot; print("kraken_trading_bot:", kraken_trading_bot.__version__)'
+              command -v kraken-trading-bot && kraken-trading-bot --version
               python -c 'import kraken_api, pandas, numpy, gymnasium, yaml; print("deps: kraken-python, pandas, numpy, gymnasium, pyyaml")'
             '';
           };
