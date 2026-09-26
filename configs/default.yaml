@@ -1,0 +1,50 @@
+# Default training configuration for the kraken-trading-bot RL pipeline.
+# The training CLI (:class:`kraken_trading_bot.rl`) and paper-trading
+# runner load per-model overrides from `models/{TICKER_ID}/{model_name}/config.yaml`.
+# Values here are sane defaults; copy this file per run to customize.
+
+# --- Market / data ------------------------------------------------------
+# Ticker the environment is specialized for. Use Kraken pair notation.
+ticker: "ETH/USD"
+
+# Raw OHLCV timeframe for one environment bar (minutes).
+ohlcv_interval_minutes: 60
+
+# Starting quote-currency balance for the simulated account.
+initial_balance: 10000.0
+
+# Simulated execution costs.
+fee_rate: 0.0         # fractional fee per executed order
+slippage: 0.0         # fractional adverse price move on fills
+allow_short: false    # whether sell actions may open a short position
+
+# --- Environment --------------------------------------------------------
+# "continuous" -> Box(3) [buy_amount, sell_amount, hold_confidence]
+# "discrete"   -> Discrete(3) [0=buy, 1=hold, 2=sell]
+action_space: "continuous"
+
+# Reward shaping weights (see RewardSpec). Use "mode" presets:
+#   mode: "pnl"     -> PnL-based reward only
+#   mode: "sharpe"  -> risk-adjusted (per-step Sharpe proxy) reward
+reward:
+  mode: "pnl"
+  pnl: 1.0
+  risk_adjusted: 0.0
+  drawdown_penalty: 0.0
+  holding_penalty: 0.0
+  pnl_scale: 0.0001
+  risk_window: 20
+  penalize_drawdown: true
+  hold_confidence_threshold: 0.5
+
+# --- Feature pipeline ---------------------------------------------------
+# Look-back windows (in bars) for rolling features; e.g. [1, 4, 24] gives
+# 1h, 4h and 1d views when bars are 1h candles.
+feature_windows: [1, 4, 24]
+# Subset of: price, technical, volume, microstructure
+feature_groups: ["price", "technical", "volume", "microstructure"]
+
+# --- Model metadata -----------------------------------------------------
+# Directory layout: models/{ticker_id}/{model_name}/
+#   model.zip, normalization.npz, config.yaml
+model_name: "ppo_eth_01"

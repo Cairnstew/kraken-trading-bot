@@ -37,6 +37,10 @@ python3.pkgs.buildPythonApplication {
   propagatedBuildInputs = with python3.pkgs; [
     (python3.pkgs.toPythonModule (pkgs.callPackage ./nix/kraken-python.nix { }))
     python-dotenv
+    numpy
+    pandas
+    gymnasium
+    pyyaml
   ];
 
   # Live-API verification requires credentials; skip in the Nix build.
