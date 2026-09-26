@@ -12,12 +12,33 @@ with reinforcement learning:
   per-ticker mean/std statistics saved/loaded as ``normalization.npz``.
 - :class:`~kraken_trading_bot.rl.environment.RewardSpec` — configurable
   reward-shaping weights (PnL, risk-adjusted, drawdown, holding).
+- :class:`~kraken_trading_bot.rl.registry.ModelRecord` and friends — a
+  per-ticker model registry under ``models/{TICKER_ID}/{model_name}/``.
+- :class:`~kraken_trading_bot.rl.agent.RLAgent` — a thin stable-baselines3
+  PPO wrapper for train/load/predict.
+- :func:`~kraken_trading_bot.rl.data.fetch_ohlc_dataframe` and
+  :func:`~kraken_trading_bot.rl.data.prepare_episode` — OHLC data loading
+  and episode slicing.
+- :func:`~kraken_trading_bot.rl.train.train_ticker` — end-to-end
+  training orchestrator.
+- :func:`~kraken_trading_bot.rl.backtest.backtest_model` — walk-forward
+  backtesting with standard performance metrics.
 """
 
 from __future__ import annotations
 
+from .agent import RLAgent
+from .backtest import BacktestResult, backtest_model
+from .data import (
+    NotEnoughDataError,
+    candles_to_dataframe,
+    fetch_ohlc_dataframe,
+    prepare_episode,
+)
 from .environment import RewardSpec, TradingEnvironment
 from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
+from .registry import ModelRecord, list_models, register_model
+from .train import build_train_config, load_train_config, pair_from_ticker_id, train_ticker
 
 __all__ = [
     "TradingEnvironment",
@@ -25,4 +46,18 @@ __all__ = [
     "NormalizationStats",
     "RewardSpec",
     "normalize_ticker_id",
+    "RLAgent",
+    "ModelRecord",
+    "list_models",
+    "register_model",
+    "NotEnoughDataError",
+    "candles_to_dataframe",
+    "fetch_ohlc_dataframe",
+    "prepare_episode",
+    "load_train_config",
+    "build_train_config",
+    "pair_from_ticker_id",
+    "train_ticker",
+    "BacktestResult",
+    "backtest_model",
 ]
