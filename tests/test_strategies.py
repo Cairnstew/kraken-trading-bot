@@ -1,25 +1,24 @@
 """Tests for the trading strategies."""
 
 from decimal import Decimal
-from datetime import datetime
 from typing import Sequence
 
-from kraken_trading_bot.models import Candle, OrderBook, OrderBookLevel, Ticker
+from kraken_api.models import Candle, Ticker
 from kraken_trading_bot.strategies.sma import SMAcrossoverStrategy
 
 
 def _make_candles(closes: Sequence[float | int]) -> list[Candle]:
-    """Helper to create candles from close prices."""
+    """Helper to create candles from close prices (kraken_api.models.Candle)."""
     return [
         Candle(
             pair="XBT/USD",
-            time=datetime(2024, 1, 1, i),
-            open=Decimal(str(c - 100)),
-            high=Decimal(str(c + 100)),
-            low=Decimal(str(c - 100)),
-            close=Decimal(str(c)),
-            vwap=Decimal(str(c)),
-            volume=Decimal("100"),
+            time=1704067200 + i * 3600,
+            open=str(c - 100),
+            high=str(c + 100),
+            low=str(c - 100),
+            close=str(c),
+            vwap=str(c),
+            volume="100",
             count=100,
         )
         for i, c in enumerate(closes)
@@ -27,18 +26,18 @@ def _make_candles(closes: Sequence[float | int]) -> list[Candle]:
 
 
 def _make_ticker(last: float) -> Ticker:
-    """Helper to create a ticker."""
+    """Helper to create a ticker (kraken_api.models.Ticker)."""
     return Ticker(
         pair="XBT/USD",
-        bid=Decimal(str(last - 10)),
-        ask=Decimal(str(last + 10)),
-        last=Decimal(str(last)),
-        volume_24h=Decimal("1000"),
-        vwap_24h=Decimal(str(last)),
-        high_24h=Decimal(str(last + 500)),
-        low_24h=Decimal(str(last - 500)),
-        trades_24h=5000,
-        timestamp=datetime.utcnow(),
+        bid=[str(last - 10)],
+        ask=[str(last + 10)],
+        last=[str(last)],
+        volume=["100", "1000"],
+        vwap=[str(last), str(last)],
+        trade_count=[100, 5000],
+        low=[str(last - 500), str(last - 500)],
+        high=[str(last + 500), str(last + 500)],
+        open_price=[str(last)],
     )
 
 
