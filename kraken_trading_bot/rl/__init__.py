@@ -23,6 +23,10 @@ with reinforcement learning:
   training orchestrator.
 - :func:`~kraken_trading_bot.rl.backtest.backtest_model` — walk-forward
   backtesting with standard performance metrics.
+- :class:`~kraken_trading_bot.rl.paper_trade.PaperTrader` and
+  :func:`~kraken_trading_bot.rl.paper_trade.run_paper_trader` — live
+  paper-trading runner that steps a trained model against live market
+  data through ``KrakenManager.paper()`` (no real orders).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from .data import (
 )
 from .environment import RewardSpec, TradingEnvironment
 from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
+from .paper_trade import PaperSignal, PaperTrader, run_paper_trader
 from .registry import ModelRecord, list_models, register_model
 from .train import build_train_config, load_train_config, pair_from_ticker_id, train_ticker
 
@@ -60,4 +65,7 @@ __all__ = [
     "train_ticker",
     "BacktestResult",
     "backtest_model",
+    "PaperSignal",
+    "PaperTrader",
+    "run_paper_trader",
 ]

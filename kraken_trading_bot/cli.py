@@ -90,6 +90,44 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── orders command ─────────────────────────────────────────────────────
     sub.add_parser("orders", help="Show open orders")
 
+    # ── paper-trade command ────────────────────────────────────────────────
+    paper_parser = sub.add_parser(
+        "paper-trade",
+        help="Run a trained RL model in live paper-trade mode (no real orders).",
+    )
+    paper_parser.add_argument(
+        "--ticker",
+        required=True,
+        help="Ticker the model was trained for, e.g. ETH_USD.",
+    )
+    paper_parser.add_argument(
+        "--model",
+        required=True,
+        help="Model name under the ticker, e.g. ppo_eth_01.",
+    )
+    paper_parser.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Seconds between ticks (default: 60).",
+    )
+    paper_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Run this many ticks then stop (default: run until Ctrl-C).",
+    )
+    paper_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print would-be orders without executing on the paper manager.",
+    )
+    paper_parser.add_argument(
+        "--models-root",
+        default="models",
+        help="Model registry root (default: models).",
+    )
+
     return parser
 
 
@@ -195,6 +233,35 @@ def cmd_orders(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_paper_trade(args: argparse.Namespace) -> int:
+    """Run a trained RL model in live paper-trade mode (no real orders)."""
+    from kraken_trading_bot.rl.paper_trade import run_paper_trader
+    from kraken_trading_bot.rl.registry import scan_model
+
+    record = scan_model(args.ticker, args.model, root=args.models_root)
+    if not record.is_trained():
+        print(
+            f"Model {args.ticker}/{args.model} is not trained: no model.zip / "
+            f"normalization.npz found under {record.root}. Train it first "
+            f"(kraken-trading-bot rl-train or rl.train_ticker).",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        run_paper_trader(
+            args.ticker,
+            args.model,
+            iterations=args.iterations,
+            interval=args.interval,
+            dry_run=args.dry_run,
+            models_root=args.models_root,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Main entry point for the CLI."""
     parser = _build_parser()
@@ -209,6 +276,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "balance": cmd_balance,
         "ticker": cmd_ticker,
         "orders": cmd_orders,
+        "paper-trade": cmd_paper_trade,
     }
 
     if args.command is None:
