@@ -8,7 +8,8 @@ A trading bot framework using the [kraken-python](https://github.com/Cairnstew/k
 - **SMA Crossover Strategy**: Included trend-following strategy with golden/death cross detection
 - **Trading Engine**: Orchestrates strategy execution with paper mode support
 - **Nix Integration**: Flake packaging, NixOS module with credential management
-- **CLI**: Commands for `balance`, `ticker`, `orders`, and `run`
+- **CLI**: Commands for `balance`, `ticker`, `orders`, `run`, and the RL
+  pipeline (`train`, `backtest`, `models`, `paper-trade`)
 
 ## Installation
 
@@ -63,6 +64,33 @@ kraken-trading-bot run --paper
 
 # Run with custom settings
 kraken-trading-bot run --pair XBT/USD --pair ETH/USD --short-period 10 --long-period 30 --interval 30
+```
+
+### RL CLI
+
+Train, evaluate, and list reinforcement-learning models. The RL pipeline
+trains a PPO agent per ticker; artifacts live under
+`models/{TICKER_ID}/{model_name}/` (`model.zip`, `normalization.npz`,
+`config.yaml`). Tickers use underscore notation (`ETH_USD`).
+
+```bash
+# Train a new PPO model for ETH/USD (fetches public OHLC; no credentials needed)
+kraken-trading-bot train --ticker ETH_USD --model ppo_eth_01
+
+# Customise the run: config file, data pages, training budget, execution costs
+kraken-trading-bot train --ticker ETH_USD --model ppo_eth_01 \
+  --config configs/default.yaml --pages 8 --timesteps 20000 \
+  --action-space discrete --fee-rate 0.0026 --slippage 0.0005
+
+# Backtest a trained model on fresh OHLC data
+kraken-trading-bot backtest --ticker ETH_USD --model ppo_eth_01
+
+# List registered models (readable table, or JSON with --json; filter by ticker)
+kraken-trading-bot models
+kraken-trading-bot models --ticker ETH_USD --json
+
+# Paper-trade a trained model (no real orders)
+kraken-trading-bot paper-trade --ticker ETH_USD --model ppo_eth_01 --iterations 100
 ```
 
 ### Python API
