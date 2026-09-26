@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kraken-trading-bot"
+version = "0.1.0"
+description = "A trading bot framework for the Kraken Spot REST + WebSocket v2 APIs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "websocket-client>=1.7",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+kraken-trading-bot = "kraken_trading_bot.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["kraken_trading_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: hits the live Kraken REST/WebSocket APIs (requires KRAKEN_API_KEY/SECRET + RUN_LIVE=1)",
+]
