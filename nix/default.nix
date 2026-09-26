@@ -64,6 +64,7 @@ python3.pkgs.buildPythonApplication {
     pandas
     gymnasium
     pyyaml
+    stable-baselines3
   ];
 
   # Live-API verification requires credentials; skip in the Nix build.

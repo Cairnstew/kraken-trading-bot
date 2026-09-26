@@ -65,6 +65,7 @@
             pandas
             gymnasium
             pyyaml
+            stable-baselines3
           ]);
         in
         {
