@@ -6,7 +6,9 @@ import logging
 import time
 from typing import Any
 
-from .client import KrakenClient
+from kraken_api import KrakenManager
+from kraken_api.models import Candle, OrderBook, Ticker
+
 from .strategies.base import Strategy, Signal
 
 _LOGGER = logging.getLogger(__name__)
@@ -15,11 +17,11 @@ _LOGGER = logging.getLogger(__name__)
 class TradingEngine:
     """Main trading engine that orchestrates strategy execution.
 
-    The engine connects a KrakenClient with one or more trading strategies,
+    The engine connects a KrakenManager with one or more trading strategies,
     manages the trading loop, and handles order execution.
 
     Parameters:
-        client: A configured KrakenClient instance.
+        manager: A configured KrakenManager instance.
         strategies: List of Strategy instances to run.
         pairs: List of trading pairs to monitor.
         interval: Seconds between trading loop iterations.
@@ -28,13 +30,13 @@ class TradingEngine:
 
     def __init__(
         self,
-        client: KrakenClient,
+        manager: KrakenManager,
         strategies: list[Strategy],
         pairs: list[str] | None = None,
         interval: float = 60.0,
         paper_mode: bool = False,
     ) -> None:
-        self.client = client
+        self.manager = manager
         self.strategies = strategies
         self.pairs = pairs or ["XBT/USD"]
         self.interval = interval
@@ -54,23 +56,20 @@ class TradingEngine:
 
         try:
             # Fetch ticker
-            tickers = self.client.ticker(pair)
-            if tickers:
-                data["ticker"] = tickers.get(pair)
+            data["ticker"] = self.manager.ticker(pair)
         except Exception as e:
             _LOGGER.warning("Failed to fetch ticker for %s: %s", pair, e)
 
         try:
             # Fetch recent candles (1-hour candles, last 100)
-            candles = self.client.ohlc(pair, interval=60)
+            candles, _ = self.manager.ohlc(pair, interval=60)
             data["candles"] = candles[-100:] if candles else []
         except Exception as e:
             _LOGGER.warning("Failed to fetch candles for %s: %s", pair, e)
 
         try:
             # Fetch order book
-            order_book = self.client.order_book(pair, count=10)
-            data["order_book"] = order_book
+            data["order_book"] = self.manager.order_book(pair, count=10)
         except Exception as e:
             _LOGGER.warning("Failed to fetch order book for %s: %s", pair, e)
 
@@ -100,13 +99,22 @@ class TradingEngine:
             return True
 
         try:
-            result = self.client.add_order(
-                pair=signal.pair,
-                side=signal.action,
-                ordertype="limit" if signal.price else "market",
-                volume=str(signal.volume),
-                price=str(signal.price) if signal.price else None,
-            )
+            # Use the manager's buy/sell helpers
+            if signal.action == "buy":
+                result = self.manager.buy(
+                    pair=signal.pair,
+                    volume=str(signal.volume),
+                    price=str(signal.price) if signal.price else None,
+                )
+            elif signal.action == "sell":
+                result = self.manager.sell(
+                    pair=signal.pair,
+                    volume=str(signal.volume),
+                    price=str(signal.price) if signal.price else None,
+                )
+            else:
+                return True
+
             _LOGGER.info("Order placed: %s", result)
             return True
         except Exception as e:

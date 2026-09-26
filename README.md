@@ -1,14 +1,14 @@
 # kraken-trading-bot
 
-A trading bot framework for the Kraken Spot REST + WebSocket v2 APIs.
+A trading bot framework using the [kraken-python](https://github.com/Cairnstew/kraken-python) API wrapper.
 
 ## Features
 
-- **Kraken API Client**: Typed Python wrapper for Kraken's REST API
-- **Trading Strategies**: Pluggable strategy framework (SMA crossover included)
-- **Trading Engine**: Orchestrates strategy execution and order management
-- **Paper Trading**: Simulate trades without real money
-- **Nix Integration**: Flake-based packaging, NixOS module, and dev shell
+- **Strategy Framework**: Pluggable abstract base class for custom trading strategies
+- **SMA Crossover Strategy**: Included trend-following strategy with golden/death cross detection
+- **Trading Engine**: Orchestrates strategy execution with paper mode support
+- **Nix Integration**: Flake packaging, NixOS module with credential management
+- **CLI**: Commands for `balance`, `ticker`, `orders`, and `run`
 
 ## Installation
 
@@ -30,7 +30,7 @@ pip install -e .
 
 ## Configuration
 
-Set your Kraken API credentials:
+Set your Kraken API credentials (or use the kraken-python .env file):
 
 ```bash
 cp .env.example .env
@@ -68,12 +68,12 @@ kraken-trading-bot run --pair XBT/USD --pair ETH/USD --short-period 10 --long-pe
 ### Python API
 
 ```python
-from kraken_trading_bot import KrakenClient
+from kraken_api import KrakenManager
 from kraken_trading_bot.strategies import SMAcrossoverStrategy
 from kraken_trading_bot.engine import TradingEngine
 
-# Create client
-client = KrakenClient.from_env()
+# Create manager (uses kraken-python)
+manager = KrakenManager.from_env()
 
 # Create strategy
 strategy = SMAcrossoverStrategy(
@@ -84,7 +84,7 @@ strategy = SMAcrossoverStrategy(
 
 # Create and run engine
 engine = TradingEngine(
-    client=client,
+    manager=manager,
     strategies=[strategy],
     pairs=["XBT/USD"],
     paper_mode=True,  # Set to False for live trading
@@ -158,7 +158,7 @@ class MyStrategy(Strategy):
     def tick(self, data: dict) -> Signal:
         # Your trading logic here
         ticker = data.get("ticker")
-        if ticker and ticker.last < Decimal("50000"):
+        if ticker and ticker.last_price < Decimal("50000"):
             return Signal(
                 action="buy",
                 pair=self.pair,

@@ -8,7 +8,6 @@ import sys
 from typing import Sequence
 
 from . import __version__, setup_logging
-from .client import KrakenClient
 from .engine import TradingEngine
 from .strategies.sma import SMAcrossoverStrategy
 
@@ -98,7 +97,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Run the trading bot."""
     from decimal import Decimal
 
-    client = KrakenClient.from_env()
+    from kraken_api import KrakenManager
+
+    # Create manager (paper or live)
+    if args.paper:
+        manager = KrakenManager.paper()
+    else:
+        manager = KrakenManager.from_env()
 
     # Create strategy
     strategy = SMAcrossoverStrategy(
@@ -110,7 +115,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     # Create and run engine
     engine = TradingEngine(
-        client=client,
+        manager=manager,
         strategies=[strategy],
         pairs=args.pair,
         interval=args.interval,
@@ -123,18 +128,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_balance(args: argparse.Namespace) -> int:
     """Show account balances."""
-    client = KrakenClient.from_env()
+    from kraken_api import KrakenManager
+
+    manager = KrakenManager.from_env()
 
     try:
-        trade_balance = client.trade_balance()
-        print(f"Total Equity: {trade_balance.total_equity}")
-        print(f"Margin Equity: {trade_balance.margin_equity}")
+        trade_balance = manager.trade_balance()
+        print(f"Equity: {trade_balance.equity}")
+        print(f"Trade Balance: {trade_balance.trade_balance}")
         print(f"Unrealized P&L: {trade_balance.unrealized_pnl}")
-        print(f"Realized P&L: {trade_balance.realized_pnl}")
-        print(f"Margin Used: {trade_balance.margin_used}")
+        print(f"Cost Basis: {trade_balance.cost_basis}")
         print(f"Free Margin: {trade_balance.free_margin}")
-        if trade_balance.margin_level:
-            print(f"Margin Level: {trade_balance.margin_level}")
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -143,20 +147,22 @@ def cmd_balance(args: argparse.Namespace) -> int:
 
 def cmd_ticker(args: argparse.Namespace) -> int:
     """Show current ticker."""
-    client = KrakenClient.from_env()
+    from kraken_api import KrakenManager
+
+    manager = KrakenManager.from_env()
 
     try:
-        tickers = client.ticker(args.pair)
+        tickers = manager.tickers(args.pair)
         for pair, ticker in tickers.items():
             print(f"\n{pair}:")
-            print(f"  Bid: {ticker.bid}")
-            print(f"  Ask: {ticker.ask}")
-            print(f"  Last: {ticker.last}")
-            print(f"  24h Volume: {ticker.volume_24h}")
-            print(f"  24h VWAP: {ticker.vwap_24h}")
-            print(f"  24h High: {ticker.high_24h}")
-            print(f"  24h Low: {ticker.low_24h}")
-            print(f"  24h Trades: {ticker.trades_24h}")
+            print(f"  Bid: {ticker.decimal('bid')}")
+            print(f"  Ask: {ticker.decimal('ask')}")
+            print(f"  Last: {ticker.last_price}")
+            print(f"  24h Volume: {ticker.volume[1] if len(ticker.volume) > 1 else 'N/A'}")
+            print(f"  24h VWAP: {ticker.vwap[1] if len(ticker.vwap) > 1 else 'N/A'}")
+            print(f"  24h High: {ticker.high[1] if len(ticker.high) > 1 else 'N/A'}")
+            print(f"  24h Low: {ticker.low[1] if len(ticker.low) > 1 else 'N/A'}")
+            print(f"  24h Trades: {ticker.trade_count[1] if len(ticker.trade_count) > 1 else 'N/A'}")
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -165,19 +171,21 @@ def cmd_ticker(args: argparse.Namespace) -> int:
 
 def cmd_orders(args: argparse.Namespace) -> int:
     """Show open orders."""
-    client = KrakenClient.from_env()
+    from kraken_api import KrakenManager
+
+    manager = KrakenManager.from_env()
 
     try:
-        orders = client.open_orders()
+        orders = manager.open_orders()
         if not orders:
             print("No open orders")
             return 0
 
-        for txid, order in orders.items():
-            print(f"\n{txid}:")
+        for order in orders:
+            print(f"\n{order.txid}:")
             print(f"  Pair: {order.pair}")
             print(f"  Side: {order.side}")
-            print(f"  Type: {order.ordertype}")
+            print(f"  Type: {order.order_type}")
             print(f"  Volume: {order.volume}")
             print(f"  Price: {order.price or 'market'}")
             print(f"  Status: {order.status}")

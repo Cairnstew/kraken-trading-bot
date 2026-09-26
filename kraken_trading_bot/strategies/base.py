@@ -9,6 +9,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from kraken_api.models import Candle, OrderBook, Ticker
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -85,10 +87,9 @@ class Strategy(ABC):
 
         Args:
             data: Dictionary containing market data. Common keys:
-                - "ticker": Current Ticker object
-                - "candles": List of recent Candle objects
-                - "order_book": Current OrderBook object
-                - "balance": Current Balance object (if private data available)
+                - "ticker": Current Ticker object (from kraken_api.models)
+                - "candles": List of recent Candle objects (from kraken_api.models)
+                - "order_book": Current OrderBook object (from kraken_api.models)
 
         Returns:
             A Signal indicating the recommended action.
@@ -101,7 +102,7 @@ class Strategy(ABC):
         Override this to update strategy state after a successful fill.
 
         Args:
-            order: The filled Order object.
+            order: The filled Order object (from kraken_api.models).
         """
         self._logger.info("Order filled: %s", order)
 

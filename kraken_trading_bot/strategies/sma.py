@@ -5,6 +5,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from kraken_api.models import Candle, Ticker
+
 from .base import Signal, Strategy
 
 
@@ -57,8 +59,8 @@ class SMAcrossoverStrategy(Strategy):
 
         Args:
             data: Dictionary containing:
-                - "candles": List of Candle objects (at least long_period + 1)
-                - "ticker": Current Ticker object (for limit order pricing)
+                - "candles": List of Candle objects (kraken_api.models.Candle)
+                - "ticker": Current Ticker object (kraken_api.models.Ticker)
 
         Returns:
             Signal indicating buy, sell, or hold.
@@ -73,8 +75,8 @@ class SMAcrossoverStrategy(Strategy):
             )
             return Signal(action="hold", pair=self.pair, reason="insufficient data")
 
-        # Extract close prices
-        closes = [candle.close for candle in candles]
+        # Extract close prices (Candle.close is a string in kraken_api)
+        closes = [Decimal(candle.close) for candle in candles]
 
         # Calculate current SMAs
         short_sma = self._calculate_sma(closes, self.short_period)
@@ -119,7 +121,7 @@ class SMAcrossoverStrategy(Strategy):
         long_sma: Decimal,
         prev_short_sma: Decimal | None,
         prev_long_sma: Decimal | None,
-        ticker: Any,
+        ticker: Ticker | None,
     ) -> Signal:
         """Detect SMA crossover and generate appropriate signal.
 
@@ -134,7 +136,8 @@ class SMAcrossoverStrategy(Strategy):
         if prev_short_sma <= prev_long_sma and short_sma > long_sma:
             price = None
             if self.use_limit_orders and ticker:
-                price = ticker.best_ask.price if ticker.best_ask else None
+                # Use best ask for buy orders
+                price = ticker.decimal("ask")
             return Signal(
                 action="buy",
                 pair=self.pair,
@@ -147,7 +150,8 @@ class SMAcrossoverStrategy(Strategy):
         if prev_short_sma >= prev_long_sma and short_sma < long_sma:
             price = None
             if self.use_limit_orders and ticker:
-                price = ticker.best_bid.price if ticker.best_bid else None
+                # Use best bid for sell orders
+                price = ticker.decimal("bid")
             return Signal(
                 action="sell",
                 pair=self.pair,

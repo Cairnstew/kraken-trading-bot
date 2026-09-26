@@ -35,8 +35,7 @@ python3.pkgs.buildPythonApplication {
   ];
 
   propagatedBuildInputs = with python3.pkgs; [
-    requests
-    websocket-client
+    (python3.pkgs.toPythonModule (pkgs.callPackage ./nix/kraken-python.nix { }))
     python-dotenv
   ];
 
@@ -44,7 +43,7 @@ python3.pkgs.buildPythonApplication {
   doCheck = false;
 
   meta = with lib; {
-    description = "A trading bot framework for the Kraken Spot REST + WebSocket v2 APIs.";
+    description = "A trading bot framework using the kraken-python API wrapper.";
     homepage = "https://github.com/Cairnstew/kraken-trading-bot";
     license = licenses.mit;
     maintainers = [ ];

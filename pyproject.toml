@@ -5,12 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kraken-trading-bot"
 version = "0.1.0"
-description = "A trading bot framework for the Kraken Spot REST + WebSocket v2 APIs."
+description = "A trading bot framework using the kraken-python API wrapper."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "requests>=2.31",
-    "websocket-client>=1.7",
+    "kraken-python>=0.4.0",
     "python-dotenv>=1.0",
 ]
 

@@ -1,135 +1,234 @@
-"""Tests for the data models."""
+"""Tests for the trading bot models and strategies."""
 
 from decimal import Decimal
 from datetime import datetime
 
-from kraken_trading_bot.models import (
-    Balance,
-    Candle,
-    Order,
-    OrderBook,
-    OrderBookLevel,
-    Ticker,
-    Trade,
-    TradeBalance,
-)
+from kraken_api.models import Candle, OrderBook, Ticker
+
+from kraken_trading_bot.strategies.base import Signal, StrategyState
+from kraken_trading_bot.strategies.sma import SMAcrossoverStrategy
 
 
-def test_ticker_from_api():
-    """Test parsing a ticker response from the Kraken API."""
-    data = {
-        "a": ["50000.00", "1", "1.000"],  # ask
-        "b": ["49999.00", "1", "1.000"],  # bid
-        "c": ["50001.00", "0.001"],  # last
-        "v": ["100.0", "1000.0"],  # volume
-        "p": ["49950.0", "49980.0"],  # vwap
-        "h": ["50500.0", "50500.0"],  # high
-        "l": ["49500.0", "49500.0"],  # low
-        "t": [1000, 5000],  # trades
-    }
+def test_signal_properties():
+    """Test Signal class properties."""
+    buy_signal = Signal(action="buy", pair="XBT/USD", volume=Decimal("0.01"))
+    sell_signal = Signal(action="sell", pair="XBT/USD", volume=Decimal("0.01"))
+    hold_signal = Signal(action="hold", pair="XBT/USD")
 
-    ticker = Ticker.from_api("XBT/USD", data)
-
-    assert ticker.pair == "XBT/USD"
-    assert ticker.bid == Decimal("49999.00")
-    assert ticker.ask == Decimal("50000.00")
-    assert ticker.last == Decimal("50001.00")
-    assert ticker.volume_24h == Decimal("1000.0")
-    assert ticker.vwap_24h == Decimal("49980.0")
-    assert ticker.high_24h == Decimal("50500.0")
-    assert ticker.low_24h == Decimal("49500.0")
-    assert ticker.trades_24h == 5000
+    assert buy_signal.is_actionable is True
+    assert sell_signal.is_actionable is True
+    assert hold_signal.is_actionable is False
 
 
-def test_candle_from_api():
-    """Test parsing a candle response from the Kraken API."""
-    data = [1625097600, "50000", "50500", "49500", "50200", "50100", "100.5", 500]
+def test_strategy_state():
+    """Test StrategyState class."""
+    state = StrategyState()
 
-    candle = Candle.from_api("XBT/USD", data)
+    # Initial state
+    assert state.has_position() is False
+    assert state.is_long() is False
+    assert state.is_short() is False
+    assert state.position == Decimal("0")
 
-    assert candle.pair == "XBT/USD"
-    assert candle.open == Decimal("50000")
-    assert candle.high == Decimal("50500")
-    assert candle.low == Decimal("49500")
-    assert candle.close == Decimal("50200")
-    assert candle.vwap == Decimal("50100")
-    assert candle.volume == Decimal("100.5")
-    assert candle.count == 500
+    # Set long position
+    state.position = Decimal("0.01")
+    assert state.has_position() is True
+    assert state.is_long() is True
+    assert state.is_short() is False
+
+    # Set short position
+    state.position = Decimal("-0.01")
+    assert state.has_position() is True
+    assert state.is_long() is False
+    assert state.is_short() is True
 
 
-def test_order_book():
-    """Test order book parsing and properties."""
-    asks = [
-        OrderBookLevel(price=Decimal("50001"), volume=Decimal("1.0"), timestamp=1.0),
-        OrderBookLevel(price=Decimal("50002"), volume=Decimal("2.0"), timestamp=1.0),
+def test_strategy_reset():
+    """Test strategy state reset."""
+    strategy = SMAcrossoverStrategy(
+        pair="XBT/USD",
+        short_period=3,
+        long_period=5,
+    )
+
+    # Set some state
+    strategy.state.indicators["short_sma"] = Decimal("50000")
+    strategy.state.position = Decimal("0.01")
+
+    # Reset
+    strategy.reset()
+
+    # State should be cleared
+    assert strategy.state.indicators == {}
+    assert strategy.state.position == Decimal("0")
+
+
+def test_sma_strategy_insufficient_data():
+    """Test SMA strategy with insufficient candle data."""
+    strategy = SMAcrossoverStrategy(
+        pair="XBT/USD",
+        short_period=10,
+        long_period=30,
+    )
+
+    # Create mock candles with insufficient data
+    # Need at least long_period + 1 = 31 candles
+    candles = [
+        Candle(
+            pair="XBT/USD",
+            time=1625097600 + i * 3600,
+            open=str(50000 + i * 100),
+            high=str(50100 + i * 100),
+            low=str(49900 + i * 100),
+            close=str(50000 + i * 100),
+            vwap=str(50000 + i * 100),
+            volume="100",
+            count=100,
+        )
+        for i in range(20)  # Less than 31 candles
     ]
-    bids = [
-        OrderBookLevel(price=Decimal("50000"), volume=Decimal("1.5"), timestamp=1.0),
-        OrderBookLevel(price=Decimal("49999"), volume=Decimal("2.5"), timestamp=1.0),
+
+    ticker = Ticker(
+        pair="XBT/USD",
+        bid=["49990"],
+        ask=["50010"],
+        last=["50000"],
+        volume=["100", "1000"],
+        vwap=["50000", "50000"],
+        trade_count=[100, 5000],
+        low=["49500", "49500"],
+        high=["50500", "50500"],
+        open_price=["50000"],
+    )
+
+    data = {"candles": candles, "ticker": ticker}
+    signal = strategy.tick(data)
+
+    assert signal.action == "hold"
+    assert signal.reason == "insufficient data"
+
+
+def test_sma_strategy_no_crossover():
+    """Test SMA strategy when no crossover occurs."""
+    strategy = SMAcrossoverStrategy(
+        pair="XBT/USD",
+        short_period=5,
+        long_period=10,
+    )
+
+    # Create stable uptrend where short SMA stays above long SMA
+    candles = [
+        Candle(
+            pair="XBT/USD",
+            time=1625097600 + i * 3600,
+            open=str(50000 + i * 100),
+            high=str(50100 + i * 100),
+            low=str(49900 + i * 100),
+            close=str(50000 + i * 100),
+            vwap=str(50000 + i * 100),
+            volume="100",
+            count=100,
+        )
+        for i in range(50)  # More than 10 + 1 candles
     ]
 
-    book = OrderBook(pair="XBT/USD", asks=asks, bids=bids)
+    ticker = Ticker(
+        pair="XBT/USD",
+        bid=["54990"],
+        ask=["55010"],
+        last=["55000"],
+        volume=["100", "1000"],
+        vwap=["55000", "55000"],
+        trade_count=[100, 5000],
+        low=["54500", "54500"],
+        high=["55500", "55500"],
+        open_price=["55000"],
+    )
 
-    assert book.best_ask == asks[0]
-    assert book.best_bid == bids[0]
-    assert book.spread == Decimal("1")
+    data = {"candles": candles, "ticker": ticker}
 
+    # First tick sets up SMAs
+    signal1 = strategy.tick(data)
+    assert signal1.action == "hold"
 
-def test_order_book_empty():
-    """Test empty order book."""
-    book = OrderBook(pair="XBT/USD", asks=[], bids=[])
-
-    assert book.best_ask is None
-    assert book.best_bid is None
-    assert book.spread is None
-
-
-def test_trade_balance_from_api():
-    """Test parsing a trade balance response."""
-    data = {
-        "eb": "10000.00",  # total equity
-        "mh": "10000.00",  # margin equity
-        "n": "50.00",  # unrealized P&L
-        "c": "100.00",  # realized P&L
-        "m": "5000.00",  # margin used
-        "mf": "5000.00",  # free margin
-        "ml": "2.0",  # margin level
-    }
-
-    balance = TradeBalance.from_api(data)
-
-    assert balance.total_equity == Decimal("10000.00")
-    assert balance.margin_equity == Decimal("10000.00")
-    assert balance.unrealized_pnl == Decimal("50.00")
-    assert balance.realized_pnl == Decimal("100.00")
-    assert balance.margin_used == Decimal("5000.00")
-    assert balance.free_margin == Decimal("5000.00")
-    assert balance.margin_level == Decimal("2.0")
+    # Second tick with same trend should hold
+    signal2 = strategy.tick(data)
+    assert signal2.action == "hold"
 
 
-def test_order_from_api():
-    """Test parsing an order response."""
-    data = {
-        "descr": {
-            "pair": "XBT/USD",
-            "type": "buy",
-            "ordertype": "limit",
-            "price": "50000.00",
-        },
-        "vol": "0.01",
-        "status": "open",
-        "opentm": 1625097600,
-        "closetm": None,
-    }
+def test_sma_strategy_golden_cross():
+    """Test SMA strategy golden cross detection."""
+    strategy = SMAcrossoverStrategy(
+        pair="XBT/USD",
+        short_period=3,
+        long_period=5,
+        volume_per_trade=Decimal("0.01"),
+    )
 
-    order = Order.from_api("TX123", data)
+    # First tick: establish baseline where short < long
+    # Need at least long_period + 1 = 6 candles
+    candles1 = [
+        Candle(
+            pair="XBT/USD",
+            time=1625097600 + i * 3600,
+            open=str(50000 - i * 1000),  # Downtrend
+            high=str(50100 - i * 1000),
+            low=str(49900 - i * 1000),
+            close=str(50000 - i * 1000),
+            vwap=str(50000 - i * 1000),
+            volume="100",
+            count=100,
+        )
+        for i in range(6)
+    ]
 
-    assert order.txid == "TX123"
-    assert order.pair == "XBT/USD"
-    assert order.side == "buy"
-    assert order.ordertype == "limit"
-    assert order.volume == Decimal("0.01")
-    assert order.price == Decimal("50000.00")
-    assert order.status == "open"
-    assert order.opened is not None
-    assert order.closed is None
+    ticker1 = Ticker(
+        pair="XBT/USD",
+        bid=["44990"],
+        ask=["45010"],
+        last=["45000"],
+        volume=["100", "1000"],
+        vwap=["45000", "45000"],
+        trade_count=[100, 5000],
+        low=["44500", "44500"],
+        high=["45500", "45500"],
+        open_price=["45000"],
+    )
+
+    signal1 = strategy.tick({"candles": candles1, "ticker": ticker1})
+    assert signal1.action == "hold"  # No previous data for crossover
+
+    # Second tick: short SMA crosses above long SMA (golden cross)
+    candles2 = [
+        Candle(
+            pair="XBT/USD",
+            time=1625097600 + i * 3600,
+            open=str(45000 + i * 1000),  # Uptrend
+            high=str(45100 + i * 1000),
+            low=str(44900 + i * 1000),
+            close=str(45000 + i * 1000),
+            vwap=str(45000 + i * 1000),
+            volume="100",
+            count=100,
+        )
+        for i in range(6)
+    ]
+
+    ticker2 = Ticker(
+        pair="XBT/USD",
+        bid=["49990"],
+        ask=["50010"],
+        last=["50000"],
+        volume=["100", "1000"],
+        vwap=["50000", "50000"],
+        trade_count=[100, 5000],
+        low=["49500", "49500"],
+        high=["50500", "50500"],
+        open_price=["50000"],
+    )
+
+    signal2 = strategy.tick({"candles": candles2, "ticker": ticker2})
+    # Should detect golden cross
+    assert signal2.action == "buy"
+    assert signal2.pair == "XBT/USD"
+    assert signal2.volume == Decimal("0.01")
