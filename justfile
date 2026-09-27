@@ -1,10 +1,15 @@
 # justfile — standard commands for kraken-trading-bot
 #
-#   just --list            show all recipes
-#   just train             train ppo_eth_01 on ETH/USD (defaults)
-#   just backtest          evaluate a trained model
-#   just paper             live paper trade with a trained model
-#   just test              run the pytest suite
+#   just --list             show all recipes
+#   just train              train ppo_eth_01 on ETH/USD with defaults
+#   just train --ticker XRP_USD --model ppo_xrp_02 --timesteps 100000
+#   just paper --ticker ETH_USD --model ppo_eth_01 --iterations 10
+#   just test               run the pytest suite
+#
+# The RL recipes take **any** additional arguments and pass them straight
+# to the `kraken-trading-bot` CLI (all flags are optional; omitted ones
+# fall back to the CLI's own defaults). The `paper` subcommand maps the
+# `paper-trade` subcommand, so `just paper --dry-run ...` works too.
 #
 # The CLI is invoked through whichever environment is available:
 #   - .venv/bin/kraken-trading-bot  (pip install -e ., see setup-venv)
@@ -30,35 +35,38 @@ setup-venv:
 
 # ── RL workflow ────────────────────────────────────────────────────────
 
-# Train a PPO model for one ticker
-train ticker="ETH_USD" model="ppo_eth_01" timesteps="20000" action_space="continuous":
-  {{cli}} train --ticker {{ticker}} --model {{model}} --timesteps {{timesteps}} --action-space {{action_space}}
+# Train a PPO model. Args pass through to `kraken-trading-bot train`
+# e.g. just train --ticker XRP_USD --model ppo_xrp_02 --timesteps 100000
+train *CLI_ARGS="":
+  {{cli}} train {{CLI_ARGS}}
 
 # Backtest a trained model on fresh OHLC data
-backtest ticker="ETH_USD" model="ppo_eth_01":
-  {{cli}} backtest --ticker {{ticker}} --model {{model}}
+# e.g. just backtest --ticker ETH_USD --model ppo_eth_01
+backtest *CLI_ARGS="":
+  {{cli}} backtest {{CLI_ARGS}}
 
-# List models registered in the registry (all, or one ticker)
-models ticker="":
-  @if [ -z "{{ticker}}" ]; then \
-    {{cli}} models; \
-  else \
-    {{cli}} models --ticker {{ticker}}; \
-  fi
+# List models. Pass --ticker T or --json to filter/format
+# e.g. just models --ticker ETH_USD — just models --json — just models
+models *CLI_ARGS="":
+  {{cli}} models {{CLI_ARGS}}
 
-# Paper trade with a trained model (simulated orders, no real money)
-paper ticker="ETH_USD" model="ppo_eth_01" iterations="10" interval="60":
-  {{cli}} paper-trade --ticker {{ticker}} --model {{model}} --iterations {{iterations}} --interval {{interval}}
+# Paper trade a trained model (simulated orders). Map to paper-trade
+# e.g. just paper --ticker ETH_USD --model ppo_eth_01 --iterations 10
+#      just paper --ticker ETH_USD --model ppo_eth_01 --dry-run
+paper *CLI_ARGS="":
+  {{cli}} paper-trade {{CLI_ARGS}}
 
 # Dry-run paper trading (print would-be orders, execute nothing)
-paper-dry ticker="ETH_USD" model="ppo_eth_01" iterations="5" interval="60":
-  {{cli}} paper-trade --ticker {{ticker}} --model {{model}} --iterations {{iterations}} --interval {{interval}} --dry-run
+# e.g. just paper-dry --ticker ETH_USD --model ppo_eth_01
+paper-dry *CLI_ARGS="":
+  {{cli}} paper-trade {{CLI_ARGS}} --dry-run
 
 # ── Account / market (needs KRAKEN_API_KEY/SECRET for private calls) ──────
 
 # Show current ticker for a pair
-ticker pair="ETH/USD":
-  {{cli}} ticker --pair {{pair}}
+# e.g. just ticker --pair ETH/USD
+ticker *CLI_ARGS="--pair ETH/USD":
+  {{cli}} ticker {{CLI_ARGS}}
 
 # Show account balances (requires credentials)
 balance:
@@ -75,6 +83,7 @@ test:
   nix develop -c pytest tests/ -q
 
 # Run one test file
+# e.g. just test-one test_rl_training.py
 test-one file="test_rl_training.py":
   nix develop -c pytest tests/{{file}} -q
 
@@ -86,10 +95,10 @@ check:
 show:
   nix flake show
 
-# Clean generated artifacts (models, caches). Keeps the venv.
+# Clean generated artifacts (model configs stay tracked; bin+caches removed)
 clean:
   rm -rf models/__pycache__ models/*/__pycache__
   rm -rf *.egg-info kraken_trading_bot.egg-info
   find . -name __pycache__ -type d -prune -exec rm -rf {} +
   rm -rf .pytest_cache
-  @echo "Cleaned caches. Model artifacts (models/**/model.zip etc.) are gitignored."
+  @echo "Cleaned caches. Trained model zips/npz (gitignored) left in place."
