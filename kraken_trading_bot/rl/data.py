@@ -8,11 +8,18 @@ already returns a ``(candles, last)`` cursor pair, so we loop on the
 ``since`` cursor until we have ``pages`` pages or the exchange says the
 history is exhausted (``last == 0``).  This intentionally does not add
 pagination to kraken-python itself; it lives in this package.
+
+Exogenous signal merging (:func:`merge_extra_features`) left-joins
+per-(ticker, hour) signal vectors produced by the sibling
+``ticker-news-signals`` project onto the OHLCV frame by floored
+bar timestamp.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 import pandas as pd
@@ -25,6 +32,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "count")
+
+# Columns expected in a signal JSONL record from ticker-news-signals.
+_SIGNAL_COLUMNS = ("sentiment_score", "article_count", "novelty_flag")
 
 # Bars a 24-window feature pipeline needs before any indicator fills its
 # look-back window (max window + a small return/rolling cushion).
@@ -46,6 +56,106 @@ class NotEnoughDataError(ValueError):
             f"Not enough {what}: need at least {needed} bars "
             f"(max feature window + warmup), got {available}"
         )
+
+
+def merge_extra_features(
+    df: pd.DataFrame,
+    extra_features_file: str | None = None,
+) -> pd.DataFrame:
+    """Merge exogenous per-(ticker, hour) signal vectors onto an OHLCV frame.
+
+    Reads a JSONL file produced by the sibling ``ticker-news-signals``
+    project — each record has a ``timestamp`` (ISO 8601, UTC) and the
+    three signal columns: ``sentiment_score`` (float in [-1, 1]),
+    ``article_count`` (int) and ``novelty_flag`` (bool).
+
+    Both the OHLCV bar index and the signal timestamps are floor-truncated
+    to the hour before joining, so the merge is robust to minor timestamp
+    offsets (e.g. 1-minute candles with non-zero minutes).  Missing hours
+    in the signal file are forward-filled and then zero-filled (neutral
+    sentiment, 0 articles, no novelty) so every OHLCV row always has the
+    three signal columns.
+
+    Args:
+        df: OHLCV DataFrame indexed by UTC ``DatetimeIndex`` (``time``).
+        extra_features_file: Path to the signal JSONL; ``None`` or empty
+            returns ``df`` unchanged.
+
+    Returns:
+        The input DataFrame with ``sentiment_score``, ``article_count``
+        and ``novelty_flag`` columns added (when a file is provided and
+        readable).
+    """
+    if not extra_features_file:
+        return df
+
+    path = Path(extra_features_file)
+    if not path.is_file():
+        _LOGGER.warning(
+            "Extra features file not found: %s — skipping signal merge", path
+        )
+        return df
+
+    # ── read JSONL ────────────────────────────────────────────────────
+    records: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                _LOGGER.warning("Skipping malformed JSONL line %d: %s", lineno, exc)
+
+    if not records:
+        _LOGGER.debug("Extra features file %s is empty — skipping merge", path)
+        return df
+
+    # ── build a small DataFrame from the signals ──────────────────────
+    signal_df = pd.DataFrame(records)
+    if "timestamp" not in signal_df.columns:
+        _LOGGER.warning("No 'timestamp' column in %s — skipping merge", path)
+        return df
+
+    signal_df["timestamp"] = pd.to_datetime(signal_df["timestamp"], utc=True)
+    signal_df = signal_df.set_index("timestamp")
+
+    # Floor both indices to the hour so 60-min candles align cleanly
+    # even if bar timestamps land at e.g. 14:01 due to exchange quirks.
+    signal_df.index = signal_df.index.floor("h")
+
+    # Keep only the three signal columns; ignore extras (ticker, etc.).
+    available_cols = [c for c in _SIGNAL_COLUMNS if c in signal_df.columns]
+    if not available_cols:
+        _LOGGER.warning(
+            "No signal columns found in %s — expected %s",
+            path,
+            _SIGNAL_COLUMNS,
+        )
+        return df
+
+    signal_df = signal_df[available_cols].sort_index()
+
+    # ── left-join onto the OHLCV frame ────────────────────────────────
+    ohlc_index = df.index.floor("h")
+
+    merged = signal_df.reindex(ohlc_index)
+
+    # Forward-fill gaps (hours without new signals inherit the last known),
+    # then zero-fill the leading NaNs (first bar onward with no signal yet).
+    for col in available_cols:
+        df[col] = merged[col].ffill().fillna(0.0).values
+
+    _LOGGER.debug(
+        "Merged %d signal records from %s onto %d OHLCV bars "
+        "(columns: %s)",
+        len(records),
+        path,
+        len(df),
+        available_cols,
+    )
+    return df
 
 
 def candles_to_dataframe(candles: Sequence[Any]) -> pd.DataFrame:
@@ -93,6 +203,7 @@ def fetch_ohlc_dataframe(
     pages: int = 6,
     manager: "KrakenManager | None" = None,
     since: int | None = None,
+    extra_features_file: str | None = None,
 ) -> pd.DataFrame:
     """Page through Kraken OHLCV history into a training DataFrame.
 
@@ -110,6 +221,10 @@ def fetch_ohlc_dataframe(
         manager: A :class:`kraken_api.KrakenManager`; defaults to
             ``KrakenManager.from_env()`` when omitted.
         since: Optional start cursor for the first page (epoch seconds).
+        extra_features_file: Optional path to a JSONL of per-(ticker,
+            hour) signal vectors (see :func:`merge_extra_features`); a
+            feature-engineering seam joins them onto the OHLCV frame by
+            floored bar timestamp. ``None`` (config default) disables it.
 
     Returns:
         DataFrame as produced by :func:`candles_to_dataframe` with
@@ -144,7 +259,7 @@ def fetch_ohlc_dataframe(
     # The exchange may return overlapping boundary candles across pages;
     # keep the first occurrence per timestamp.
     df = df[~df.index.duplicated(keep="first")].sort_index()
-    return df
+    return merge_extra_features(df, extra_features_file)
 
 
 def prepare_episode(
@@ -216,6 +331,7 @@ def _minimum_bars(features: FeaturePipeline) -> int:
 __all__ = [
     "NotEnoughDataError",
     "candles_to_dataframe",
+    "merge_extra_features",
     "fetch_ohlc_dataframe",
     "prepare_episode",
     "_minimum_bars",

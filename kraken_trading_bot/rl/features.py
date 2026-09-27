@@ -22,7 +22,12 @@ _LOGGER = logging.getLogger(__name__)
 # Canonical column names expected on the raw OHLCV input frame.
 _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
-_FEATURE_GROUPS = ("price", "technical", "volume", "microstructure")
+_FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
+
+# Columns added by :func:`merge_extra_features` in ``data.py``.
+# The ``signals`` group passes them through as-is so they reach the
+# agent's observation vector and the normalization stats.
+_SIGNAL_COLUMNS = ("sentiment_score", "article_count", "novelty_flag")
 
 
 @dataclass
@@ -262,6 +267,8 @@ class FeaturePipeline:
             self._add_volume_features(out, close, volume)
         if "microstructure" in self.feature_groups:
             self._add_microstructure_features(out, df)
+        if "signals" in self.feature_groups:
+            self._add_signals_features(out, df)
 
         self._last_feature_names = list(out.columns)
         return out
@@ -368,6 +375,21 @@ class FeaturePipeline:
             ask_vol = df["ask_vol"].astype(float)
             denom = (bid_vol + ask_vol).replace(0, np.nan)
             out["order_book_imbalance"] = (bid_vol - ask_vol) / denom
+
+    def _add_signals_features(
+        self, out: pd.DataFrame, df: pd.DataFrame
+    ) -> None:
+        """Forward exogenous signal columns into the feature matrix.
+
+        These columns are added by :func:`merge_extra_features` in
+        ``data.py`` and need no further computation — they are already
+        numeric (sentiment_score is a float, article_count is an int,
+        novelty_flag is a bool).  Columns not present in the input are
+        silently skipped (the merge may not always be active).
+        """
+        for col in _SIGNAL_COLUMNS:
+            if col in df.columns:
+                out[col] = df[col].astype(float)
 
     # ------------------------------------------------------------------
     def n_features(self) -> int:

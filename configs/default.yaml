@@ -41,8 +41,20 @@ reward:
 # Look-back windows (in bars) for rolling features; e.g. [1, 4, 24] gives
 # 1h, 4h and 1d views when bars are 1h candles.
 feature_windows: [1, 4, 24]
-# Subset of: price, technical, volume, microstructure
-feature_groups: ["price", "technical", "volume", "microstructure"]
+# Subset of: price, technical, volume, microstructure, signals
+# "signals" forwards exogenous per-(ticker, hour) columns (sentiment_score,
+# article_count, novelty_flag) when extra_features_file is set; harmless no-op
+# when no signals are merged.
+feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
+
+# --- Exogenous signals (optional) ---------------------------------------
+# Path to a JSONL file of per-(ticker, hour) signal vectors produced by
+# the sibling `ticker-news-signals` project:
+#   python ~/Projects/ticker-news-signals/cli.py pull --ticker ETH/USD \
+#     --output signals/eth_usd.jsonl
+# When set, a feature-engineering step can left-join these columns onto
+# the OHLCV frame by timestamp. Null/empty disables the feature.
+extra_features_file: null
 
 # --- Model metadata -----------------------------------------------------
 # Directory layout: models/{ticker_id}/{model_name}/

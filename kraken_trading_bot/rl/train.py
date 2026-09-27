@@ -157,12 +157,13 @@ def train_ticker(
         interval=interval,
         pages=pages,
         manager=manager,
+        extra_features_file=cfg.get("extra_features_file"),
     )
 
     features = FeaturePipeline(
         windows=cfg.get("feature_windows", [1, 4, 24]),
         feature_groups=cfg.get("feature_groups", None)
-        or ["price", "technical", "volume", "microstructure"],
+        or ["price", "technical", "volume", "microstructure", "signals"],
     )
 
     episode_df = prepare_episode(

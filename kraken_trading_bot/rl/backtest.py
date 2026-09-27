@@ -140,6 +140,7 @@ def backtest_model(
             interval=interval,
             pages=pages,
             manager=manager,
+            extra_features_file=record.config.get("extra_features_file"),
         )
     else:
         df = data
@@ -152,7 +153,7 @@ def backtest_model(
         pipeline = FeaturePipeline(
             windows=config.get("feature_windows", [1, 4, 24]),
             feature_groups=config.get("feature_groups", None)
-            or ["price", "technical", "volume", "microstructure"],
+            or ["price", "technical", "volume", "microstructure", "signals"],
         )
         pipeline.load_normalization(ticker_key, record.normalization_path)
 

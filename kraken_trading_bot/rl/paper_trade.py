@@ -182,7 +182,7 @@ class PaperTrader:
         pipeline = FeaturePipeline(
             windows=config.get("feature_windows", [1, 4, 24]),
             feature_groups=config.get("feature_groups", None)
-            or ["price", "technical", "volume", "microstructure"],
+            or ["price", "technical", "volume", "microstructure", "signals"],
         )
         if record.normalization_path is not None:
             pipeline.load_normalization(self.ticker_key, record.normalization_path)
@@ -286,6 +286,7 @@ class PaperTrader:
             interval=self.ohlcv_interval_minutes,
             pages=_FETCH_PAGES,
             manager=self.manager,
+            extra_features_file=self.config.get("extra_features_file"),
         )
 
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:
