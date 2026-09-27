@@ -5,11 +5,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1790080595,
-        "narHash": "sha256-8AKZqfmTT1oiUMwQZKbpj557s+nHPKh+LigHjAX4wDQ=",
+        "lastModified": 1790462801,
+        "narHash": "sha256-GoR8qRBTz+2jl9zCbl6/dBNMLLNyD2M2Den5x6LEbkY=",
         "owner": "Cairnstew",
         "repo": "kraken-python",
-        "rev": "9311ef3b9cd44f85f90e77e6fd5db70c4994bd12",
+        "rev": "81de5974ded7c17586eedc78158d1293d2f74c66",
         "type": "github"
       },
       "original": {
