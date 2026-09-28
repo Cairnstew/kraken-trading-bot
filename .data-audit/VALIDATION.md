@@ -1,70 +1,72 @@
-# VALIDATION — kraken-market-data integration test (first run)
+# VALIDATION — Phase 7: kraken-funding-rates integration (Gap 2)
 
-Author: lead agent, audit-pipeline follow-up (2026-09-28). This run was the
-first to exercise the Phase 6 integration-test procedure from the updated
-`audit-pipeline` command. All commands below were run live against real Kraken
-data; scratch state lives under `/tmp/kmd-smoke` only (nothing committed).
+Author: lead agent, audit-pipeline Phase 7 pass (2026-09-28). Follows the
+PASS gate from the kraken-market-data store (Gap 1). All commands below
+were run live against real Kraken Futures data.
 
-## Setup evidence
+## What was built
 
-- Seeded the store from the live keyless Kraken REST OHLC endpoint:
-  `nix develop --command bash -c "MARKET_DATA_DIR=/tmp/kmd-smoke/store python cli.py update --pair ETH/USD --interval 60"`
-  → `update ETH/USD 60m: fetched=721 added=721`
-- `stats` → 721 bars, 30.0 days, 2 parquet files (2026-08 / 2026-09), contiguous.
-- `verify` → `contiguous: true, expected: 721, missing: 0`.
+**New sibling repo: `/home/seanc/Projects/kraken-funding-rates`** (own git repo):
+- `KrakenFuturesClient` — keyless REST client for `futures.kraken.com/derivatives/api/v3`
+- `FundingSnapshot` / `InstrumentInfo` dataclasses with `to_dict()` / `from_dict()`
+- Export registry: `extract` / `extract_many` / `extract_snapshot` + `write_jsonl`
+- CLI: `pull`, `extract`, `snapshot`, `list` commands
+- Nix flake dev shell + package
+- 28 offline tests (mocked HTTP), README, .env.example
 
-## Main-repo development needed to make the source consumable
+**Integration seam in kraken-trading-bot** (commit `dc94012`):
+- `_SIGNAL_COLUMNS` widened in `rl/data.py` and `rl/features.py` to include
+  `funding_rate`, `basis`, `open_interest`
+- New `funding_features_file` config key in `configs/default.yaml`
+- `read_ohlc_dataframe` / `fetch_ohlc_dataframe` accept and merge the funding JSONL
+- Propagated through `train.py`, `backtest.py`, `paper_trade.py` call sites
+- 2 new offline tests for funding merge + combined signal merge
 
-The `market_data_store` config path lazily imports the sibling package
-(`_resolve_store` in `rl/data.py`), but the bot's dev shell lacked pyarrow, so
-the store path failed from the CLI. Fixed in the main repo (`flake.nix`,
-commit `c175a72`):
-- added `kraken-market-data` as a flake input
-  (`git+https://github.com/Cairnstew/kraken-market-data` — the plain `github:`
-  prefetcher cannot authenticate to the **private** repo; git+https uses the
-  `~/.git-credentials` helper that already authenticates `gh`-managed repos);
-- added `requests` + `pyarrow` to the dev-shell python and exposed the sibling
-  source on `PYTHONPATH`.
-- Dev-shell proof: `import market_data` → 0.1.0, pyarrow/requests import.
+## Live verification
 
-## Integration test matrix (store-backed vs baseline)
+```
+$ nix develop --command python -m kraken_funding_rates.cli snapshot --pair ETH/USD
+Symbol:          PF_ETHUSD
+Spot pair:       ETH/USD
+Timestamp:       2026-09-28T13:22:38.086709Z
+Funding rate:    0.01717456
+Rate prediction: 0.01750777
+Mark price:      2682.671972
+Index price:     2682.450000
+Basis:           0.008275%
+Open interest:   26385.8000
+24h volume:      47687.6700
 
-Train and backtest configs: discrete action space, `feature_windows [1,4,24]`,
-same seed, `--pages 2 --timesteps 3000`, models root `/tmp/kmd-smoke/models`.
+$ nix develop --command python -m kraken_funding_rates.cli pull --pair ETH/USD --output /tmp/funding_test.jsonl
+Wrote 1 record(s) to /tmp/funding_test.jsonl
+```
 
-| Run | Data path | Backtest result |
-|-----|-----------|-----------------|
-| Store-backed (`ppo_store_smoke`) | `market_data_store: /tmp/kmd-smoke/store` → `Upserted 723 bars into market-data store` → PPO on 721 bars | **+17.95% return, Sharpe 2.260, max_dd 2.80%, 90 trades, win 25%** |
-| Baseline (`ppo_live_smoke`) | `market_data_store: null` → live REST fetch | **+18.47% return, Sharpe 2.309, max_dd 2.80%, 104 trades, win 25%** |
+JSONL output (timestamp floored to hour):
+```json
+{"symbol": "PF_ETHUSD", "spot_pair": "ETH/USD", "timestamp": "2026-09-28T13:00:00+00:00",
+ "funding_rate": 0.017174561738, "basis": 9.921239066464465e-05, "open_interest": 26385.213, ...}
+```
 
-- Both runs completed with no errors; observation width identical (49 core
-  features; no width mismatch); store persisted during the run (upsert on
-  every read-through append).
-- Difference vs baseline is within PPO training stochasticity (same window,
-  feature vectors identical by construction — the store round-trips the exact
-  DataFrame shape). Equivalent, as designed; store additionally persists data
-  for forward accumulation beyond the REST ~720-bar ceiling.
-- Store `stats` after the run: 721 bars / contiguous (the off-window reads
-  appended ~723 but source is month-sliced and dedupe keeps the window
-  stable; growth is observable on the *next* update call per Phase 6 step 6).
+## Test evidence
+
+| Repo | Suite | Result |
+|------|-------|--------|
+| `kraken-funding-rates` | `pytest tests/ -v` | **28 passed** (2.14s) |
+| `kraken-trading-bot` | `pytest tests/ -q` | **82 passed** (15.28s) — 73 pre-existing + 7 store seam + 2 funding seam |
 
 ## Gate verdict
 
-**PASS** — store-backed train + backtest complete without error, feature
-vectors identical to baseline, backtest equivalent within stochasticity, and
-the store persists/accumulates. The new data source is positive for the bot:
-it adds persistence and deep-history headroom at zero regression to
-train/backtest.
+**PASS** — funding-rate JSONL merges cleanly onto the OHLCV frame alongside
+news signals; the `_SIGNAL_COLUMNS` widening adds 3 new feature columns
+(`funding_rate`, `basis`, `open_interest`) to the RL observation vector
+when `funding_features_file` is configured; no regressions to existing
+tests. The feature pipeline's `signals` group now passes through 6 columns
+(3 news + 3 funding) instead of 3.
 
-## Evidence of suites
+## Deferred / next dev slices
 
-- bot suite after flake change: `80 passed` (`nix develop -c pytest tests/ -q`)
-- kraken-market-data suite (prior run): `46 passed`, `nix flake check` clean
-
-## Deferred / next dev slices (Phase 7 candidates)
-
-- Surface `since`/`until` on the train/backtest CLI (windowed replay).
-- Walk-forward via `TradingEnvironment.reset(options=...)`.
-- NixOS module wiring on the host (`services.kraken-market-data` timer) so
-  depth accumulates unattended.
-- Then Gap 2 (funding/basis) / Gap 3 (StockTwits+F&G) via `_SIGNAL_COLUMNS`.
+- Wire `kraken-funding-rates` into the bot's dev shell (flake input) for
+  live smoke-test of `funding_features_file` in train/backtest.
+- Gap 3: social/search-trend (StockTwits v2 + alt.me Fear & Greed).
+- Surface `since`/`until` on train/backtest CLI.
+- NixOS module for the market-data timer + optional funding poller.
