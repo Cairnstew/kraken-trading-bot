@@ -78,6 +78,8 @@ time, update its row.
 | `kraken-python` (foundation wrapper) | https://github.com/Cairnstew/kraken-python | `/home/seanc/Projects/kraken-python` |
 | `ticker-news-signals` (news → sentiment) | https://github.com/Cairnstew/ticker-news-signals (private) | `/home/seanc/Projects/ticker-news-signals` |
 | `kraken-market-data` (OHLC store) | https://github.com/Cairnstew/kraken-market-data (private) | `/home/seanc/Projects/kraken-market-data` |
+| `kraken-funding-rates` (funding/basis) | not pushed yet — no remote set | `/home/seanc/Projects/kraken-funding-rates` |
+| `kraken-social-signals` (StockTwits + Fear & Greed) | https://github.com/Cairnstew/kraken-social-signals (private) | `/home/seanc/Projects/kraken-social-signals` |
 
 Related siblings (not data sources): `opencode-ensemble`, `spotify-playlist-manager`,
 `x-python-api`, `steam-mcp`, `nixos-minecraft-modpacks` (all under `https://github.com/Cairnstew/…`,
@@ -481,6 +483,28 @@ inventory only.
   and the sibling on `PYTHONPATH` before `market_data_store` worked — Phase 4's
   scaffold step for a `kraken-*` data source should mention wiring the flake
   input into the bot dev shell as a first-class deliverable.
+- 2026-09-28 — Phase 6's gate wording is store-specific ("persists", "bars grow
+  beyond seed", "verify contiguous") and did not apply verbatim to a JSONL-seam
+  source (kraken-social-signals). The reviewer adapted it to: (a) feature-width
+  proof — `normalization.npz` feature_names + train log "N obs features" vs
+  baseline, instead of store-persistence; (b) the source-is-consumed proof
+  (`Merged N signal records from ... onto M OHLCV bars` merge log); (c) the
+  equivalent-metrics gate unchanged (|Δ return| within 5 pts, same sign). When
+  the next source is an exogenous JSONL seam, use that adapted shape; only
+  store-backed sources need the persistence proof.
+- 2026-09-28 — the registry was stale: `kraken-funding-rates` (built the
+  previous pass) had no row and was never pushed (no remote). Registry now has
+  a "not pushed yet" row for it and a row for `kraken-social-signals`. Check
+  `gh repo list` against the registry after each scaffold, not only when a new
+  repo is created.
+- 2026-09-28 — a sibling-repo pass scaffolded by a worktree builder makes no
+  bot-repo commits: `team_shutdown` says "made no changes" and `team_merge`
+  says "Nothing to merge". That is the expected outcome when the deliverable
+  lands in the standalone sibling (the worktree is just cwd), not a failure to
+  repair. Do not force a merge; verify the sibling repo has the commit instead.
+  proposal: read `_SIGNAL_COLUMNS` from a single source (config) — the 2-file
+  sync (data.py + features.py) is now a 3-pass repeated dance (news, funding,
+  social) with a silent-drop failure mode; AUDIT.md and PLAN.md both flag it.
 
 ---
 
