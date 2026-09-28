@@ -43,8 +43,17 @@ _LOGGER = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "count")
 
-# Columns expected in a signal JSONL record from ticker-news-signals.
-_SIGNAL_COLUMNS = ("sentiment_score", "article_count", "novelty_flag")
+# Columns expected in signal JSONL records from sibling projects.
+# News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
+# Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
+_SIGNAL_COLUMNS = (
+    "sentiment_score",
+    "article_count",
+    "novelty_flag",
+    "funding_rate",
+    "basis",
+    "open_interest",
+)
 
 # Bars a 24-window feature pipeline needs before any indicator fills its
 # look-back window (max window + a small return/rolling cushion).
@@ -258,6 +267,7 @@ def fetch_ohlc_dataframe(
     manager: "KrakenManager | None" = None,
     since: int | None = None,
     extra_features_file: str | None = None,
+    funding_features_file: str | None = None,
 ) -> pd.DataFrame:
     """Page through Kraken OHLCV history into a training DataFrame.
 
@@ -279,6 +289,10 @@ def fetch_ohlc_dataframe(
             hour) signal vectors (see :func:`merge_extra_features`); a
             feature-engineering seam joins them onto the OHLCV frame by
             floored bar timestamp. ``None`` (config default) disables it.
+        funding_features_file: Optional path to a JSONL of per-(ticker,
+            hour) funding-rate/basis vectors from the sibling
+            ``kraken-funding-rates`` project.  Merged after news signals
+            via the same timestamp-floor left-join.
 
     Returns:
         DataFrame as produced by :func:`candles_to_dataframe` with
@@ -302,7 +316,9 @@ def fetch_ohlc_dataframe(
     # The exchange may return overlapping boundary candles across pages;
     # keep the first occurrence per timestamp.
     df = df[~df.index.duplicated(keep="first")].sort_index()
-    return merge_extra_features(df, extra_features_file)
+    df = merge_extra_features(df, extra_features_file)
+    df = merge_extra_features(df, funding_features_file)
+    return df
 
 
 def read_ohlc_dataframe(
@@ -314,6 +330,7 @@ def read_ohlc_dataframe(
     since: int | None = None,
     until: int | None = None,
     extra_features_file: str | None = None,
+    funding_features_file: str | None = None,
     market_data_store: Any = None,
     market_data_source: Any = None,
 ) -> pd.DataFrame:
@@ -376,6 +393,7 @@ def read_ohlc_dataframe(
             manager=manager,
             since=since,
             extra_features_file=extra_features_file,
+            funding_features_file=funding_features_file,
         )
 
     store = _resolve_store(market_data_store)
@@ -409,7 +427,9 @@ def read_ohlc_dataframe(
     df = store.read(pair, interval, since=since, until=until)
     if isinstance(df, pd.DataFrame) and df.empty:
         raise NotEnoughDataError(1, 0, what="OHLC candles")
-    return merge_extra_features(df, extra_features_file)
+    df = merge_extra_features(df, extra_features_file)
+    df = merge_extra_features(df, funding_features_file)
+    return df
 
 
 def _resolve_store(market_data_store: Any) -> Any:

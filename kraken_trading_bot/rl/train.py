@@ -160,6 +160,7 @@ def train_ticker(
         pages=pages,
         manager=manager,
         extra_features_file=cfg.get("extra_features_file"),
+        funding_features_file=cfg.get("funding_features_file"),
         market_data_store=cfg.get("market_data_store"),
     )
 

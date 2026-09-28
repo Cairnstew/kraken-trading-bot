@@ -27,7 +27,16 @@ _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 # Columns added by :func:`merge_extra_features` in ``data.py``.
 # The ``signals`` group passes them through as-is so they reach the
 # agent's observation vector and the normalization stats.
-_SIGNAL_COLUMNS = ("sentiment_score", "article_count", "novelty_flag")
+# News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
+# Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
+_SIGNAL_COLUMNS = (
+    "sentiment_score",
+    "article_count",
+    "novelty_flag",
+    "funding_rate",
+    "basis",
+    "open_interest",
+)
 
 
 @dataclass

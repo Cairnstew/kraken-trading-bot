@@ -232,3 +232,64 @@ def test_read_ohlc_dataframe_extra_features_still_merge(tmp_path) -> None:
     assert "article_count" in df.columns
     assert df["sentiment_score"].iloc[-1] == 0.5
     assert df["article_count"].iloc[-1] == 3
+
+
+def test_read_ohlc_dataframe_funding_features_merge(tmp_path) -> None:
+    """Funding-rate JSONL merges alongside news signals."""
+    store = FakeStore([_candle(0), _candle(1)])
+    source = FakeSource([_candle(2)], last=0)
+
+    funding = tmp_path / "funding.jsonl"
+    funding.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "funding_rate": 0.0001, '
+        '"basis": 0.0002, "open_interest": 5000.0}\n',
+        encoding="utf-8",
+    )
+
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        funding_features_file=str(funding),
+        market_data_store=store,
+    )
+    assert "funding_rate" in df.columns
+    assert "basis" in df.columns
+    assert "open_interest" in df.columns
+    assert df["funding_rate"].iloc[-1] == pytest.approx(0.0001)
+    assert df["basis"].iloc[-1] == pytest.approx(0.0002)
+
+
+def test_read_ohlc_dataframe_both_signal_files_merge(tmp_path) -> None:
+    """News + funding signals merge independently onto the OHLCV frame."""
+    store = FakeStore([_candle(0), _candle(1)])
+    source = FakeSource([_candle(2)], last=0)
+
+    signals = tmp_path / "news.jsonl"
+    signals.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "sentiment_score": 0.7, '
+        '"article_count": 5, "novelty_flag": false}\n',
+        encoding="utf-8",
+    )
+    funding = tmp_path / "funding.jsonl"
+    funding.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "funding_rate": 0.0003, '
+        '"basis": 0.0004, "open_interest": 8000.0}\n',
+        encoding="utf-8",
+    )
+
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        extra_features_file=str(signals),
+        funding_features_file=str(funding),
+        market_data_store=store,
+    )
+    # Both signal sets present
+    assert "sentiment_score" in df.columns
+    assert "funding_rate" in df.columns
+    assert df["sentiment_score"].iloc[-1] == pytest.approx(0.7)
+    assert df["funding_rate"].iloc[-1] == pytest.approx(0.0003)

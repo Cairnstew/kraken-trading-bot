@@ -56,6 +56,14 @@ feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 # the OHLCV frame by timestamp. Null/empty disables the feature.
 extra_features_file: null
 
+# Path to a JSONL file of per-(ticker, hour) funding-rate/basis vectors
+# produced by the sibling `kraken-funding-rates` project:
+#   python ~/Projects/kraken-funding-rates/cli.py pull --pair ETH/USD \
+#     --output signals/eth_usd_funding.jsonl
+# Columns: funding_rate, basis, open_interest.  Merged after news signals
+# via the same timestamp-floor left-join.  Null/empty disables the feature.
+funding_features_file: null
+
 # --- Local market-data store (optional) ----------------------------------
 # Path to the root of the sibling `kraken-market-data` store — the
 # directory containing its `_meta.json` cursor sidecar and the
