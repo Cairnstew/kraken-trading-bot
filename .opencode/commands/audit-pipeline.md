@@ -96,7 +96,7 @@ check `gh repo list Cairnstew --limit 100` for the full inventory).
 | Auditor | `general` | `false` | Read-only code audit, pipeline mapping, gap enumeration → `AUDIT.md` |
 | Researcher ×2 | `general` | `false` | Library/API research for top gaps → `RESEARCH.md` |
 | Architect | `general` | `false` | Decision: pick one (gap, library) pair → `DECISION.md` |
-| Builder | `build` | `true` | Scaffold the new project per DECISION.md |
+| Builder | `build` | `true` | Scaffold the project (new sibling repo) or implement the improvement per DECISION.md |
 | Integrator | `build` | `true` | Wire minimum integration seam in this repo |
 | Reviewer | `qa` | `false` | Validate tests, flake check, write `PLAN.md` |
 
@@ -125,7 +125,7 @@ board and complete tasks manually as each agent reports).
 | `research-2` | Researcher: library survey for top gap #2 | `audit` |
 | `research-3` | Researcher: library survey for top gap #3 | `audit` |
 | `decision` | Architect: pick one (gap, library) pair → `DECISION.md` | all `research-*` |
-| `scaffold` | Builder: create new project per DECISION.md | `decision` |
+| `scaffold` | Builder: create new project (4A) or implement improvement (4B) per DECISION.md | `decision` |
 | `integrate` | Integrator: wire minimum seam in this repo | `scaffold` |
 | `verify` | Reviewer: run tests, flake check, write `PLAN.md` | `integrate` |
 
@@ -169,13 +169,17 @@ delivers their result and any task-completed status). Do **not** poll.
 4. **CHECKPOINT:** Read DECISION.md. Show it to the user. Wait for explicit go.
 
 5. After user go: spawn the builder (`build`, own worktree, `claim_task: scaffold`). Give it:
-   DECISION.md, the house style context, and the Phase 4 spec. The builder creates the sibling
-   repo, commits everything, and **creates + pushes the GitHub remote when `gh` is
-   authenticated** (see Phase 4 step 8).
+   DECISION.md, the house style context, and the Phase 4 spec (4A for `NEW-DATA-SOURCE`, 4B for
+   `IMPROVE-EXISTING`). The builder creates the sibling repo **or implements the improvement in
+   the existing target(s)**, commits everything, and **creates + pushes the GitHub remote when
+   `gh` is authenticated** (see Phase 4 step 8 / 4B) or pushes the touched existing repo.
 
 6. When the builder reports done: `team_shutdown`, `team_merge`. Inspect the merged diff. Then
    spawn the integrator (`build`, own worktree, `claim_task: integrate`). Give it: DECISION.md,
-   the Phase 5 spec. The integrator adds the minimum adapter stub in this repo.
+   the Phase 5 spec. The integrator adds the minimum adapter stub in this repo (for a
+   `NEW-DATA-SOURCE`); for an `IMPROVE-EXISTING` outcome whose work already lands in this repo,
+   the integrator's job is to confirm the seam is wired through train/backtest/paper and close
+   any call-site gaps found.
 
 7. When the integrator reports done: merge. Then spawn the reviewer (`qa`, `worktree: false`,
    `claim_task: verify`). Give it: the full diff scope, the Phase 6 spec. The reviewer runs
@@ -208,6 +212,10 @@ Do not propose solutions yet.
    all), and exactly where it enters the RL feature space or a strategy's `tick()` inputs.
 3. Enumerate every plausible gap or improvement vector you can find evidence for. Do not
    pre-filter toward one category. Illustrative, not exhaustive:
+   - Improve what already exists (the highest-directness items are often here): dead/ceremonial
+     code paths, effective-but-unapplied machinery, missing schedulers/timers, duplicated
+     constants, config keys that exist but nothing reads, unthrottled/unretried fetches, thin
+     historical depth vs. what models need
    - Text/news signal (headlines, articles, press releases for a ticker or sector)
    - Research/academic signal (papers, citation trends)
    - On-chain/crypto-native data (exchange flows, whale activity, network/gas metrics, stablecoin
@@ -233,8 +241,11 @@ Write `.data-audit/AUDIT.md` and end with `AUDIT COMPLETE`.
 Do not write code yet.
 
 Each researcher takes one of the top 2-3 gaps from AUDIT.md and searches out concrete
-libraries/APIs/packages that could source it. Search broadly; do not limit yourself to any fixed
-list.
+libraries/APIs/packages that could source it — or, for an `IMPROVE-EXISTING` gap (a data-quality,
+reliability, or operational-improvement candidate), the concrete approaches/libraries/patterns
+that could implement the improvement (e.g. a scheduler pattern for the pullers, a
+normalization/z-scoring reference, a config-driven seam). Search broadly; do not limit yourself
+to any fixed list.
 
 As a reference example of the rigor expected, a prior survey of text/news sourcing covered
 `newspaper4k`, `trafilatura`, `feedparser`, `newsapi-python`, `GNews`, and for academic sources
@@ -255,17 +266,30 @@ Each researcher appends its findings to `.data-audit/RESEARCH.md`. End with `RES
 
 Do not scaffold yet.
 
-1. Pick exactly one (gap, library) pair for this pass. One clean pipeline beats three half-built
-   ones.
+1. **Choose the pass outcome type first.** Both are legitimate; let the AUDIT.md evidence decide,
+   never default to "new project" just because that is the familiar shape:
+   - **`NEW-DATA-SOURCE`** — a new keyless/paid source shipped as a new sibling project (the
+     historical default).
+   - **`IMPROVE-EXISTING`** — improving code/infra that already exists: this repo's own pipeline
+     (actually applying the normalization stack, a wired scheduler, a proven seam refactor such
+     as reading `_SIGNAL_COLUMNS` from config, fixing a duplicated tuple) **or** an existing
+     sibling project (wider/denser store, backfill, cache, ops hardening, flake-input wiring).
+     An improvement that AUDIT.md ranks highest-directness must be a *candidate outcome*, not a
+     footnote, even though it creates no new repo.
+   Then pick exactly one (gap, improvement-or-library) target for that outcome. One clean
+   outcome beats three half-built ones.
 2. Justify it against the RL pipeline's real shape from AUDIT.md: config inputs, the
-   `train`/`backtest` knobs, and the `models/{TICKER_ID}/{model_name}/` artifact layout. The new
-   feature must land somewhere a feature-engineering step can read it per ticker.
-3. Name the project: in the `kraken-*` family if Kraken/crypto-specific, otherwise a
-   source-oriented name. State why.
-4. Target location: a new git repo in a sibling directory, `../<new-project-name>/`, not nested
-   inside this repo and not a submodule.
-5. Write DECISION.md: chosen gap, library(ies), project name and path, a one-paragraph
-   integration sketch (see Phase 5), and the runner-up options and why they lost.
+   `train`/`backtest` knobs, and the `models/{TICKER_ID}/{model_name}/` artifact layout. State the
+   exact landing point — a feature-engineering step, the store adapter, the scheduler, a config
+   key — where the feature or fix is read per ticker.
+3. For `NEW-DATA-SOURCE`: name the project (in the `kraken-*` family if Kraken/crypto-specific,
+   otherwise a source-oriented name) and state why. Target location: a new git repo in a sibling
+   directory, `../<new-project-name>/`, not nested inside this repo and not a submodule.
+   For `IMPROVE-EXISTING`: name the touched repo(s) — this repo, a sibling, or both — and the
+   in-scope files/units. There is no new repo and no naming step.
+4. Write DECISION.md: outcome type, chosen gap, library(ies) if any, project name and path (or
+   improvement scope), a one-paragraph integration sketch (see Phase 5), and the runner-up
+   options and why they lost.
 
 Write `.data-audit/DECISION.md` and end with `DECISION COMPLETE`.
 
@@ -273,7 +297,12 @@ Write `.data-audit/DECISION.md` and end with `DECISION COMPLETE`.
 
 # PHASE 4 — SCAFFOLD (builder)
 
-Create the sibling repo per DECISION.md, mirroring the house style above.
+Execute DECISION.md's outcome type. The house style below (pyproject/flake/package layout/
+cli/tests/env/README) applies to **new** projects; for an `IMPROVE-EXISTING` outcome, skip the
+repo-creation steps and apply the same discipline (typed dataclasses, export registry,
+offline tests, `.env.example`, README updates) to the existing target.
+
+## 4A. `NEW-DATA-SOURCE` — create the sibling repo per DECISION.md
 
 1. `git init` the new directory.
 2. `pyproject.toml` (same metadata shape as `kraken-python`) and a Nix flake dev shell.
@@ -297,8 +326,19 @@ Create the sibling repo per DECISION.md, mirroring the house style above.
    a remote URL; record the real one in the registry (see the project list above) after
    pushing.
 
+## 4B. `IMPROVE-EXISTING` — implement the decision in the existing target(s)
+
+1. No `git init`, no `gh repo create`. Work in the repo(s) DECISION.md names.
+2. Implement exactly the in-scope units listed in DECISION.md — no adjacent rewrites.
+3. Follow the same house style for any code added: typed dataclasses, `to_dict()`/`from_*()`,
+   export registry, offline tests for new behaviour, `.env.example` updated if a config key is
+   added, README/flake updated if the repo's surface changes.
+4. Commit in the worktree. If the target repo has a remote, push when `gh` is ready; a fix that
+   is pushed first time gets its registry row updated (see registry note above).
+
 Commit everything in the worktree. Report done via `team_message` with the diff and commit hash
-(and the new GitHub URL, or "not pushed — no gh/auth" if skipped).
+(and, for 4A, the new GitHub URL, or "not pushed — no gh/auth" if skipped; for 4B, the repo and
+commit touched, or "not pushed — no gh/auth" if skipped).
 
 ---
 
@@ -316,7 +356,9 @@ prove it.
    scope.
 3. Write `INTEGRATION.md` in the new project (linked from its README): output schema, refresh
    cadence, how this bot consumes it today, and how a follow-up pass would wire it fully into
-   `train`/`backtest`.
+   `train`/`backtest`. For an `IMPROVE-EXISTING` outcome that lands here rather than in a new
+   project, skip `INTEGRATION.md`; the improvement's wiring notes belong in the commit message
+   and `PLAN.md`.
 
 Commit in the worktree. Report done via `team_message` with the diff and commit hash.
 
@@ -325,11 +367,14 @@ Commit in the worktree. Report done via `team_message` with the diff and commit 
 # PHASE 6 — VALIDATE, INTEGRATION-TEST, AND REPORT (reviewer)
 
 The reviewer must do **both** unit validation and a **real end-to-end
-integration test of the bot against the new data source** — the point of the
-source is that the bot consumes it, so a positive result is an actual
-train/backtest reading through it. Everything below was live-verified for the
-`kraken-market-data` pass (period: real Kraken data, 2026-09-28); adapt the
-commands to the chosen source.
+integration test of the bot against the pass's outcome** — the point of the
+outcome is that the bot consumes it, so a positive result is an actual
+train/backtest reading through it (a new source) **or** an actual
+train/backtest proving the improvement changes what the bot sees
+(`IMPROVE-EXISTING` — e.g. the normalization stack is now applied, the
+scheduler keeps the signal fresh, the widened seam reaches the observation).
+Everything below was live-verified for the `kraken-market-data` pass (period:
+real Kraken data, 2026-09-28); adapt the commands to the chosen outcome.
 
 1. **Sub-project validation**: new project's offline tests + `nix flake check`
    if applicable. Then this repo's `pytest` to confirm the adapter broke
@@ -393,9 +438,10 @@ Never commit scratch models/store from a smoke test (keep them in `/tmp/...`).
 
 # PHASE 7 — FURTHER DEVELOPMENT (lead + builder, when the gate fails OR on request)
 
-The command does not stop at "scaffolded". The user wants the new data source
-to be *positive for the bot* and continued development of **both** the
-sub-project and main repo.
+The command does not stop at "scaffolded" (or "improvement landed"). The user
+wants the pass's outcome (new data source **or** improvement slice) to be
+*positive for the bot*, and continued development of the sub-project(s) and
+main repo alike.
 
 1. **If Phase 6 returns `NEEDS_FIX`** (errors, regressions, feature-width
    mismatch, store not persisting): spawn a builder (`build`, own worktree,
@@ -505,13 +551,23 @@ inventory only.
   proposal: read `_SIGNAL_COLUMNS` from a single source (config) — the 2-file
   sync (data.py + features.py) is now a 3-pass repeated dance (news, funding,
   social) with a silent-drop failure mode; AUDIT.md and PLAN.md both flag it.
+- 2026-09-28 — the command only shipped NEW-DATA-SOURCE outcomes: Phase 3
+  mandated "name the project / new sibling repo" and Phase 4 was `git init` +
+  `gh repo create`, so when the audit ranked a pure-code improvement as the
+  highest-directness item (normalization wiring), the architect had no routing
+  and deferred it as "companion hardening". Added an explicit outcome-type
+  branch — `NEW-DATA-SOURCE` vs `IMPROVE-EXISTING` — to Phase 3/4 (4A/4B), the
+  spawn sequence, Phase 5/6 wording, the team-shape/task-board tables, and the
+  registry guardrail. The audit now lists "improve what already exists" as the
+  first gap category. Improvement outcomes are decided by AUDIT.md evidence,
+  never defaulted to new-project.
 
 ---
 
 ## Guardrails
 
 - The audit must genuinely span multiple categories before narrowing.
-- One data vector per pass.
+- One data vector (new source) or one improvement slice per pass.
 - Never commit real API keys; follow the `.env.example` convention.
 - Respect each source's rate limits and terms of use; prefer keyless sources over paid ones unless
   DECISION.md justifies the cost.
@@ -520,10 +576,11 @@ inventory only.
   not ask permission for repo creation/push when `gh` is ready — this is the intended workflow.
   Only ask before opening a PR or changing remote visibility after the push. If `gh` is
   unavailable, record the local-only state in the registry and note it in the report.
-- **Keep the "Current data-source projects" registry current**: on every run, after scaffold,
-  add the new project's row with its GitHub URL + local path; if an existing project (e.g.
-  `ticker-news-signals`, `kraken-market-data`) has no URL yet and none was pushed, note
-  "not pushed yet" and offer to push it as a follow-up.
+- **Keep the "Current data-source projects" registry current**: on every run, after scaffold (4A)
+  or after an `IMPROVE-EXISTING` pass that pushes an existing project for the first time, add or
+  update the row — new project gets its GitHub URL + local path; an existing project (e.g.
+  `kraken-funding-rates`) with no URL yet and none was pushed gets "not pushed yet" and an offer
+  to push it as a follow-up.
 - If a later phase invalidates an earlier decision (e.g. the chosen library turns out to be
   unmaintained), stop and redo the earlier phase rather than pushing on.
 - Do not poll teammates or sleep while waiting — see "Waiting on teammates".
