@@ -38,6 +38,7 @@ from .data import (
     candles_to_dataframe,
     fetch_ohlc_dataframe,
     prepare_episode,
+    read_ohlc_dataframe,
 )
 from .environment import RewardSpec, TradingEnvironment
 from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
@@ -58,6 +59,7 @@ __all__ = [
     "NotEnoughDataError",
     "candles_to_dataframe",
     "fetch_ohlc_dataframe",
+    "read_ohlc_dataframe",
     "prepare_episode",
     "load_train_config",
     "build_train_config",

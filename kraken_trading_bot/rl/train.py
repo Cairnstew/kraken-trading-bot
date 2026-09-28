@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from .agent import RLAgent
-from .data import fetch_ohlc_dataframe, prepare_episode
+from .data import prepare_episode, read_ohlc_dataframe
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
 from .registry import ModelRecord, register_model
@@ -116,7 +116,9 @@ def train_ticker(
        arrive as ``overrides``).
     2. Determine the Kraken pair from ``ticker_id`` (``ETH_USD`` ->
        ``ETH/USD``).
-    3. Fetch OHLC history with client-side pagination.
+    3. Fetch OHLC history with client-side pagination (read through the
+       local ``market_data_store`` when ``configs/default.yaml`` sets one;
+       otherwise the live fetch, unchanged).
     4. Fit a :class:`FeaturePipeline` from the config on the fetched
        data.
     5. Build a :class:`TradingEnvironment` from the config (fee,
@@ -152,12 +154,13 @@ def train_ticker(
     action_space = cfg.get("action_space", "continuous")
 
     _LOGGER.info("Fetching %d pages of %s %d-minute OHLC", pages, pair, interval)
-    df = fetch_ohlc_dataframe(
+    df = read_ohlc_dataframe(
         pair,
         interval=interval,
         pages=pages,
         manager=manager,
         extra_features_file=cfg.get("extra_features_file"),
+        market_data_store=cfg.get("market_data_store"),
     )
 
     features = FeaturePipeline(

@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .agent import RLAgent
-from .data import fetch_ohlc_dataframe
+from .data import read_ohlc_dataframe
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
 from .registry import ModelRecord, scan_model
@@ -135,12 +135,13 @@ def backtest_model(
         interval = int(
             (record.config or {}).get("ohlcv_interval_minutes", 60)
         )
-        df = fetch_ohlc_dataframe(
+        df = read_ohlc_dataframe(
             record.config.get("ticker", ticker_key.replace("_", "/")),
             interval=interval,
             pages=pages,
             manager=manager,
             extra_features_file=record.config.get("extra_features_file"),
+            market_data_store=(record.config or {}).get("market_data_store"),
         )
     else:
         df = data

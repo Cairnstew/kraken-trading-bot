@@ -56,6 +56,19 @@ feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 # the OHLCV frame by timestamp. Null/empty disables the feature.
 extra_features_file: null
 
+# --- Local market-data store (optional) ----------------------------------
+# Path to the root of the sibling `kraken-market-data` store — the
+# directory containing its `_meta.json` cursor sidecar and the
+# {PAIR_ID}/{interval_min}/{YYYY-MM}.parquet month-sliced files, e.g.
+#   ~/Projects/kraken-market-data/store
+# When set, `read_ohlc_dataframe` loads OHLCV as fetch -> upsert -> read:
+# every window is also appended into the store, so later reads can return
+# deeper history than Kraken's ~720-bar REST ceiling and train/backtest/
+# paper-trade share one venue-consistent source of truth. Null/empty (the
+# default) falls back to the live paginated Kraken fetch. See
+# `kraken-market-data/INTEGRATION.md` for the full consumer contract.
+market_data_store: null
+
 # --- Model metadata -----------------------------------------------------
 # Directory layout: models/{ticker_id}/{model_name}/
 #   model.zip, normalization.npz, config.yaml

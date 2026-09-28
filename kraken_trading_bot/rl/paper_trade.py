@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 
 from .agent import RLAgent
-from .data import NotEnoughDataError, fetch_ohlc_dataframe
+from .data import NotEnoughDataError, read_ohlc_dataframe
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
 from .registry import scan_model
@@ -278,15 +278,21 @@ class PaperTrader:
     # data flow per tick
     # ------------------------------------------------------------------
     def _fetch_data(self) -> pd.DataFrame:
-        """Return the latest OHLCV window (``pages=2`` public fetch)."""
+        """Return the latest OHLCV window (``pages=2`` public fetch).
+
+        When the model config sets ``market_data_store``, the window is read
+        through the local store (fetch -> upsert -> read), so each tick both
+        appends to the store and reads the fresh tail back.
+        """
         if self._data_fetcher is not None:
             return self._data_fetcher(self.pair, self.ohlcv_interval_minutes)
-        return fetch_ohlc_dataframe(
+        return read_ohlc_dataframe(
             self.pair,
             interval=self.ohlcv_interval_minutes,
             pages=_FETCH_PAGES,
             manager=self.manager,
             extra_features_file=self.config.get("extra_features_file"),
+            market_data_store=self.config.get("market_data_store"),
         )
 
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:

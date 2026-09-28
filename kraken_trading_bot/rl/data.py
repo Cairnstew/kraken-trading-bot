@@ -13,12 +13,22 @@ Exogenous signal merging (:func:`merge_extra_features`) left-joins
 per-(ticker, hour) signal vectors produced by the sibling
 ``ticker-news-signals`` project onto the OHLCV frame by floored
 bar timestamp.
+
+Local market-data store integration (:func:`read_ohlc_dataframe`): when the
+``market_data_store`` config key points at the sibling ``kraken-market-data``
+store root, loading becomes fetch -> ``upsert`` -> ``read`` — every window is
+also appended to the store, and later reads can return deeper history than
+Kraken's ~720-bar REST ceiling.  The store is imported lazily and only when
+configured, so ``kraken-market-data`` stays an optional, duck-typed accent of
+this package.  See ``kraken-market-data/INTEGRATION.md`` for the full
+consumer contract.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
@@ -197,6 +207,50 @@ def candles_to_dataframe(candles: Sequence[Any]) -> pd.DataFrame:
     return df
 
 
+def _page_candles(
+    pair: str,
+    interval: int,
+    pages: int,
+    manager: Any,
+    since: int | None,
+) -> list[Any]:
+    """Page through a Kraken-compatible source ``ohlc`` and collect candles.
+
+    Follows the exchange's ``last`` cursor exactly as the loop in
+    :func:`fetch_ohlc_dataframe` always has: each call to
+    ``manager.ohlc(pair, interval=..., since=cursor)`` returns
+    ``(candles, last)``, the next call passes ``since=last``, and the loop
+    stops after ``pages`` pages, when the source reports ``last == 0``
+    (history exhausted), or when a page returns no candles.  This is shared
+    by the live fetch and the ``market-data`` store read-through adapter so
+    the two paths can never drift apart on pagination semantics.
+
+    Args:
+        pair: Kraken pair notation, e.g. ``"ETH/USD"``.
+        interval: Candle interval in minutes.
+        pages: Maximum number of OHLC pages to fetch.
+        manager: Anything exposing ``ohlc(pair, interval, since) ->
+            (candles, last)`` (a ``KrakenManager`` or a duck-typed source).
+        since: Optional start cursor for the first page (epoch seconds).
+
+    Returns:
+        The collected Candle-like objects (may be empty).
+    """
+    if pages < 1:
+        raise ValueError(f"`pages` must be >= 1, got {pages}")
+    collected: list[Any] = []
+    cursor: int | None = since
+    for _ in range(pages):
+        batch, last = manager.ohlc(pair, interval=interval, since=cursor)
+        if batch:
+            collected.extend(batch)
+        if last == 0 or not batch:
+            _LOGGER.debug("OHLC history exhausted at cursor %s", cursor)
+            break
+        cursor = last
+    return collected
+
+
 def fetch_ohlc_dataframe(
     pair: str,
     interval: int,
@@ -234,23 +288,12 @@ def fetch_ohlc_dataframe(
     Raises:
         NotEnoughDataError: If no candles could be fetched at all.
     """
-    if pages < 1:
-        raise ValueError(f"`pages` must be >= 1, got {pages}")
     if manager is None:  # deferred import: only needed for live fetching
         from kraken_api import KrakenManager
 
         manager = KrakenManager.from_env()
 
-    collected: list[Any] = []
-    cursor: int | None = since
-    for _ in range(pages):
-        batch, last = manager.ohlc(pair, interval=interval, since=cursor)
-        if batch:
-            collected.extend(batch)
-        if last == 0 or not batch:
-            _LOGGER.debug("OHLC history exhausted at cursor %s", cursor)
-            break
-        cursor = last
+    collected = _page_candles(pair, interval, pages, manager, since)
 
     if not collected:
         raise NotEnoughDataError(1, 0, what="OHLC candles")
@@ -260,6 +303,155 @@ def fetch_ohlc_dataframe(
     # keep the first occurrence per timestamp.
     df = df[~df.index.duplicated(keep="first")].sort_index()
     return merge_extra_features(df, extra_features_file)
+
+
+def read_ohlc_dataframe(
+    pair: str,
+    interval: int,
+    *,
+    pages: int = 6,
+    manager: "KrakenManager | None" = None,
+    since: int | None = None,
+    until: int | None = None,
+    extra_features_file: str | None = None,
+    market_data_store: Any = None,
+    market_data_source: Any = None,
+) -> pd.DataFrame:
+    """Read OHLCV through the local market-data store, or fall back to live.
+
+    The integration seam for the sibling ``kraken-market-data`` project.
+    When ``market_data_store`` is set, this performs **fetch -> upsert ->
+    read**: the window is paged from Kraken exactly as
+    :func:`fetch_ohlc_dataframe` does, appended into the store, and then
+    read back — so the requested window is also persisted and later reads
+    can return deeper history than Kraken's ~720-bar REST ceiling.  When
+    ``market_data_store`` is unset (the config default, ``null``), it is a
+    pass-through to :func:`fetch_ohlc_dataframe` and behaviour is
+    byte-identical, which keeps the existing train/backtest/paper call
+    sites working unchanged.
+
+    Args:
+        pair: Kraken pair notation, e.g. ``"ETH/USD"``.
+        interval: Candle interval in minutes.
+        pages: Maximum number of OHLC pages to fetch before the read.
+        manager: A :class:`kraken_api.KrakenManager` for the fetch leg;
+            defaults to ``KrakenManager.from_env()`` when omitted.
+        since: Inclusive lower bound on the returned window (epoch seconds
+            or ``None`` for the whole store).
+        until: Exclusive upper bound on the returned window (epoch seconds
+            or ``None`` for no bound).
+        extra_features_file: Passed to :func:`merge_extra_features` on the
+            read frame, exactly as in :func:`fetch_ohlc_dataframe`.
+        market_data_store: ``null`` (live fetch), a store root path, or a
+            store-like object exposing ``upsert``/``read`` (see
+            :func:`_resolve_store`).
+        market_data_source: Fetch source for the upsert leg; defaults to
+            ``manager``.  Anything exposing ``ohlc(pair, interval, since)
+            -> (candles, last)`` works (a live ``KrakenManager``, the
+            store's own thin client, or a fake in tests).
+
+    Returns:
+        The same DataFrame shape :func:`fetch_ohlc_dataframe` returns
+        (UTC ``DatetimeIndex``, columns ``time, open, high, low, close,
+        vwap, volume, count``).
+
+    Raises:
+        ValueError: If a store *path* is configured but the sibling
+            package is not importable.
+        TypeError: If ``market_data_store`` is neither null, a path, nor a
+            store-like object.
+        NotEnoughDataError: If the read window is empty.
+
+    .. todo:: Follow-up integration pass (see ``kraken-market-data/
+       INTEGRATION.md``): honour ``since``/``until`` from config; drive
+       train/eval split and walk-forward through the currently-unused
+       ``TradingEnvironment.reset(options=...)``; let backtest skip the
+       re-fetch and paper trade collapse to append + tail read.
+    """
+    if market_data_store is None:
+        return fetch_ohlc_dataframe(
+            pair,
+            interval=interval,
+            pages=pages,
+            manager=manager,
+            since=since,
+            extra_features_file=extra_features_file,
+        )
+
+    store = _resolve_store(market_data_store)
+
+    source = market_data_source if market_data_source is not None else manager
+    if source is None:  # deferred import: only needed for live fetching
+        from kraken_api import KrakenManager
+
+        source = KrakenManager.from_env()
+
+    # fetch -> upsert: page the window from the source and append it to the
+    # store, so the read below covers both pre-existing history and the
+    # just-fetched bars.
+    candles = _page_candles(pair, interval, pages, source, since)
+    if candles:
+        store.upsert(pair, interval, candles)
+        _LOGGER.info(
+            "Upserted %d %d-minute %s bars into market-data store",
+            len(candles),
+            interval,
+            pair,
+        )
+    else:
+        _LOGGER.warning(
+            "market-data store fetch returned no candles for %s/%d — "
+            "reading whatever the store already has",
+            pair,
+            interval,
+        )
+
+    df = store.read(pair, interval, since=since, until=until)
+    if isinstance(df, pd.DataFrame) and df.empty:
+        raise NotEnoughDataError(1, 0, what="OHLC candles")
+    return merge_extra_features(df, extra_features_file)
+
+
+def _resolve_store(market_data_store: Any) -> Any:
+    """Resolve the ``market_data_store`` config value to a usable store.
+
+    Two shapes are accepted, both duck-typed against the sibling
+    ``kraken-market-data`` contract (``upsert(pair, interval, candles)``
+    plus ``read(pair, interval, since, until) -> DataFrame``):
+
+    * a **path** (``str``/``os.PathLike``) to a store root — the sibling
+      package is imported lazily and ``MarketDataStore(path)`` is built
+      (raises a clear error if it is not installed);
+    * a **store-like object** — used directly, which is what lets tests
+      (and embedded callers) drive the seam without the sibling package.
+
+    Returns:
+        An object exposing the store's ``upsert``/``read`` contract.
+
+    Raises:
+        ValueError: If the sibling package is missing for a path config.
+        TypeError: If the value is neither a path nor a store-like object.
+    """
+    upsert = getattr(market_data_store, "upsert", None)
+    read = getattr(market_data_store, "read", None)
+    if callable(upsert) and callable(read):
+        return market_data_store
+    if isinstance(market_data_store, (str, os.PathLike)):
+        try:  # deferred import: optional accent, not a hard dependency
+            from market_data.store import MarketDataStore
+        except ImportError as exc:  # pragma: no cover - env dependent
+            raise ValueError(
+                "market_data_store is configured but the sibling "
+                "`kraken-market-data` package is not importable; install it "
+                "or set market_data_store: null in config to use the live "
+                "paginated fetch."
+            ) from exc
+        return MarketDataStore(Path(market_data_store))
+    raise TypeError(
+        "market_data_store must be a store root path, a MarketDataStore-like "
+        "object with upsert()/read(), or None (live fetch); got "
+        f"{type(market_data_store).__name__}"
+    )
 
 
 def prepare_episode(
@@ -333,6 +525,9 @@ __all__ = [
     "candles_to_dataframe",
     "merge_extra_features",
     "fetch_ohlc_dataframe",
+    "read_ohlc_dataframe",
     "prepare_episode",
     "_minimum_bars",
+    "_page_candles",
+    "_resolve_store",
 ]
