@@ -102,7 +102,9 @@ Spawning: read-only roles (auditor, researchers, architect, reviewer) must be sp
 `worktree: false` explicitly — otherwise the plugin may give them a worktree and their handoff
 artifact (e.g. `PLAN.md`) lands in that worktree instead of the main repo's `./.data-audit/`,
 and `team_cleanup` later asks to acknowledge their uncommitted changes. If that happens anyway,
-copy the artifact into the main repo before cleanup.
+copy the artifact into the main repo before cleanup. After Phase 6, the reviewer is followed by
+zero or more builder slices in Phase 7 (fix loop / further development); each is a normal
+`build` + worktree + merge cycle.
 
 ## Task board
 
@@ -175,9 +177,13 @@ delivers their result and any task-completed status). Do **not** poll.
 
 7. When the integrator reports done: merge. Then spawn the reviewer (`qa`, `worktree: false`,
    `claim_task: verify`). Give it: the full diff scope, the Phase 6 spec. The reviewer runs
-   tests, flake check, and writes PLAN.md.
+   tests, flake check, **the end-to-end integration test of the bot against the new data
+   source** (store-backed train/backtest vs baseline control — see Phase 6), writes
+   `VALIDATION.md` + `PLAN.md`, and returns a gate verdict.
 
-8. After the reviewer reports: run final verification yourself (Phase 6 commands), then
+8. After the reviewer reports: read the gate verdict. If `NEEDS_FIX`, run Phase 7 fix loop
+   (spawn a builder, merge, re-verify) until the node turns `PASS`. Then run final
+   verification yourself (Phase 6 commands), push both repos if `gh` is ready, and
    `team_cleanup`.
 
 Note for cleanup: teammates that wrote handoff artifacts into the main repo's `./.data-audit/`
@@ -313,14 +319,102 @@ Commit in the worktree. Report done via `team_message` with the diff and commit 
 
 ---
 
-# PHASE 6 — VALIDATE AND REPORT (reviewer)
+# PHASE 6 — VALIDATE, INTEGRATION-TEST, AND REPORT (reviewer)
 
-1. Run the new project's tests and `nix flake check` if applicable; run this repo's existing
-   `pytest` to confirm the adapter stub broke nothing.
-2. Write `.data-audit/PLAN.md`: what was audited, what was deferred (the other candidate gaps),
-   what was built, and concrete next steps for fully wiring the signal into the RL pipeline.
-3. Report to the user: the new repo's path, how to run it (`nix develop`, `cli.py extract ...`),
-   and the deferred integration work.
+The reviewer must do **both** unit validation and a **real end-to-end
+integration test of the bot against the new data source** — the point of the
+source is that the bot consumes it, so a positive result is an actual
+train/backtest reading through it. Everything below was live-verified for the
+`kraken-market-data` pass (period: real Kraken data, 2026-09-28); adapt the
+commands to the chosen source.
+
+1. **Sub-project validation**: new project's offline tests + `nix flake check`
+   if applicable. Then this repo's `pytest` to confirm the adapter broke
+   nothing (expected: pre-existing count + new adapter tests, all green).
+
+2. **Seed the data source live** (needs network, keyless source): for the
+   market-data store,
+   `cd ~/Projects/kraken-market-data && nix develop --command bash -c
+   "MARKET_DATA_DIR=/tmp/kmd-test/store python cli.py update --pair ETH/USD --interval 60"`
+   then confirm with `... python cli.py stats` (bars, span, contiguous via
+   `... python cli.py verify --pair ETH/USD --interval 60`).
+
+3. **Train the bot through the source** (store-backed): write a scratch config
+   (e.g. `/tmp/kmd-test/config.yaml`) with `market_data_store: /tmp/kmd-test/store`
+   and small budget (`--pages 2 --timesteps 3000`, discrete for speed), then
+   from this repo:
+   `nix develop --command bash -c "kraken-trading-bot train --ticker ETH_USD
+   --model ppo_store_smoke --config /tmp/kmd-test/config.yaml --pages 2
+   --timesteps 3000 --models-root /tmp/kmd-test/models"`.
+   Success looks like: `Upserted N bars into market-data store` then
+   `Training PPO on N bars`.
+
+4. **Backtest through the source**:
+   `nix develop --command bash -c "kraken-trading-bot backtest --ticker ETH_USD
+   --model ppo_store_smoke --pages 2 --models-root /tmp/kmd-test/models"`
+   — record return/Sharpe/drawdown/trades.
+
+5. **Baseline control (no source)**: repeat train + backtest with a config
+   where `market_data_store: null` (fresh leaf config, same seed/timesteps) and
+   record the same metrics.
+
+6. **Positive-result gate** (this is what "results of the new data source are
+   positive" means):
+   - Store-backed train + backtest complete without error (no feature-width
+     mismatch, no `NotEnoughDataError`) and the store **persists**: `stats`
+     after the run shows bars ≥ seeded, `verify` still contiguous.
+   - Store-backed backtest is **equivalent** to the baseline within training
+     stochasticity (same window → |store − baseline| return within ~5 pts /
+     shares the same sign; do NOT gate on exact equality — PPO with a seed is
+     still stochastic across runs; the feature *vectors* must be identical).
+   - Optional but strong: show the source **unlocks depth** — for the store,
+     run `update` again and confirm bars grow beyond the seed (~721), i.e. the
+     accumulation that breaks the REST ~720-bar ceiling is observable.
+   - If the store-backed run is *worse* than baseline beyond stochasticity, or
+     errors occur, that is **not a pass**: record the failure in
+     `.data-audit/VALIDATION.md` and proceed to Phase 7.
+
+7. Write `.data-audit/VALIDATION.md`: the integration-test matrix above
+   (store-backed vs baseline metrics), the persistence proof, the gate
+   verdict (`PASS` / `NEEDS_FIX` + evidence). Write `.data-audit/PLAN.md`:
+   what was audited, what was deferred (the other candidate gaps), what was
+   built, and concrete next steps for fully wiring the signal into the RL
+   pipeline.
+
+8. Report to the user: new repo's path, how to run it (`nix develop`,
+   `cli.py extract ...`), the integration-test results, and the deferred work.
+
+Never commit scratch models/store from a smoke test (keep them in `/tmp/...`).
+
+---
+
+# PHASE 7 — FURTHER DEVELOPMENT (lead + builder, when the gate fails OR on request)
+
+The command does not stop at "scaffolded". The user wants the new data source
+to be *positive for the bot* and continued development of **both** the
+sub-project and main repo.
+
+1. **If Phase 6 returns `NEEDS_FIX`** (errors, regressions, feature-width
+   mismatch, store not persisting): spawn a builder (`build`, own worktree,
+   `claim_task: scaffold` or a new `dev-fix` task) with the VALIDATION.md
+   evidence and a scoped fix brief. The fix may touch **either** repo: the
+   sibling project (store extraction/CLI bugs) or `kraken-trading-bot` (the
+   `read_ohlc_dataframe` adapter, config wiring, dev-shell imports). The
+   builder commits in its worktree; merge, re-run the Phase 6 integration test,
+   and repeat until the gate passes.
+2. **Iterative development loop** (the normal happy path): after a PASS, and
+   whenever the user asks for further development, spawn one developer at a
+   time on a named slice (e.g. "surface `since`/`until` on the train CLI",
+   "walk-forward via `TradingEnvironment.reset(options=...)`", "wire the NixOS
+   module into the bot host", "add `kraken-market-data` flake input to the bot
+   dev shell"). Each slice: spawn → merge → **re-run the relevant Phase 6
+   checks** (bot suite + integration test for that slice) → update PLAN.md /
+   VALIDATION.md → next slice. One slice per pass, tests green before moving
+   on.
+3. Both repos' changes are committed in their own worktrees and pushed when
+   `gh` is ready (the sibling pushes to its own origin; this repo pushes to
+   `github.com/Cairnstew/kraken-trading-bot`). The registry in this command
+   stays the single source of truth for repo URLs.
 
 ---
 
@@ -343,3 +437,11 @@ Commit in the worktree. Report done via `team_message` with the diff and commit 
 - If a later phase invalidates an earlier decision (e.g. the chosen library turns out to be
   unmaintained), stop and redo the earlier phase rather than pushing on.
 - Do not poll teammates or sleep while waiting — see "Waiting on teammates".
+- **The integration test is mandatory, not optional.** A pass is not "scaffolded and unit-tested";
+  it is "the bot trained and backtested reading through the new source, equivalent to baseline,
+  with persistence observed" (Phase 6 gate). If the gate fails, Phase 7 must fix it before the
+  run is reported as done.
+- **Two repos, one loop.** Development continues in both the sub-project and `kraken-trading-bot`
+  after scaffold; every dev slice ends with both repos' tests green and, when `gh` is ready, both
+  pushed. Do not leave a dev slice half-pushed.
+- Scratch stores/models from integration tests live under `/tmp/...` only — never commit them.
