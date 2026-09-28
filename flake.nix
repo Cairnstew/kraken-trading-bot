@@ -4,9 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     kraken-python.url = "github:Cairnstew/kraken-python";
+    kraken-market-data.url = "git+https://github.com/Cairnstew/kraken-market-data";
   };
 
-  outputs = { self, nixpkgs, kraken-python }:
+  outputs = { self, nixpkgs, kraken-python, kraken-market-data }:
     let
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
@@ -56,6 +57,10 @@
             gymnasium
             pyyaml
             stable-baselines3
+            # kraken-market-data dependency closure (the sibling store is
+            # importable via PYTHONPATH below; these make its imports work).
+            requests
+            pyarrow
           ]);
         in
         {
@@ -63,8 +68,10 @@
             packages = [ python bot-pkg ];
             shellHook = ''
               echo "kraken-trading-bot dev shell"
+              export PYTHONPATH="${kraken-market-data.outPath}:$PYTHONPATH"
               command -v kraken-trading-bot && kraken-trading-bot --version
               python -c 'import kraken_api, pandas, numpy, gymnasium, yaml; print("deps: kraken-python, pandas, numpy, gymnasium, pyyaml")'
+              python -c 'import market_data, pyarrow, requests; print("sibling deps: kraken-market-data, pyarrow, requests")'
             '';
           };
         }
