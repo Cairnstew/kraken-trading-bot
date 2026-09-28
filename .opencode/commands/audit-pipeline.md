@@ -76,8 +76,8 @@ time, update its row.
 |---------|-----------|--------------|
 | `kraken-trading-bot` (this repo) | https://github.com/Cairnstew/kraken-trading-bot | `/home/seanc/Projects/kraken-trading-bot` |
 | `kraken-python` (foundation wrapper) | https://github.com/Cairnstew/kraken-python | `/home/seanc/Projects/kraken-python` |
-| `ticker-news-signals` (news → sentiment) | *(not pushed yet — create on next run)* | `/home/seanc/Projects/ticker-news-signals` |
-| `kraken-market-data` (OHLC store) | *(not pushed yet — create on next run)* | `/home/seanc/Projects/kraken-market-data` |
+| `ticker-news-signals` (news → sentiment) | https://github.com/Cairnstew/ticker-news-signals (private) | `/home/seanc/Projects/ticker-news-signals` |
+| `kraken-market-data` (OHLC store) | https://github.com/Cairnstew/kraken-market-data (private) | `/home/seanc/Projects/kraken-market-data` |
 
 Related siblings (not data sources): `opencode-ensemble`, `spotify-playlist-manager`,
 `x-python-api`, `steam-mcp`, `nixos-minecraft-modpacks` (all under `https://github.com/Cairnstew/…`,
