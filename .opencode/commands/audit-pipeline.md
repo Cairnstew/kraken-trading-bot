@@ -184,7 +184,8 @@ delivers their result and any task-completed status). Do **not** poll.
 8. After the reviewer reports: read the gate verdict. If `NEEDS_FIX`, run Phase 7 fix loop
    (spawn a builder, merge, re-verify) until the node turns `PASS`. Then run final
    verification yourself (Phase 6 commands), push both repos if `gh` is ready, and
-   `team_cleanup`.
+   `team_cleanup`. Finally run the **Phase 8 self-improvement checkpoint** (append RUN LOG,
+   commit it separately) before writing the final summary.
 
 Note for cleanup: teammates that wrote handoff artifacts into the main repo's `./.data-audit/`
 directly need no merge; teammates with a worktree you did not merge (the reviewer in this run)
@@ -418,6 +419,71 @@ sub-project and main repo.
 
 ---
 
+# PHASE 8 — SELF-IMPROVEMENT (lead, required after every run)
+
+The command improves itself. After `team_cleanup` and before the final summary,
+run a short, cheap checkpoint that captures what this run taught us about
+*running the command itself* (not the task's own findings). This keeps future
+runs cheaper and less error-prone.
+
+1. **Capture run-time lessons.** Notes about how THIS run exercised the
+   guidance in this file (or the repo/tooling it touches): a step that misled,
+   wasted effort, or was stale; a command in this file that no longer works or
+   proved awkward; a tool/CLI quirk discovered the hard way; a convention that
+   had to be rediscovered. Be concrete and evidence-grounded — never
+   aspirational.
+
+2. **Audit the guidance you relied on** against the run and the current repos:
+   are the paths real? do the CLI commands work as written? is the project
+   registry current (new repos pushed, URLs updated)? is any step now redundant?
+
+3. **Act per grounded lesson** (append-only to the RUN LOG below, or fix the
+   guidance directly):
+   - If the lesson is a CHEAP correction to this file (wrong command, stale
+     path, missing step), fix the relevant section **and** append a short RUN
+     LOG entry citing it.
+   - If the lesson is a tip/observation without a fix, append it to the RUN
+     LOG only.
+   - If the lesson belongs to a sibling repo (a bug in `kraken-market-data`,
+     `ticker-news-signals`, etc.) or an upstream tool, record it in the RUN
+     LOG as a **link** and, if it blocks the next run, note it in the final
+     summary — do not fix other repos during this checkpoint.
+   - Never invent lessons. If nothing concrete surfaced, append
+     `no lessons this run — <date>`.
+
+4. **Efficiency lens.** If a repeated pattern in this run (multiple identical
+   calls, an expensive full re-run when an incremental existed, a slow step
+   with a known faster alternative) is worth collapsing, append a
+   **proposal-only** line to the RUN LOG (`proposal: ...`). Do not build the
+   proposal this run — it is inventory for a future Phase 7 slice.
+
+5. **Commit the checkpoint.** The RUN LOG / guidance edit is its **own
+   commit** (`docs: audit-pipeline run log <date>`) in this repo, pushed when
+   `gh` is ready. Rollback is `git revert`.
+
+## RUN LOG
+
+Append-only. One entry per run. Format: `- <date> — lesson (what happened →
+what changed in this file).` Prefix a `proposal:` line when it is efficiency
+inventory only.
+
+- 2026-09-28 — private flake inputs need `git+https`, not `github:` (the
+  `github:` prefetcher cannot authenticate private repos; `git+https` uses the
+  `~/.git-credentials` helper `gh` already manages). When wiring a new sibling
+  into this repo's flake, use `git+https` and let `nix flake lock` verify.
+- 2026-09-28 — `kraken-market-data` CLI puts `--store` (or `MARKET_DATA_DIR`)
+  **before** the subcommand: `MARKET_DATA_DIR=... python cli.py update --pair
+  ETH/USD --interval 60` works; `python cli.py update ... --store` errors.
+  Phase 6 commands reflect this — keep them that way if the CLI changes.
+- 2026-09-28 — end-to-end integration smoke test of the store-backed path was
+  validated on real Kraken data (train + backtest through `market_data_store`,
+  baseline control, gate PASS). The bot's dev shell needed `pyarrow`+`requests`
+  and the sibling on `PYTHONPATH` before `market_data_store` worked — Phase 4's
+  scaffold step for a `kraken-*` data source should mention wiring the flake
+  input into the bot dev shell as a first-class deliverable.
+
+---
+
 ## Guardrails
 
 - The audit must genuinely span multiple categories before narrowing.
@@ -445,3 +511,5 @@ sub-project and main repo.
   after scaffold; every dev slice ends with both repos' tests green and, when `gh` is ready, both
   pushed. Do not leave a dev slice half-pushed.
 - Scratch stores/models from integration tests live under `/tmp/...` only — never commit them.
+- **Phase 8 self-improvement runs after every run.** The command file is not frozen; grounded
+  lessons shorten the next run. Skip it only when the run was aborted before any phase executed.
