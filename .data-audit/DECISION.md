@@ -1,135 +1,135 @@
-# DECISION — Phase 3: one (gap, library) pair for this pass
+# DECISION — Phase 8: one (gap, library) pair for this pass
 
 Author: Architect, audit-pipeline team. Read-only phase — this document decides; it does
-not scaffold. House-style mirror: `kraken-python` + the completed `ticker-news-signals` pass.
+not scaffold. Fresh Phase-8 decision, superseding the Phase-3 Gap-1 decision (store) that
+was built and validated in `kraken-market-data`; this decision is taken **after** the store
+and funding seams landed, against the fresh AUDIT.md and the three live-verified research
+surveys (social, microstructure, on-chain; 2026-09-28).
 
 ## 1. THE DECISION
 
-- **Chosen gap: GAP 1 — Local market-data store / backfill / replay** (data quality).
-- **Libraries: pandas + pyarrow** (parquet, month-sliced) with a `since`-cursor poller.
-  duckdb stays an *optional* verification layer (it reads the same parquet in place) — not
-  a v1 dependency. No new API, no new venue, no key, no ToS surface.
-- **Project name: `kraken-market-data`.**
-- **Path: `../kraken-market-data/` — a sibling git repo**, not nested in this repo and not
-  a submodule (same placement as `ticker-news-signals`).
+- **Chosen gap: CANDIDATE 1 — Social / search-trend** (original Gap 3, still open) — the
+  audit's own "best new modality" and the only remaining gap whose source set is both
+  keyless **and** immediately backfillable for train/backtest.
+- **Libraries: none new — plain HTTP via the house transport/client pattern** exactly as
+  the prior sibling passes use (`ticker-news-signals`, `kraken-funding-rates`): an
+  `requests`-style thin client in `transport/client` modules, a manager facade, typed
+  dataclasses (raw `int`/`float`/`str`, no lossy floats), `export.py` registry, offline
+  tests + a live-verify script. No ccxt, no pytrends, no LunarCrush SDK. Both endpoints
+  are plain REST JSON (StockTwits v2, alternative.me F&G) — research verified no wrapper
+  is needed or maintained (blockchair-python-style stale wrappers rejected by precedent).
+- **Project name: `kraken-social-signals`.**
+- **Path: `../kraken-social-signals/` — a sibling git repo**, not nested in this repo and
+  not a submodule (same placement as `ticker-news-signals`, `kraken-market-data`,
+  `kraken-funding-rates`).
 
-Name rationale: it is Kraken/crypto-specific (it accumulates the bot's own venue
-consistent Kraken market for the *kraken-trading-bot* pipeline), so it belongs in the
-`kraken-*` family — consistent with `kraken-python` and `ticker-news-signals`. A
-source-oriented name (e.g. `ohlcv-store`) would understate that it is the bot's
-single source of truth for its own market.
+Name rationale: it is Kraken/crypto-specific — it produces the per-(ticker, hour) crypto
+sentiment axes for *this* bot's RL feature vector (StockTwits retail mention velocity on
+`BTC.X`/`ETH.X` plus the market-wide Fear & Greed index), so it belongs in the `kraken-*`
+family, consistent with the sibling signal projects. A source-oriented name
+(`stocktwits-poller`) would understate that it is one of the bot's own exogenous signal
+seams; `kraken-social-signals` makes the family obvious and matches the house-style map in
+RESEARCH.md (Researcher-social).
 
 ## 2. WHY THIS PAIR, AGAINST THE PIPELINE'S REAL SHAPE
 
-The audit's own data assumption is **factually wrong**, and that single fact is
-decisive. RESEARCH.md verified live (2026-09-28):
+The landing point is **proven twice over** — this is the decisive fact. The bot's RL
+observation path (`configs/default.yaml` → `rl/data.py` → `rl/features.py` →
+`models/{TICKER_ID}/{model_name}/`) already has the exact seam this source needs:
 
-- `GET /0/public/OHLC?pair=XBTUSD&interval=60&since=0` → **721 rows** (most recent ~720
-  bars, ~30 days at 1 h). `since=2017` returns the **identical** 721 rows. Kraken's own
-  docs: *"Returns up to 720 of the most recent entries (older data cannot be retrieved,
-  regardless of the value of `since`)."* Following the returned `last` cursor (the bot's
-  `pages=6` loop, `rl/data.py:238-253`) returns only the tail again.
-- Consequence: **`train_ticker(pages=6)` does NOT give ~180 d**. Every RL run today —
-  train, backtest (refetches on `data=None`, `rl/backtest.py:138`), and paper trade
-  (re-fetches `pages=2` every 60 s, `rl/paper_trade.py:284-290`) — sees **at most
-  ~30 days of 1 h bars**, regardless of knob values.
+- **Config keys already documented for sibling JSONL seams:** `extra_features_file: null`
+  (`default.yaml:57`) for news and `funding_features_file: null` (`default.yaml:65`) for
+  funding. `feature_groups` already contains `"signals"` (`default.yaml:48`). A social
+  seam is a *third* key in that proven row: `social_features_file: null`.
+- **The seam itself (`merge_extra_features`, `data.py:80-177`) is byte-identical in
+  behavior for any per-(ticker, hour) scalar file:** hour-floor left-join + ffill +
+  zero-fill. It is already invoked twice per load (`fetch_ohlc_dataframe` `data.py:319-320`,
+  `read_ohlc_dataframe` `data.py:430-431`); a third invocation for the social file is the
+  same 2-line pattern the funding pass already established.
+- **`_add_signals_features` (`features.py:388-401`) forwards ANY numeric column already in
+  `_SIGNAL_COLUMNS`.** The only code change required is the documented 2-file widening
+  (`data.py:49`, `features.py:32`) by `stt_mention_count`, `stt_tilt`, `fng_index`. The
+  audit's seam caveat (`AUDIT.md:112-117`) is acknowledged: the widenings must stay in
+  sync, and models must be retrained for the columns to enter the observation (see §5).
+- **Models layout land:** `FeaturePipeline.compute()` → `signals` group → the observation
+  vector; per-ticker stats are persisted to `models/{TICKER_ID}/{model_name}/normalization.npz`
+  and `config.yaml` records the merged `default.yaml` (via `build_train_config`), so a
+  retrained model carries the widened width and the new columns' stats. This is exactly
+  where a feature-engineering step reads the feature per ticker — same artifact tree the
+  news/funding columns already land in.
+- **Backfill is the differentiator vs the two other research-tested candidates.**
+  `train_ticker`/`backtest` knobs (pages, since/until) bound the OHLC frame at ~720 bars
+  (~30 d) without the store — and even through the now-existing store, the *social* pair
+  can be deep on day one: alternative.me F&G `limit=0` returns full 2018→ history in one
+  keyless call (`fng_index`), and StockTwits cursor-walk reaches the 60–180 d train window
+  (`stt_mention_count`, `stt_tilt`). No forward-only wait: train/backtest get a labeled
+  history immediately.
 
-Where the new feature must land, per ticker (`configs/default.yaml` → `train.py` →
-`models/{TICKER_ID}/{model_name}/`):
+Sourcing guardrails: both sources keyless, no geo-block, ToS-clean (F&G is an offered
+public API; StockTwits is user-generated posts with attribution requested). StockTwits'
+one caveat — Cloudflare bot-challenge on scripted HTTP — is a client hardening (browser UA,
+retry/backoff, non-fatal on challenge), not a blocker; it is folded into the client spec.
 
-- A feature-engineering step reads market data **exactly once**: `fetch_ohlc_dataframe`
-  (`rl/data.py:200`) pages Kraken into a pandas DataFrame with UTC `DatetimeIndex` and
-  columns `time, open, high, low, close, vwap, volume, count`, then
-  `FeaturePipeline.compute()` (`rl/features.py:239`) builds the groups and
-  `TradingEnvironment` slices the observation. Everything below it — `NormalizationStats`
-  → `normalization.npz`, `PPO`, `model.zip`, per-model `config.yaml` — is downstream of
-  that one DataFrame.
-- So the store's contract is *shape-preserving*: **`read(pair, interval, since, until)`
-  returns precisely that DataFrame**, so `fetch_ohlc_dataframe` becomes a thin read-through
-  (fetch → `upsert` → `read`). Train, backtest and paper call sites change by one adapter
-  (`read_ohlc_dataframe`) whose signature is unchanged. The store lands the feature directly
-  in the exact seam `train.py:155`, `backtest.py:138` and `paper_trade.py:287` already use.
-- It also activates dormant machinery: `prepare_episode` (`rl/data.py:265`) and the unused
-  `TradingEnvironment.reset(options=...)` become real train/eval split + walk-forward, and
-  `since`/`until` surfaces on the CLI for controlled replays.
+## 3. INTEGRATION SKETCH (how the bot consumes it)
 
-Gap 1 is the **unlocker**, not just the cheapest fix:
+**Output contract — the JSONL file `kraken-social-signals` writes:** one record per
+(ticker, hour): `{ticker: "ETH/USD", timestamp: <ISO-UTC hour>, stt_mention_count: <int>,
+stt_tilt: <float>, fng_index: <int>}` — same shape family as the news and funding JSONLs,
+so `merge_extra_features` consumes it with zero pipeline redesign. **Config key:**
+`social_features_file` added to `configs/default.yaml` (null = off), the third sibling
+JSONL key in the same documented pattern; the bot's `fetch_ohlc_dataframe` /
+`read_ohlc_dataframe` gain the matching parameter and the third `merge_extra_features`
+call. **Refresh cadence:** hourly `cli.py pull --ticker ETH/USD --output
+signals/eth_usd_social.jsonl` (mirrors the news pass; F&G is daily and the merge's ffill
+hands the sub-day gap exactly as it does for funding). NixOS module optional — both
+sources are cheap enough for the manual/cron hourly pull; a systemd timer is a possible
+add-on later, not a v1 requirement. **How the bot reads it per ticker:** `signals` group →
+`_add_signals_features` → raw observation columns with per-ticker normalization stats in
+`models/{TICKER_ID}/{model_name}/` exactly like the two completed seams.
 
-1. **It is the only way the bot ever sees more than ~30 days of its own market.** Deep
-   history is obtainable *nowhere* else — Kraken REST is capped, period.
-2. **Gap 2 and Gap 3 are depth-capped WITHOUT it.** Their signal vectors join onto the OHLCV
-   frame (`merge_extra_features`), whose window is bounded by the OHLC frame length. A
-   Binance-since-2020 funding backfill joined onto a 720-bar Kraken frame is a 30-day slice
-   — the exact same data capacity as today, with cross-venue noise thrown in. The exogen
-   columns ride on the store's depth, so the store must come first.
-3. **Zero sourcing risk.** Pure code over already-fetched keyless data. No US-geo-block
-   (Binance/Bybit/OKX all self-cert-restricted in RESEARCH.md), no rate ceiling, no new
-   venue, no ToS surface. The guardrail "prefer keyless" is satisfied maximally.
+## 4. RUNNER-UPS AND WHY THEY LOST
 
-Signal-per-effort verdict: a funding-rate column adds *one* differentiated scalar but only
-inside a 30-day frame; the store raises the information *capacity* of **every** current and
-future feature (market, technical, `signals`) and fixes ops redundantly (the paper trader's
-60-day refetch every 60 s collapses to append + tail read). One vector per pass — this pass
-is the market-data foundation; the next two passes ship the exogenous vectors on top of it.
+1. **Gap 4 / microstructure recorder (Kraken REST poller via house lib, zero new deps).**
+   The land-shape is arguably the cleanest — it activates the *dormant* `microstructure`
+   group (`features.py:373-386`) by writing `bid/ask/bid_vol/ask_vol` onto the frame with
+   **no `_SIGNAL_COLUMNS` widening at all**, and the research overturns the old blocker
+   (store now exists). But it is **forward-only** — no keyless depth history anywhere —
+   so train/backtest get nothing until weeks of runtime accumulate, and the operational
+   cost is medium-high (poller + storage + alignment + store must be enabled). It fails
+   the "train/backtest today" bar this pass targets. It is the natural *next* plumbing
+   pass once `market_data_store` is actually enabled on a host.
+2. **Gap 5 / on-chain (Blockchair v2 + Coin Metrics Community + DefiLlama + Whale Alert
+   archive).** Deep keyless backfill is real (2019 blocks, 2022 txs — overturns the
+   audit's "backfill-limited" fear), but Blockchair v2 is a **maintenance-mode API** (last
+   major update 2022-11-07, successor 3xpl) — the wrong reliability profile for the bot's
+   first non-venue exogenous heartbeat — and its strongest legs are chain-level/daily
+   (Coin Metrics 1h is paid-403; DefiLlama daily), cutting per-ticker hourly directness.
+   The audit's "park until the store has depth" still stands.
+3. **Gap 2 — funding rates** — already built (`kraken-funding-rates`), acknowledged
+   (near-constant 8h cadence, not a bot flake input; not this pass's problem).
+4. **Candidate 2 — normalization.npz wiring** — pure code fix, zero sourcing, highest
+   directness of all; but this pass's mandate is a (gap, library) *data-source* pair, and
+   making z-scores real is a code change inside this repo, not a sibling project. Recorded
+   as companion hardening (§5). Same for **Candidate 3 scheduling** (ops, not a source).
 
-## 3. DECISION INPUTS WEIGHED (from RESEARCH.md)
+## 5. EXPLICIT NOTE ON WHAT THIS PASS DOES NOT BUILD
 
-| Option | Score | Verdict |
-|---|---|---|
-| **Gap 1 store — pandas+pyarrow parquet** | cheapest, keyless, prerequisite | **CHOSEN** — verified 720-bar ceiling means it is the only route to deep venue-consistent history; every other gap joins onto its output. |
-| Gap 2 — Binance FAPI direct (funding + basis, since 2020) | 8.4 best data fit | Runner-up. Deepest history + cleanest surface, but (a) value capped by the 720-bar OHLC frame it joins onto before the store exists, (b) **US IP geo-block + US-person self-cert** must be host-jurisdiction-confirmed before commit, (c) basis from Binance mark vs Kraken spot = cross-venue noise until the store anchors venue-consistent prices. |
-| Gap 2 alt — Kraken-Futures poller (`PF_ETHUSD`) | 7.6 best house-fit | **Becomes the natural `kraken-market-data` companion poller** (same venue, USD-quoted) for a later funding/basis column — it has no public history, so it *requires* a forward store; reinforces Gap-1-first. |
-| Gap 3 — StockTwits v2 + alt.me F&G | 9.0 best new modality | Runner-up. Genuinely new modality, fully keyless, live-verified. But medium sourcing cost (unauthenticated rate ceiling) and it, too, joins onto the OHLC frame → depth-capped without the store. Second exogenous axis for a future pass; its history belongs in the store eventually. |
-| Gap 4 — book/trades recorder, Gap 5 on-chain, Gap 6 macro | ≤6 | Explicitly or implicitly require Gap 1 (book recorder is ephemeral-by-nature; on-chain backfill is limited; macro is feature-design-heavy). Not candidates for this pass. |
-
-## 4. INTEGRATION SKETCH (how the bot consumes it)
-
-**Output contract (the one thing that matters):** `MarketDataStore.read(pair, interval,
-since=None, until=None) → pd.DataFrame` with a UTC `DatetimeIndex` and columns
-`time, open, high, low, close, vwap, volume, count` — byte-for-byte the shape
-`candles_to_dataframe` produces today (`rl/data.py:161-197`). Prices stay float in the
-DataFrame; raw `Decimal`/string fidelity lives upstream in `kraken-api.models.Candle`
-(as the house style mandates) and is cast only at the DataFrame boundary, exactly as now.
-
-- **File location:** `store/{PAIR_ID}/{interval_min}/YYYY-MM.parquet` month-sliced, with a
-  per-(pair, interval) `since`-cursor sidecar `store/_meta.json`. `PAIR_ID` uses the same
-  `normalize_ticker_id` rule as the model tree (`ETH/USD` → `ETH_USD`), so `models/ETH_USD/`↔
-  `store/ETH_USD/` line up by construction. Store root configurable (`.env` → `MARKET_DATA_DIR`);
-  keyless, so the NixOS module needs no secret, just `StateDirectory` + `DynamicUser`.
-- **Merge point in this repo:** a thin `read_ohlc_dataframe(pair, interval, since, until,
-  extra_features_file)` adapter beside `fetch_ohlc_dataframe` in `rl/data.py`:
-  fetch→`upsert`→`read`. `train.py:155`, `backtest.py:138` and `paper_trade.py:287` keep
-  their signatures and simply pass a store. The exogenous `signals` seam
-  (`merge_extra_features` → `_add_signals_features`) is untouched and joins onto the deeper
-  frame, so Gap 2/3 land later with a one-line `_SIGNAL_COLUMNS` widening, with no pipeline
-  redesign.
-- **Scheduler:** NixOS module + systemd timer (`OnCalendar=*-*-* *:*:30`) running
-  `kraken-market-data market update --pair ETH/USD --interval 60`; the JSON-logged, redacted
-  poller appends incremental bars and persists them. This also answers the audit's
-  "no operational scheduler" finding for the data substrate (the news/signals hourly pull
-  scheduling is a separate, deferred concern).
-- **What it unlocks immediately:** deep history > 30 d by accumulation, `since`/`until`
-  replay, train/eval split + walk-forward through the currently-unused
-  `TradingEnvironment.reset(options=...)`, backtest without a re-fetch, and a paper trader
-  whose per-tick cost drops to append + tail read.
-
-## 5. RUNNER-UPS AND WHY THEY LOST
-
-1. **Gap 2 — funding-rate / perp-basis (Binance FAPI primary, Kraken-Futures poller
-   secondary).** Lost because its information value is bounded by the very 720-bar ceiling
-   this pass exists to break: the funding/basis columns join onto the OHLC frame, so on top
-   of today's data capacity they add one scalar inside a 30-day slice. It also carries the
-   one real risk set in the whole candidate list (US-friendly geo/ToS, confirmed only by
-   host-jurisdiction check) and, sourced from Binance, introduces cross-venue basis noise
-   against Kraken spot. **It ships on top of this store in the next pass**, most cleanly via
-   the Kraken-Futures poller for a live column, optionally Binance for deep backfill.
-2. **Gap 3 — social/search-trend (StockTwits v2 + alt.me Fear&Greed).** Lost on the same
-   depth-capping logic, plus a medium sourcing ceiling (unauthenticated StockTwits rate cap).
-   The most differentiated *modality* of the three (retail mention velocity, orthogonal to
-   the finished GNews+VADER pass) — a strong candidate for the pass after the funding column,
-   again dumping its history into the store.
-3. **Gap 4 / 5 / 6.** Gap 4 (book/trades recorder) explicitly needs this store as its
-   prerequisite; Gap 5 (on-chain) is backfill-limited; Gap 6 (macro) is feature-design-heavy.
-   Not candidates this pass.
+- **No microstructure recorder / WS consumer / store extension.** No on-chain project.
+  No macro calendar. Both stay parked (runner-ups above).
+- **No normalization wiring fix** (Candidate 2) — this pass does not touch
+  `environment.py`/`paper_trade.py` to apply `transform()`. It pairs naturally with the
+  new heteroscaled columns (raw mention counts, 0–100 F&G) and can be the next hardening,
+  but is explicitly **not** this pass's deliverable.
+- **No scheduler for exogenous pulls** (Candidate 3) — timers for news/funding/social
+  remain manual/cron as documented; the bot's `nix/module.nix` stays credentials-only.
+- **No `_SIGNAL_COLUMNS`-from-config refactor.** The audit flags reading that tuple from
+  config so future sources stop needing the 2-file edit; this pass uses the *minimal
+  proven widening* to land the feature, and records the config-read + a
+  sync-check between the two tuples as follow-up hardening. Also **no model retraining**:
+  on-disk `models/ETH_USD` / `models/XRP_USD` are at 49 features (pre-seam); retraining
+  after the social seam is enabled is a downstream step, not a scoped deliverable.
+- **No paid or ToS-grey legs:** no LunarCrush social tier (~$90/mo), no X API, no Reddit
+  scrape, no pytrends/Google Trends scrape, no BlueSky phase-2 leg. The pass builds the
+  two keyless, ToS-clean columns (StockTwits velocity/tilt + Fear & Greed) and nothing else.
 
 DECISION COMPLETE
