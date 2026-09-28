@@ -293,6 +293,7 @@ class PaperTrader:
             manager=self.manager,
             extra_features_file=self.config.get("extra_features_file"),
             funding_features_file=self.config.get("funding_features_file"),
+            social_features_file=self.config.get("social_features_file"),
             market_data_store=self.config.get("market_data_store"),
         )
 

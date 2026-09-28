@@ -293,3 +293,82 @@ def test_read_ohlc_dataframe_both_signal_files_merge(tmp_path) -> None:
     assert "funding_rate" in df.columns
     assert df["sentiment_score"].iloc[-1] == pytest.approx(0.7)
     assert df["funding_rate"].iloc[-1] == pytest.approx(0.0003)
+
+
+def test_read_ohlc_dataframe_social_features_merge(tmp_path) -> None:
+    """Social-signal JSONL merges (hour-floor, ffill, zero-fill) onto OHLCV."""
+    store = FakeStore([_candle(0), _candle(1)])
+    source = FakeSource([_candle(2)], last=0)
+
+    social = tmp_path / "social.jsonl"
+    social.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "stt_mention_count": 42, '
+        '"stt_tilt": 0.8, "fng_index": 65}\n',
+        encoding="utf-8",
+    )
+
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        social_features_file=str(social),
+        market_data_store=store,
+    )
+    assert "stt_mention_count" in df.columns
+    assert "stt_tilt" in df.columns
+    assert "fng_index" in df.columns
+    # 2026-08-01T14:00Z floors onto bar 2 (hours: 12, 13, 14).
+    assert df["stt_mention_count"].iloc[-1] == 42
+    assert df["stt_tilt"].iloc[-1] == pytest.approx(0.8)
+    assert df["fng_index"].iloc[-1] == 65
+
+
+def test_read_ohlc_dataframe_all_signal_files_merge(tmp_path) -> None:
+    """News + funding + social signals all merge; all 9 signal columns present."""
+    store = FakeStore([_candle(0), _candle(1)])
+    source = FakeSource([_candle(2)], last=0)
+
+    signals = tmp_path / "news.jsonl"
+    signals.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "sentiment_score": 0.7, '
+        '"article_count": 5, "novelty_flag": false}\n',
+        encoding="utf-8",
+    )
+    funding = tmp_path / "funding.jsonl"
+    funding.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "funding_rate": 0.0003, '
+        '"basis": 0.0004, "open_interest": 8000.0}\n',
+        encoding="utf-8",
+    )
+    social = tmp_path / "social.jsonl"
+    social.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "stt_mention_count": 42, '
+        '"stt_tilt": 0.8, "fng_index": 65}\n',
+        encoding="utf-8",
+    )
+
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        extra_features_file=str(signals),
+        funding_features_file=str(funding),
+        social_features_file=str(social),
+        market_data_store=store,
+    )
+    # All three signal sets present
+    assert "sentiment_score" in df.columns
+    assert "article_count" in df.columns
+    assert "novelty_flag" in df.columns
+    assert "funding_rate" in df.columns
+    assert "basis" in df.columns
+    assert "open_interest" in df.columns
+    assert "stt_mention_count" in df.columns
+    assert "stt_tilt" in df.columns
+    assert "fng_index" in df.columns
+    assert df["sentiment_score"].iloc[-1] == pytest.approx(0.7)
+    assert df["funding_rate"].iloc[-1] == pytest.approx(0.0003)
+    assert df["stt_mention_count"].iloc[-1] == 42
+    assert df["stt_tilt"].iloc[-1] == pytest.approx(0.8)

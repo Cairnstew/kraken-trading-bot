@@ -46,6 +46,7 @@ _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "cou
 # Columns expected in signal JSONL records from sibling projects.
 # News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
 # Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
+# Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
 _SIGNAL_COLUMNS = (
     "sentiment_score",
     "article_count",
@@ -53,6 +54,9 @@ _SIGNAL_COLUMNS = (
     "funding_rate",
     "basis",
     "open_interest",
+    "stt_mention_count",
+    "stt_tilt",
+    "fng_index",
 )
 
 # Bars a 24-window feature pipeline needs before any indicator fills its
@@ -268,6 +272,7 @@ def fetch_ohlc_dataframe(
     since: int | None = None,
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
+    social_features_file: str | None = None,
 ) -> pd.DataFrame:
     """Page through Kraken OHLCV history into a training DataFrame.
 
@@ -293,6 +298,10 @@ def fetch_ohlc_dataframe(
             hour) funding-rate/basis vectors from the sibling
             ``kraken-funding-rates`` project.  Merged after news signals
             via the same timestamp-floor left-join.
+        social_features_file: Optional path to a JSONL of per-(ticker,
+            hour) social/search-trend vectors from the sibling
+            ``kraken-social-signals`` project.  Merged after funding
+            signals via the same timestamp-floor left-join.
 
     Returns:
         DataFrame as produced by :func:`candles_to_dataframe` with
@@ -318,6 +327,7 @@ def fetch_ohlc_dataframe(
     df = df[~df.index.duplicated(keep="first")].sort_index()
     df = merge_extra_features(df, extra_features_file)
     df = merge_extra_features(df, funding_features_file)
+    df = merge_extra_features(df, social_features_file)
     return df
 
 
@@ -331,6 +341,7 @@ def read_ohlc_dataframe(
     until: int | None = None,
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
+    social_features_file: str | None = None,
     market_data_store: Any = None,
     market_data_source: Any = None,
 ) -> pd.DataFrame:
@@ -359,6 +370,14 @@ def read_ohlc_dataframe(
             or ``None`` for no bound).
         extra_features_file: Passed to :func:`merge_extra_features` on the
             read frame, exactly as in :func:`fetch_ohlc_dataframe`.
+        funding_features_file: Optional path to a JSONL of per-(ticker,
+            hour) funding-rate/basis vectors from the sibling
+            ``kraken-funding-rates`` project.  Merged after news signals
+            via the same timestamp-floor left-join.
+        social_features_file: Optional path to a JSONL of per-(ticker,
+            hour) social/search-trend vectors from the sibling
+            ``kraken-social-signals`` project.  Merged after funding
+            signals via the same timestamp-floor left-join.
         market_data_store: ``null`` (live fetch), a store root path, or a
             store-like object exposing ``upsert``/``read`` (see
             :func:`_resolve_store`).
@@ -394,6 +413,7 @@ def read_ohlc_dataframe(
             since=since,
             extra_features_file=extra_features_file,
             funding_features_file=funding_features_file,
+            social_features_file=social_features_file,
         )
 
     store = _resolve_store(market_data_store)
@@ -429,6 +449,7 @@ def read_ohlc_dataframe(
         raise NotEnoughDataError(1, 0, what="OHLC candles")
     df = merge_extra_features(df, extra_features_file)
     df = merge_extra_features(df, funding_features_file)
+    df = merge_extra_features(df, social_features_file)
     return df
 
 

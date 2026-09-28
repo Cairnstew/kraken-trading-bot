@@ -142,6 +142,7 @@ def backtest_model(
             manager=manager,
             extra_features_file=record.config.get("extra_features_file"),
             funding_features_file=record.config.get("funding_features_file"),
+            social_features_file=record.config.get("social_features_file"),
             market_data_store=(record.config or {}).get("market_data_store"),
         )
     else:

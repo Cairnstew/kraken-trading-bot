@@ -64,6 +64,14 @@ extra_features_file: null
 # via the same timestamp-floor left-join.  Null/empty disables the feature.
 funding_features_file: null
 
+# Path to a JSONL file of per-(ticker, hour) social/search-trend vectors
+# produced by the sibling `kraken-social-signals` project:
+#   python ~/Projects/kraken-social-signals/cli.py pull --ticker ETH/USD \
+#     --output signals/eth_usd_social.jsonl
+# Columns: stt_mention_count, stt_tilt, fng_index.  Merged after funding
+# signals via the same timestamp-floor left-join.  Null/empty disables it.
+social_features_file: null
+
 # --- Local market-data store (optional) ----------------------------------
 # Path to the root of the sibling `kraken-market-data` store — the
 # directory containing its `_meta.json` cursor sidecar and the
