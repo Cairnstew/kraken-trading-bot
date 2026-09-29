@@ -1,0 +1,76 @@
+# Example training config: RL runs seeded from kraken-deep-history.
+#
+# This is a copy of configs/default.yaml with the local market-data store
+# turned on. Copy it to `models/{TICKER_ID}/{model_name}/config.yaml` (or
+# pass it with `--config` to a training run) only AFTER the store has been
+# seeded — the store must already hold deep bars, because the bot only
+# *reads* it; it cannot backfill years from Kraken (REST caps at ~720 bars).
+#
+# Seed once with the sibling `kraken-deep-history` project, e.g.:
+#   (cd ~/Projects/kraken-deep-history && pip install -e ".[store]")
+#   python ~/Projects/kraken-deep-history/cli.py seed \
+#     --ticker ETH/USD --interval 60 --from 2018-01-01 --store ~/Projects/kraken-market-data/store
+#   python ~/Projects/kraken-deep-history/cli.py verify \
+#     --ticker ETH/USD --interval 60 --store ~/Projects/kraken-market-data/store
+#
+# Which models would use it: every ticker with an entry in the seeder's
+# ticker map, i.e. ETH/USD, BTC/USD, SOL/USD, XRP/USD (the *USDT spot
+# family). DOGE/USD has no Binance mapping yet and is refused by the seeder
+# (add it to kraken_deep_history/utils.TICKER_SYMBOL_MAP to extend).
+# Per-model: keep the same `market_data_store` key in
+# models/{TICKER_ID}/{model_name}/config.yaml so backtest/paper-trade reads
+# (which load the model record's config) resolve the same store root.
+
+# --- Market / data ------------------------------------------------------
+ticker: "ETH/USD"
+
+# Raw OHLCV timeframe for one environment bar (minutes). Must match the
+# interval you seeded (60 -> Binance 1h).
+ohlcv_interval_minutes: 60
+
+# Starting quote-currency balance for the simulated account.
+initial_balance: 10000.0
+
+# Simulated execution costs.
+fee_rate: 0.0         # fractional fee per executed order
+slippage: 0.0         # fractional adverse price move on fills
+allow_short: false    # whether sell actions may open a short position
+
+# --- Environment --------------------------------------------------------
+action_space: "continuous"
+
+reward:
+  mode: "pnl"
+  pnl: 1.0
+  risk_adjusted: 0.0
+  drawdown_penalty: 0.0
+  holding_penalty: 0.0
+  pnl_scale: 0.0001
+  risk_window: 20
+  penalize_drawdown: true
+  hold_confidence_threshold: 0.5
+
+# --- Feature pipeline ---------------------------------------------------
+feature_windows: [1, 4, 24]
+feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
+
+# --- Exogenous signals (optional, as in default.yaml) --------------------
+extra_features_file: null
+funding_features_file: null
+social_features_file: null
+
+# --- Local market-data store (deep history enabled) ----------------------
+# Root of the store seeded by `kraken-deep-history` (same layout the
+# `kraken-market-data` poller writes: {PAIR_ID}/{interval_min}/{YYYY-MM}
+# month-sliced parquet/CSV + `_meta.json` cursor). When set,
+# `read_ohlc_dataframe` does fetch -> upsert -> read, and because the store
+# already holds years of bars the read returns the WHOLE store (since/until
+# default to None), far past Kraken's ~720-bar REST ceiling. The live fetch
+# leg is optional now: a store-only read (source returning no candles)
+# degrades with a warning and serves seeded history.
+market_data_store: ~/Projects/kraken-market-data/store
+
+# --- Model metadata -----------------------------------------------------
+# Recorded in models/{ticker_id}/{model_name}/config.yaml at save time, so
+# a retrained model remembers which deep-history root it saw.
+model_name: "ppo_eth_deep"

@@ -83,6 +83,17 @@ social_features_file: null
 # paper-trade share one venue-consistent source of truth. Null/empty (the
 # default) falls back to the live paginated Kraken fetch. See
 # `kraken-market-data/INTEGRATION.md` for the full consumer contract.
+#
+# DEEP HISTORY (kraken-deep-history): the sibling `kraken-deep-history`
+# project seeds years of Binance-archive OHLCV into this same store root
+# (`seed --ticker ETH/USD --interval 60 --from 2018-01-01 --store <root>`).
+# With a seeded store, setting this key gives train/backtest/paper reads
+# deep history with **no consumer code change** — `read_ohlc_dataframe`
+# already forwards since/until (None -> whole store) to `store.read`, and
+# `pages` only bounds the live *append*, not the depth served. Turn it on
+# with the ready-to-copy `configs/deep-history.example.yaml` (covers the
+# ETH/USD, BTC/USD, SOL/USD, XRP/USD *USDT spot family; DOGE/USD is not
+# mapped yet). Consumer contract: `kraken-deep-history/INTEGRATION.md`.
 market_data_store: null
 
 # --- Model metadata -----------------------------------------------------

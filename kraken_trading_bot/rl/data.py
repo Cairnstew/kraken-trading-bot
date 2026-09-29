@@ -416,6 +416,18 @@ def read_ohlc_dataframe(
             social_features_file=social_features_file,
         )
 
+    # DEEP-HISTORY (kraken-deep-history): with a store seeded by the
+    # sibling `kraken-deep-history` project (Binance-archive OHLCV -> the
+    # `kraken-market-data` store root), this branch serves years of bars
+    # instead of Kraken's ~720-bar REST ceiling: since/until default to
+    # None so `store.read` returns the whole store, and `pages` only bounds
+    # the live append below. Turn it on per-model by setting
+    # `market_data_store` in models/{TICKER}/{NAME}/config.yaml (or via
+    # `configs/deep-history.example.yaml`). A seeded store makes since/until
+    # slicing, train/eval split, and walk-forward through the currently-
+    # unused `TradingEnvironment.reset(options=...)` possible — a follow-up
+    # pass, not a feature-engineering rewrite (see
+    # kraken-deep-history/INTEGRATION.md §5).
     store = _resolve_store(market_data_store)
 
     source = market_data_source if market_data_source is not None else manager
