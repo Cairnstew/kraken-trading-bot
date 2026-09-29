@@ -80,6 +80,7 @@ time, update its row.
 | `kraken-market-data` (OHLC store) | https://github.com/Cairnstew/kraken-market-data (private) | `/home/seanc/Projects/kraken-market-data` |
 | `kraken-funding-rates` (funding/basis) | not pushed yet — no remote set | `/home/seanc/Projects/kraken-funding-rates` |
 | `kraken-social-signals` (StockTwits + Fear & Greed) | https://github.com/Cairnstew/kraken-social-signals (private) | `/home/seanc/Projects/kraken-social-signals` |
+| `kraken-deep-history` (deep OHLCV via Binance archive → store seeder) | https://github.com/Cairnstew/kraken-deep-history (private) | `/home/seanc/Projects/kraken-deep-history` |
 
 Related siblings (not data sources): `opencode-ensemble`, `spotify-playlist-manager`,
 `x-python-api`, `steam-mcp`, `nixos-minecraft-modpacks` (all under `https://github.com/Cairnstew/…`,
@@ -258,7 +259,10 @@ API key / paid), rate limits, and output shape (structured JSON vs. raw HTML/tex
 Score each option partly on how cheaply it reduces to what the RL pipeline can consume: a
 per-ticker, per-timestamp scalar or small vector beats a pile of raw unstructured output.
 
-Each researcher appends its findings to `.data-audit/RESEARCH.md`. End with `RESEARCH COMPLETE`.
+Each researcher writes its findings to a per-researcher file — `.data-audit/RESEARCH-1.md`,
+`.data-audit/RESEARCH-2.md`, `.data-audit/RESEARCH-3.md` — to avoid write races between three
+parallel writers, and the lead assembles `.data-audit/RESEARCH.md` from them once all three
+report. End with `RESEARCH COMPLETE`.
 
 ---
 
@@ -561,6 +565,39 @@ inventory only.
   registry guardrail. The audit now lists "improve what already exists" as the
   first gap category. Improvement outcomes are decided by AUDIT.md evidence,
   never defaulted to new-project.
+- 2026-09-29 — kraken-deep-history pass (NEW-DATA-SOURCE): Binance public archive
+  seeder into the kraken-market-data store; gate PASS, registry row added. Lessons:
+  - The three parallel researchers are told to WRITE SEPARATE files
+    (`.data-audit/RESEARCH-{1,2,3}.md`) and the lead assembles `RESEARCH.md` from
+    them — Phase 2 previously said "appends its findings to RESEARCH.md", which
+    would have clobbered under three concurrent writers. Guidance fix applied so
+    future runs don't have to improvise it.
+  - A store-backed source keeps the Phase 6 gate cleanly applicable (persistence +
+    verify contiguous + bars > REST ceiling), so a live bounded seed (e.g.
+    eth/usd 60m from 2025-01-01) is a strong smoke; the reviewer proved depth by
+    seeding 14592 bars (~20x ceiling) and showed the LIVE leg stays capped at
+    ~721 bars even at `--pages 21` — that page-count gold control is worth keeping
+    as the "depth is real and only the store unlocks it" proof.
+  - When the sibling store package (`market_data`, `pyarrow`) isn't importable in
+    the seeder's own dev shell, the seeder falls back to CSV mode and the BOT
+    reads 0 bars (parquet glob); the bot-facing seed must run where the store
+    package is importable (the bot's dev shell with the seeder on PYTHONPATH).
+    Reviewer hit this live and the README/INTEGRATION docs were extended to say
+    so — record "seed in market-data mode, not fallback" in future store-fronting
+    passes.
+  - Pre-existing uncommitted work in the tree (untracked `rl/export.py` while
+    committed `rl/__init__.py` imports `.export`) breaks the Nix-packaged
+    `kraken-trading-bot` binary even though pytest passes (source-tree
+    resolution). The reviewer worked around it by invoking the CLI in-process
+    from the source tree (the tests' own pattern). When a tree has uncommitted
+    work, note that the packaged-binary check may be unreliable and prefer the
+    in-process main() route.
+  - Phase 7 dev-fix slice (stats crash + docs) ran as a one-task builder exactly
+    like the fix loop; 57 tests green, pushed. Two-repo loop confirmed: both
+    repos pushed in one pass.
+  proposal: give the kraken-* seeder a `--check-store-mode` guard (refuse to
+  seed a bot-bound root in fallback-CSV mode, or auto-warn) so the 0-bars trap is
+  caught at seed time, not at bot read time.
 
 ---
 
