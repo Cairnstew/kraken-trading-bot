@@ -15,7 +15,10 @@ Load and follow the `opencode-ensemble` skill for the lead workflow before start
 
 **Non-negotiable rules (apply to every teammate, every phase):**
 - Each phase must write its handoff artifact before the next phase starts. Keep artifacts in
-  `./.data-audit/` (create it; do not commit it).
+  `./.data-audit/` (create it). The artifact dir IS tracked per repo convention — commit the
+  final pass artifacts (AUDIT/RESEARCH/DECISION/VALIDATION/PLAN) as one docs commit at run end,
+  as prior passes do (`docs: data-pipeline pass <date> artifacts`). Never commit scratch
+  models/store from `/tmp/...`.
 - Do not skip ahead. Do not write code before Phase 4.
 - The audit is category-agnostic. Do not assume news, or any other specific data source, is the
   right gap; the audit has to find that out by reading the code.
@@ -113,11 +116,14 @@ zero or more builder slices in Phase 7 (fix loop / further development); each is
 
 Create the team (`team_create` — name it `audit-pipeline`), then record the tasks up front with
 `team_tasks_add`. `team_tasks_add` returns per-task IDs like `task_XXXX_0001_yyyy`. **Capture
-those returned IDs and pass them to `depends_on` — never label names.** If any `depends_on`
-references a label instead of a real ID, every downstream task shows as `blocked` and teammates
-cannot `claim_task` (the work still runs, but the board lies and `team_tasks_complete` is refused
-— correct the board by editing the tasks with real IDs before spawning, or accept the broken
-board and complete tasks manually as each agent reports).
+those returned IDs and pass them to `depends_on` — never label names, and never type an ID from
+memory.** If any `depends_on` references a label or a mistyped ID, every downstream task shows as
+`blocked`: teammates still RUN (spawn works unclaimed, work proceeds, they just can't `claim_task`),
+but there is **no board-edit API** — `team_tasks_complete` refuses to complete a blocked task, so
+the board stays wrong for the whole run. Accepted fallback (verified 2026-10-01): ignore the board
+once it is broken, track the chain yourself by the spawn order, complete whatever completes, and
+don't block teammates on claims. The only real cure is to write the `depends_on` list from the
+exact response of the *same* `team_tasks_add` call — double-check each ID before sending.
 
 | Task key (label) | Description | depends_on (real IDs from `team_tasks_add`) |
 |------------------|-------------|------------------------|
@@ -175,7 +181,12 @@ delivers their result and any task-completed status). Do **not** poll.
    the existing target(s)**, commits everything, and **creates + pushes the GitHub remote when
    `gh` is authenticated** (see Phase 4 step 8 / 4B) or pushes the touched existing repo.
 
-6. When the builder reports done: `team_shutdown`, `team_merge`. Inspect the merged diff. Then
+6. When the builder reports done: `team_shutdown`, `team_merge`. Inspect the merged diff. **Then
+   COMMIT the merged builder land in the main repo before any further worktree teammate is
+   spawned** (`team_merge` leaves the builder's work as *unstaged changes* in the lead's working
+   tree, and a downstream worktree branches from the last **commit** — the integrator will start
+   one commit behind and see a pre-4B tree, exactly what blocked the 2026-10-01 integrator).
+   Landing it as its own commit keeps every later worktree base current. Then
    spawn the integrator (`build`, own worktree, `claim_task: integrate`). Give it: DECISION.md,
    the Phase 5 spec. The integrator adds the minimum adapter stub in this repo (for a
    `NEW-DATA-SOURCE`); for an `IMPROVE-EXISTING` outcome whose work already lands in this repo,
@@ -642,6 +653,46 @@ inventory only.
     artifact dir is committed or ignored and say so — today repo history and
     the note disagree.
 
+- 2026-10-01 — IMPROVE-EXISTING pass (Candidate 1, make the three exogenous signal seams sound:
+  A1 ticker filter, A2 hour dedup, A3 bounded ffill + freshness columns, A4 absence != neutral in
+  `merge_extra_features`; integrator proved config wiring end-to-end and fixed a sub-hourly
+  carry-bound bug). Gate PASS (119 tests, flake check green, Leg A 49-wide at defaults, Leg B
+  49→60 with freshness pair finite in the z-scored obs). Pushed `5951f72` + `1e404ba` + docs
+  `18343ce`. Lessons:
+  - A `team_merge` lands the builder's work as UNSTAGED changes in the lead's working tree, and a
+    downstream worktree teammate branches from the last COMMIT. The integrator started one commit
+    behind (its HEAD was the builder commit's parent) and correctly blocked reporting a false
+    base. Fix: after `team_merge`, COMMIT the merged builder land before spawning any further
+    worktree teammate — guidance fix applied to spawn-sequence step 6. If a teammate still reports
+    being behind, authorize `git merge --ff-only <upstream-commit>` explicitly (proven clean).
+  - A second `team_merge` of a branch that itself contains an upstream land commit conflicts with
+    the already-landed tree (`Recorded preimage`). Fix used successfully: commit the upstream land
+    first, then on conflict take the downstream's version of shared files (`git checkout --theirs
+    <file>`) — it contains upstream + the downstream delta.
+  - `depends_on` IDs written from memory can be fabricated silently: I typed a non-existent ID for
+    the integrate/verify tasks, the board showed both blocked for the whole run, and
+    `team_tasks_complete` REFUSED to complete a blocked task manually — there is NO board-edit
+    API, so the board stayed wrong. Work still ran (teammates spawn unclaimed and report fine),
+    but the chain had to be tracked by hand. Guidance fix: the Task board section now says to
+    write depends_on from the same team_tasks_add response and to treat a poisoned board as
+    permanent (spawn anyway, track manually).
+  - The force-shutdown/respawn race bit twice this run in different disguises: the first auditor
+    was force-shut for a model change but its completion message and an AUDIT.md write were still
+    in flight, while the respawned auditor ALSO wrote an AUDIT.md — producing two different
+    audits on disk (the second overwrote the first) and a researcher/architect brief mismatch.
+    When a force-shutdown precedes a respawn, check for a late completion AND reconcile which
+    artifact is actually on disk before spawning downstream; tell the architect explicitly which
+    audit is authoritative.
+  - Repeated "stalled (low output tokens)" notices fired for read-only general/qa agents
+    (researcher2/3, architect, reviewer) while they were mid-`nix develop` build or quiet-reading;
+    each was false. Confirms the RUN LOG's prior qa/build note extends to read-only roles: treat
+    low-token silence as normal for ≥5 min and nudge only on elapsed time, not on the notice.
+  - `export-data` is a first-class route for proving a JSONL-seam source reaches the observation
+    without a full train: the reviewer showed `signal_age_hours`/`signal_observed` in the export
+    CSV, ages {-1,0,1}, observed 301/721, → normalization.npz 60 features all finite. For a seam
+    pass, an export-route Leg B is a faster consumed-proof than a live train.
+  - .data-audit/ tracking note fixed in the command: artifacts ARE committed as a docs commit per
+    convention; "do not commit it" was stale for two passes.
 ---
 
 ## Guardrails
