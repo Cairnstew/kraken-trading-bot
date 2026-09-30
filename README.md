@@ -73,6 +73,15 @@ trains a PPO agent per ticker; artifacts live under
 `models/{TICKER_ID}/{model_name}/` (`model.zip`, `normalization.npz`,
 `config.yaml`). Tickers use underscore notation (`ETH_USD`).
 
+`normalization.npz` is not a passive artifact: it holds the per-ticker
+mean/std the policy was **trained** on, and every consumer applies it —
+the training environment, `backtest`, `paper-trade`, and the
+`export-data --normalized` block. The agent therefore observes
+`compute` → `ffill` → `fillna(0)` → `(x - mean) / std`, not raw
+heteroscaled features. Editing `feature_windows`/`feature_groups` (or
+adding a signal column) changes that vector, so retrain rather than
+reuse a model across feature configs.
+
 ```bash
 # Train a new PPO model for ETH/USD (fetches public OHLC; no credentials needed)
 kraken-trading-bot train --ticker ETH_USD --model ppo_eth_01
@@ -84,6 +93,14 @@ kraken-trading-bot train --ticker ETH_USD --model ppo_eth_01 \
 
 # Backtest a trained model on fresh OHLC data
 kraken-trading-bot backtest --ticker ETH_USD --model ppo_eth_01
+
+# Dump the data-pipeline stages for inspection (no model needed)
+kraken-trading-bot export-data --ticker ETH_USD --output exports/ETH_USD.csv
+
+# Add the z_-prefixed block: the agent's z-scored observation, column for
+# column what the policy is fed. The unprefixed feature columns stay
+# pre-transform, so the CSV shows both sides of the scaling.
+kraken-trading-bot export-data --ticker ETH_USD --normalized
 
 # List registered models (readable table, or JSON with --json; filter by ticker)
 kraken-trading-bot models

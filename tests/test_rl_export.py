@@ -199,3 +199,48 @@ def test_write_export_csv_creates_dirs_and_roundtrips(tmp_path, manager):
     assert len(back) == 40
     assert back["timestamp"].iloc[-1] == frame["timestamp"].iloc[-1]
     assert back["close"].iloc[-1] == pytest.approx(float(frame["close"].iloc[-1]))
+
+
+def test_normalized_block_equals_environment_observation(manager, monkeypatch):
+    """The ``z_`` block IS the environment's observation, row for row.
+
+    Fourth leg of the normalization contract: the other three consumers
+    (``TradingEnvironment._raw_feature_array``,
+    ``PaperTrader._build_observation``, and the backtest env) are pinned to
+    ``FeaturePipeline.transform``.  Here we capture the exact episode and
+    pipeline ``build_export_frame`` hands the environment, build that
+    environment, and assert its observation matrix equals the exported
+    ``z_*`` block -- so ``export-data --normalized`` is a faithful render
+    of what the policy actually sees, not a second, independent
+    normalization.
+    """
+    import kraken_trading_bot.rl.export as export_mod
+    from kraken_trading_bot.rl import TradingEnvironment
+
+    captured: dict[str, object] = {}
+    real_prepare = export_mod.prepare_episode
+
+    def spy_prepare(df, features, **kwargs):
+        episode = real_prepare(df, features, **kwargs)
+        captured["episode"] = episode
+        captured["pipeline"] = features
+        return episode
+
+    monkeypatch.setattr(export_mod, "prepare_episode", spy_prepare)
+
+    frame = build_export_frame("SOL_USD", manager=manager, pages=1, include_normalized=True)
+    stages = frame.attrs["stages"]
+
+    env = TradingEnvironment(
+        "SOL_USD",
+        data=captured["episode"],
+        feature_pipeline=captured["pipeline"],
+    )
+    matrix = env._raw_feature_array()
+    zblock = frame[stages["normalized"]].to_numpy(dtype=np.float32)
+
+    assert matrix.shape == zblock.shape
+    np.testing.assert_allclose(matrix, zblock, rtol=1e-5, atol=1e-5)
+
+    # The pre-transform feature block is genuinely different.
+    assert not np.allclose(matrix, frame[stages["features"]].to_numpy(dtype=np.float32))

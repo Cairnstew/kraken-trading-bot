@@ -264,6 +264,39 @@ def test_built_observation_matches_env_space(trained_model):
     assert obs.dtype == np.float32
 
 
+def test_built_observation_is_z_scored_by_saved_stats(trained_model):
+    """Paper inference applies the saved npz stats, not the raw row.
+
+    The train/infer-skew spot: ``_build_observation`` rebuilds the row per
+    60 s tick from a *freshly fetched* window, so if it returned the raw
+    ffilled features the live policy would be reading a different scale
+    than the one it was trained on.  It must apply the same
+    ``compute -> ffill -> fillna(0) -> (x - mean) / std`` the training
+    environment applies, using the stats loaded from
+    ``models/{TICKER}/{MODEL}/normalization.npz``.
+    """
+    root, record = trained_model
+    mgr = MockManager(_candle_window())
+    trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
+
+    # The npz guard is unchanged and the saved stats are what gets used.
+    assert record.normalization_path is not None
+    stats = trader.pipeline.stats_for(trader.ticker_key)
+    assert stats is not None
+    assert stats.feature_names
+
+    df = _synthetic_ohlcv(60)
+    obs = trader._build_observation(df)
+
+    # Identical transform to the training env's _raw_feature_array.
+    expected = trader.pipeline.transform(df, ticker_id=trader.ticker_key)
+    np.testing.assert_allclose(obs, expected[-1], rtol=1e-5, atol=1e-6)
+
+    # ... and specifically not the raw ffilled row.
+    raw = trader.pipeline.compute(df).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+    assert not np.allclose(obs, raw[-1])
+
+
 # ---------------------------------------------------------------------------
 # run_paper_trader convenience
 # ---------------------------------------------------------------------------
