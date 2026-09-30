@@ -232,7 +232,10 @@ def _resolve_max_age_hours(max_age_hours: float | int | None) -> float:
 
 
 def _signal_ages(
-    raw: pd.DataFrame, filled: pd.DataFrame, columns: Sequence[str]
+    raw: pd.DataFrame,
+    filled: pd.DataFrame,
+    columns: Sequence[str],
+    bar_index: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     """Hours since the record that produced each (carried) value.
 
@@ -242,6 +245,12 @@ def _signal_ages(
         filled: The forward-filled frame; a non-null cell means "this
             bar's value came from a record inside the freshness window".
         columns: The signal columns present in both frames.
+        bar_index: The frame's *unfloored* bar timestamps, used to measure
+            the age.  ``filled`` is indexed on hour-truncated stamps, so on
+            sub-hourly bars (15m, 5m) every bar inside a record's hour
+            shares one floored label and would otherwise all report an age
+            of 0.  Defaults to ``filled.index`` (identical for hourly
+            bars, where flooring is a no-op).
 
     Returns:
         Float frame aligned to ``filled``; ``0.0`` on a bar that carries
@@ -249,13 +258,20 @@ def _signal_ages(
         carried forward, and ``NaN`` where no record is live.
     """
     hours = pd.Timedelta(hours=1)
+    index = filled.index if bar_index is None else bar_index
     out = pd.DataFrame(index=filled.index, columns=list(columns), dtype=float)
     for col in columns:
-        # Timestamp of the record a bar is reading, carried forward
-        # without limit purely to find it.
-        own = raw[col].notna()
+        # Hour of the record a bar is reading, carried forward without
+        # limit purely to find it.  Positionally paired with ``raw`` /
+        # ``filled``, which are reindexed onto the *floored* index — so
+        # this tracks the record's hour (all sub-hourly bars of one hour
+        # read the same record, which is correct for an hourly source),
+        # while the subtraction below measures the age against the real
+        # bar time.  Using the floored stamp for both would report every
+        # bar of the record's hour as 0 hours old.
+        own = raw[col].notna().to_numpy()
         seen = pd.Series(filled.index, index=filled.index).where(own).ffill()
-        age = (filled.index - seen) / hours
+        age = (index - seen) / hours
         # Mask to the live rows: a bar with no live reading is unobserved,
         # not stale-but-usable, and gets no age.
         out[col] = age.where(filled[col].notna()).to_numpy(dtype=float)
@@ -418,19 +434,29 @@ def merge_extra_features(
 
     # ── 3. bounded forward-fill + freshness ────────────────────────────
     ohlc_index = df.index.floor("h")
-    bar_hours = _bar_hours(ohlc_index)
+    # Bar spacing is measured on the *unfloored* index: flooring collapses
+    # every bar of an hour onto one label, so on 15m/5m bars the median
+    # gap of the floored index is 0 and `_bar_hours` would fall back to
+    # 1.0.  On hourly bars the two are identical.
+    bar_hours = _bar_hours(df.index)
     bound_hours = _resolve_max_age_hours(max_age_hours)
-    # The bound is in hours, ffill counts rows, so translate through the
-    # bar interval the frame actually has (1 row on hourly bars, 4 on
-    # 15-minute bars, ...).  Never unbounded.
-    limit = max(0, int(round(bound_hours / bar_hours)))
 
     merged = signal_df.reindex(ohlc_index)
-    # `ffill(limit=0)` is rejected by pandas, and it is exactly the
-    # "carry nothing" case anyway, so skip the pad entirely.
-    filled = merged[available_cols]
-    if limit > 0:
-        filled = filled.ffill(limit=limit)
+    filled = merged[available_cols].ffill()
+    # The bound is expressed in *hours*, so it is applied by masking on the
+    # measured age rather than with `ffill(limit=N)`.  A row-count limit
+    # only equals an hour-count on bars of an hour or longer: several
+    # sub-hourly bars share one floored record-hour, so `limit=N` rows
+    # would carry a reading N bars *past* its whole hour.  Masking on age
+    # keeps the bound exact on every interval and is identical to the old
+    # `ffill(limit=...)` on hourly bars.
+    ages = _signal_ages(merged, filled, available_cols, df.index)
+    for col in available_cols:
+        filled[col] = filled[col].where(ages[col] <= bound_hours)
+    # Ages for the rows the mask just retired.  `filled` is the masked
+    # frame, so masking the ages by it reproduces exactly the ages of a
+    # forward-fill that had never carried past the bound.
+    ages = ages.where(filled.notna())
 
     # ── 4. absence is not neutral ─────────────────────────────────────
     # A row is "observed" when at least one of this source's columns holds
@@ -439,7 +465,6 @@ def merge_extra_features(
     # NaN reaches `FeaturePipeline`/`NormalizationStats` — the flag pair is
     # what makes the zero-fill unambiguous.
     observed = filled.notna().any(axis=1)
-    ages = _signal_ages(merged, filled, available_cols)
     source_age = ages.max(axis=1).fillna(_NO_SIGNAL_AGE)
 
     for col in available_cols:
@@ -459,15 +484,15 @@ def merge_extra_features(
 
     _LOGGER.debug(
         "Merged %d signal record(s) (%d hour(s)) from %s onto %d OHLCV bars "
-        "(columns: %s, ticker: %s, carry: %d row(s) = %.1fh)",
+        "(columns: %s, ticker: %s, carry bound: %.2fh on %.2fh bars)",
         len(signal_df),
         len(signal_df.index),
         path,
         len(df),
         available_cols,
         ticker or "unfiltered",
-        limit,
         bound_hours,
+        bar_hours,
     )
     return df
 
