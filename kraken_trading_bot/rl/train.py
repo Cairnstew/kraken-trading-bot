@@ -30,6 +30,29 @@ _DEFAULT_CONFIG_PATH = (
 )
 
 
+def resolve_default_config_path() -> Path:
+    """Locate the shipped default training config.
+
+    Resolution order:
+
+    1. Module-relative (``configs/default.yaml`` above the ``rl`` package)
+       — correct for a source checkout or editable install.
+    2. ``./configs/default.yaml`` under the current working directory —
+       the packaged console script imports this module out of the Nix
+       store, where ``configs/`` is not installed, so the module-relative
+       path resolves to a non-existent store path.  The justfile and
+       ``nix develop`` both run from the repo root, so honouring the CWD
+       recovers the config users actually edit.
+
+    Returns:
+        The first candidate that exists, else the CWD candidate (which
+        ``load_train_config`` reports as absent when it does not exist).
+    """
+    if _DEFAULT_CONFIG_PATH.is_file():
+        return _DEFAULT_CONFIG_PATH
+    return Path.cwd() / "configs" / "default.yaml"
+
+
 def pair_from_ticker_id(ticker_id: str) -> str:
     """Map a ticker id back to Kraken pair notation.
 
@@ -47,13 +70,18 @@ def load_train_config(config_path: str | Path | None = None) -> dict[str, Any]:
 
     Args:
         config_path: Path to a YAML config with the shape of
-            ``configs/default.yaml``; defaults to that shipped config.
+            ``configs/default.yaml``; defaults to the resolved shipped
+            config (see :func:`resolve_default_config_path`).
 
     Returns:
         Config dict (empty when the file is absent).  Raises on
         unparseable YAML.
     """
-    path = Path(config_path) if config_path is not None else _DEFAULT_CONFIG_PATH
+    path = (
+        Path(config_path)
+        if config_path is not None
+        else resolve_default_config_path()
+    )
     if not path.is_file():
         return {}
     with path.open(encoding="utf-8") as f:
@@ -216,6 +244,7 @@ def train_ticker(
 
 __all__ = [
     "pair_from_ticker_id",
+    "resolve_default_config_path",
     "load_train_config",
     "build_train_config",
     "train_ticker",

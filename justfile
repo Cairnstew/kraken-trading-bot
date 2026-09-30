@@ -3,6 +3,8 @@
 #   just --list             show all recipes
 #   just train              train ppo_eth_01 on ETH/USD with defaults
 #   just train --ticker XRP_USD --model ppo_xrp_02 --timesteps 100000
+#   just bench SOL_USD ppo_sol_01 50000   train + backtest + show performance
+#   just export-data --ticker SOL_USD      dump the data pipeline frame to CSV
 #   just paper --ticker ETH_USD --model ppo_eth_01 --iterations 10
 #   just test               run the pytest suite
 #
@@ -37,6 +39,15 @@ setup-venv:
   ./.venv/bin/pip install -e /home/seanc/Projects/kraken-python
   ./.venv/bin/pip install -e .
 
+# ── Classic strategy runner ────────────────────────────────────────────
+
+# Run the SMA strategy loop against live Kraken data (no RL). Passes
+# straight through to `kraken-trading-bot run`. Prefer --paper: without it
+# the engine places real orders and needs KRAKEN_API_KEY/SECRET.
+# e.g. just run --paper --pair ETH/USD
+run *CLI_ARGS="":
+  {{dev}} 'kraken-trading-bot run {{CLI_ARGS}}'
+
 # ── RL workflow ────────────────────────────────────────────────────────
 
 # Train a PPO model. Args pass through to `kraken-trading-bot train`
@@ -44,10 +55,38 @@ setup-venv:
 train *CLI_ARGS="":
   {{dev}} 'kraken-trading-bot train {{CLI_ARGS}}'
 
+# Train and immediately backtest in one shot, so the performance block
+# follows the training log. Positional params, all optional and defaulted:
+# ticker, model, timesteps, pages, seed, models-root — so `just bench`,
+# `just bench SOL_USD ppo_sol_01`, `just bench SOL_USD ppo_sol_01 50000`
+# and `just bench SOL_USD ppo_sol_01 50000 6 42` all work. Unlike the
+# other RL recipes this does not take free pass-through, because the same
+# values have to be handed to *both* subcommands — only flags shared by
+# `train` and `backtest` can be forwarded blindly, and `--timesteps` is
+# not one of them. `*TRAIN_ARGS` is appended to `train` only, for
+# train-exclusive flags (e.g. --config, --action-space, --episode-bars);
+# `backtest` re-reads those from the saved model config. The backtest
+# refetches the same `pages` window seconds after training, so the
+# numbers are in-sample — for a genuine holdout re-run `just backtest`
+# later, or with a smaller --pages.
+# e.g. just bench SOL_USD ppo_sol_01 50000 6 42 --action-space discrete
+bench ticker="ETH_USD" model="ppo_eth_01" timesteps="10000" pages="6" seed="42" models_root="models" *TRAIN_ARGS="":
+  {{dev}} 'kraken-trading-bot train --ticker {{ticker}} --model {{model}} --timesteps {{timesteps}} --pages {{pages}} --seed {{seed}} --models-root {{models_root}} {{TRAIN_ARGS}} && kraken-trading-bot backtest --ticker {{ticker}} --model {{model}} --pages {{pages}} --seed {{seed}} --models-root {{models_root}}'
+
 # Backtest a trained model on fresh OHLC data
 # e.g. just backtest --ticker ETH_USD --model ppo_eth_01
 backtest *CLI_ARGS="":
   {{dev}} 'kraken-trading-bot backtest {{CLI_ARGS}}'
+
+# Run the data pipeline (OHLCV -> signal merges -> features) and write the
+# staged frame to CSV. Columns keep their pipeline order: timestamp, OHLCV,
+# any merged signals, then the raw observation features (plus a warmup flag
+# for the look-back rows the agent never trades on). --normalized appends
+# z_-prefixed columns for inspection; the agent itself reads the raw ones.
+# e.g. just export-data --ticker SOL_USD
+#      just export-data --ticker SOL_USD --episode-bars 500 --normalized
+export-data *CLI_ARGS="":
+  {{dev}} 'kraken-trading-bot export-data {{CLI_ARGS}}'
 
 # List models. Pass --ticker T or --json to filter/format
 # e.g. just models --ticker ETH_USD — just models --json — just models
