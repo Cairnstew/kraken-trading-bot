@@ -1,10 +1,16 @@
 """Feature engineering for the RL trading environment.
 
-Transforms raw OHLCV data into normalized features consumed by the
+Transforms raw OHLCV data into the feature matrix consumed by the
 reinforcement learning agent.  All calculations are vectorized with
-pandas/numpy; normalization statistics are kept per ticker and can be
-persisted to ``normalization.npz`` files inside the model storage tree
+pandas/numpy; the matrix the policy sees is ``compute`` output passed
+through :func:`observation_frame` (forward-fill, then zero-fill) and
+z-scored with per-ticker normalization statistics that are persisted to
+``normalization.npz`` files inside the model storage tree
 (``models/{TICKER_ID}/{model_name}/``).
+
+Fit the stats and transform through the same pipeline that
+``TradingEnvironment`` uses, so training, backtest, paper trading and the
+CSV export all share one observation convention.
 """
 
 from __future__ import annotations
@@ -24,16 +30,15 @@ _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 
-# Columns added by :func:`merge_extra_features` in ``data.py``.
-# The ``signals`` group passes them through as-is so they reach the
-# agent's observation vector and the normalization stats.
-# NOTE: MUST stay in sync with ``data._SIGNAL_COLUMNS`` — widening the
-# merge seam in one place without the other silently drops signal columns
-# from the observation vector.
+# Columns added by :func:`merge_extra_features` in ``data.py``, which
+# imports this tuple so the merge allow-list and the feature allow-list
+# cannot drift: the ``signals`` group forwards them as-is so they reach
+# the agent's observation vector and the normalization stats.  Widen it
+# here only.
 # News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
 # Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
 # Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
-_SIGNAL_COLUMNS = (
+SIGNAL_COLUMNS = (
     "sentiment_score",
     "article_count",
     "novelty_flag",
@@ -53,6 +58,15 @@ class NormalizationStats:
     The stats are stored as a mapping ``feature_name -> (mean, std)`` and
     are serialized to the standard ``normalization.npz`` format so the
     training pipeline can persist them next to each trained model.
+
+    The moments are always taken over an **observation frame** — the
+    output of :func:`observation_frame`, i.e. ``compute`` then ``ffill``
+    then ``fillna(0)``.  That is the matrix the policy is actually
+    conditioned on, so :meth:`normalize` applied to it is an exact affine
+    image of what the agent sees.  Fitting on the raw ``compute`` output
+    instead would silently mix a different set of rows (the NaN warm-up)
+    into the moments, making the ``z_`` columns a *different*
+    normalization than the one the policy runs on.
     """
 
     ticker_id: str
@@ -113,8 +127,13 @@ class NormalizationStats:
         deviations are replaced by 1.0 so constant features normalize to
         zero instead of raising.
 
+        The map is affine and per-feature, so it preserves the observation
+        width and column order — a policy trained against these stats
+        keeps loading unchanged.
+
         Args:
-            frame: Un-normalized feature frame produced by a pipeline.
+            frame: Feature frame to z-score; pass an observation frame
+                (:func:`observation_frame`) for the canonical result.
 
         Returns:
             Frame with the same index and the normalized columns.
@@ -127,6 +146,28 @@ class NormalizationStats:
             safe_std = std if std > 1e-12 else 1.0
             out[name] = (frame[name] - mean) / safe_std
         return out
+
+
+def observation_frame(features: pd.DataFrame) -> pd.DataFrame:
+    """The one matrix the policy is conditioned on: ffill, then zero-fill.
+
+    Every observation path in this repo goes through this function —
+    :meth:`FeaturePipeline.fit` (the fit frame), :meth:`FeaturePipeline.
+    transform`, ``TradingEnvironment._raw_feature_array``,
+    ``PaperTrader._build_observation`` and the CSV export's feature block.
+    Sharing it is what makes a persisted ``normalization.npz`` mean the
+    same thing at train time and at inference time.
+
+    Args:
+        features: Raw :meth:`FeaturePipeline.compute` output.
+
+    Returns:
+        A frame of identical index and columns with no NaN: indicator
+        warm-up rows hold the first valid value, and a leading gap with
+        nothing to fill from is zero — the same treatment the environment
+        gives the policy.
+    """
+    return features.ffill().fillna(0.0)
 
 
 class FeaturePipeline:
@@ -144,8 +185,10 @@ class FeaturePipeline:
 
     Indicators that depend on a look-back window are computed for every
     window size in ``windows`` (e.g. ``[1, 4, 24]`` gives 1h, 4h and 1d
-    views of the same levels).  Normalization stats are stored per ticker
-    and can be persisted with :meth:`save_normalization` /
+    views of the same levels).  The pipeline's output becomes the matrix
+    the policy consumes through :func:`observation_frame`, and
+    normalization stats are stored per ticker — fitted on that same
+    matrix — and persisted with :meth:`save_normalization` /
     :meth:`load_normalization`.
     """
 
@@ -190,6 +233,12 @@ class FeaturePipeline:
     def fit(self, df: pd.DataFrame, ticker_id: str | None = None) -> "FeaturePipeline":
         """Compute and store per-ticker normalization stats.
 
+        The moments are taken over the *observation* frame of ``df``
+        (:func:`observation_frame`: compute, ffill, zero-fill), not over
+        the raw compute output.  Callers pass the window they will
+        actually train or trade on, so nothing outside it — a held-out
+        tail, a leading NaN warm-up — leaks into the saved stats.
+
         Args:
             df: Raw OHLCV frame (columns: open/high/low/close/volume).
             ticker_id: Ticker these stats belong to.  When omitted the
@@ -198,16 +247,16 @@ class FeaturePipeline:
         Returns:
             ``self`` for chaining.
         """
-        features = self.compute(df)
-        mean = features.mean()
-        std = features.std(ddof=0)
+        observed = observation_frame(self.compute(df))
+        mean = observed.mean()
+        std = observed.std(ddof=0)
         stats = NormalizationStats(
             ticker_id=ticker_id or "",
             stats={
                 name: (float(mean[name]), float(std[name]))
-                for name in features.columns
+                for name in observed.columns
             },
-            feature_names=list(features.columns),
+            feature_names=list(observed.columns),
         )
         self._stats[ticker_id or ""] = stats
         return self
@@ -215,9 +264,11 @@ class FeaturePipeline:
     def transform(self, df: pd.DataFrame, ticker_id: str | None = None) -> np.ndarray:
         """Compute and normalize features for ``df``.
 
-        When per-ticker stats exist they are used; otherwise the frame's
-        own statistics are used (in-sample normalization, fine for
-        exploratory use but not for evaluation).
+        The observation frame of ``df`` (:func:`observation_frame`) is
+        z-scored with the ticker's stored stats, so the result is an exact
+        affine image of the matrix the environment hands the policy. When
+        no stats exist the frame's own moments are used (in-sample
+        normalization, fine for exploratory use but not for evaluation).
 
         Args:
             df: Raw OHLCV frame.
@@ -226,14 +277,16 @@ class FeaturePipeline:
         Returns:
             ``float32`` array of shape ``(n_bars, n_features)``.
         """
-        features = self.compute(df)
+        observed = observation_frame(self.compute(df))
         stats = self._stats.get(ticker_id or "")
         if stats is not None:
-            normalized = stats.normalize(features)
+            normalized = stats.normalize(observed)
         else:
-            normalized = (features - features.mean()) / features.std(ddof=0).replace(0, 1.0)
-        # Normalized output is ready for the agent: forward-fill the
-        # indicator warm-up region and zero the remaining leading NaNs.
+            safe_std = observed.std(ddof=0).replace(0, 1.0)
+            normalized = (observed - observed.mean()) / safe_std
+        # The observation frame is already gap-free; this is a guard
+        # against a stats file whose moments came back as NaN, not the
+        # usual warm-up fill.
         normalized = normalized.ffill().fillna(0.0)
         return normalized.to_numpy(dtype=np.float32)
 
@@ -403,7 +456,7 @@ class FeaturePipeline:
         novelty_flag is a bool).  Columns not present in the input are
         silently skipped (the merge may not always be active).
         """
-        for col in _SIGNAL_COLUMNS:
+        for col in SIGNAL_COLUMNS:
             if col in df.columns:
                 out[col] = df[col].astype(float)
 
@@ -485,7 +538,9 @@ def _atr(
 __all__ = [
     "FeaturePipeline",
     "NormalizationStats",
+    "SIGNAL_COLUMNS",
     "normalize_ticker_id",
+    "observation_frame",
 ]
 
 

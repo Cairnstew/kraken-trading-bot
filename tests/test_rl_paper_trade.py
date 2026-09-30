@@ -17,7 +17,8 @@ import pytest
 from kraken_api.models import Candle
 
 from kraken_trading_bot.cli import _build_parser, main
-from kraken_trading_bot.rl import train_ticker
+from kraken_trading_bot.rl import NormalizationStats, train_ticker
+from kraken_trading_bot.rl.features import observation_frame
 from kraken_trading_bot.rl.paper_trade import PaperSignal, PaperTrader, run_paper_trader
 
 
@@ -262,6 +263,33 @@ def test_built_observation_matches_env_space(trained_model):
     obs = trader._build_observation(_synthetic_ohlcv(60))
     assert obs.shape == trader.env.observation_space.shape
     assert obs.dtype == np.float32
+
+
+def test_built_observation_is_z_scored_with_the_saved_stats(trained_model):
+    """Live inference applies the model's own normalization.npz moments.
+
+    The raw row is not what the policy was trained on, so this is the
+    train/infer-skew guard: the live observation must be the same affine
+    map the training environment applied, using the *loaded* stats (never
+    refitted from the live window).
+    """
+    root, record = trained_model
+    mgr = MockManager(_candle_window())
+    trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
+
+    stats = NormalizationStats.load(record.normalization_path)
+    observed = observation_frame(trader.pipeline.compute(_synthetic_ohlcv(60)))
+    expected = stats.normalize(observed).to_numpy(dtype=np.float32)[-1]
+
+    obs = trader._build_observation(_synthetic_ohlcv(60))
+    np.testing.assert_allclose(obs, expected, rtol=1e-5, atol=1e-5)
+
+    # The loaded moments are used as-is, not re-derived from live data.
+    assert trader.pipeline.stats_for(trader.ticker_key).stats == pytest.approx(
+        {k: tuple(v) for k, v in stats.stats.items()}
+    )
+    # ...and it is genuinely scaled, not the raw feature row.
+    assert not np.allclose(obs, observed.to_numpy(dtype=np.float32)[-1])
 
 
 # ---------------------------------------------------------------------------

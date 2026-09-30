@@ -21,11 +21,11 @@ Action mapping (mirrors ``TradingEnvironment._execute``):
 
 Observations replicate the environment exactly, which is the load-bearing
 detail for inference: :class:`TradingEnvironment` feeds the agent the
-pipeline's raw (un-normalized) computed features, forward-filled then
-zero-filled, as a ``float32`` row (:meth:`_observe` /
-``_raw_feature_array``).  ``PaperTrader._build_observation`` rebuilds that
-exact vector from the live window so inference sees the same scale as
-training.
+pipeline's computed features, forward-filled then zero-filled and z-scored
+with the ticker's persisted ``normalization.npz`` stats, as a ``float32``
+row (:meth:`_observe` / ``_raw_feature_array``).  ``PaperTrader.
+_build_observation`` rebuilds that exact vector from the live window — same
+fill, same stats — so inference sees the same scale as training.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ import pandas as pd
 from .agent import RLAgent
 from .data import NotEnoughDataError, read_ohlc_dataframe
 from .environment import TradingEnvironment
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import FeaturePipeline, normalize_ticker_id, observation_frame
 from .registry import scan_model
 from .train import pair_from_ticker_id
 
@@ -300,11 +300,13 @@ class PaperTrader:
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:
         """Build the observation vector exactly as the training env did.
 
-        The environment feeds the agent the pipeline's raw computed
-        features (forward-filled, then zero-filled, ``float32`` — see
-        ``TradingEnvironment._observe``/``_raw_feature_array``), not the
-        normalized ``transform`` output; using the same construction keeps
-        live inference on the same scale as training.
+        The environment feeds the agent the pipeline's computed features
+        forward-filled then zero-filled, z-scored with the ticker's
+        ``normalization.npz`` stats (see ``TradingEnvironment._observe`` /
+        ``_raw_feature_array``), not the raw un-normalized row; using the
+        same construction keeps live inference on the same scale as
+        training.  Those stats are the ones loaded from the model
+        directory — never refitted from the live window.
 
         Raises:
             ValueError: If the resulting width differs from the model's
@@ -312,10 +314,10 @@ class PaperTrader:
         """
         if self.context_bars is not None:
             df = df.tail(self.context_bars)
-        features = self.pipeline.compute(df)
-        arr = features.to_numpy(dtype=np.float64)
-        arr = pd.DataFrame(arr).ffill().fillna(0.0).to_numpy(dtype=np.float32)
-        obs = np.asarray(arr[-1], dtype=np.float32)
+        observed = observation_frame(self.pipeline.compute(df))
+        stats = self.pipeline.stats_for(self.ticker_key)
+        matrix = observed if stats is None else stats.normalize(observed)
+        obs = np.asarray(matrix.to_numpy(dtype=np.float32)[-1], dtype=np.float32)
         return self._validate_observation(obs)
 
     def _validate_observation(self, obs: np.ndarray) -> np.ndarray:

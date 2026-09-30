@@ -438,8 +438,10 @@ def test_cli_export_data_dispatch_writes_csv(tmp_path, capsys):
     assert destination.exists()
     assert "Exported 2 bars x 5 columns" in out
     assert "2026-01-01T00:00:00Z -> 2026-01-01T01:00:00Z" in out
-    # Stage counts come from frame.attrs, not a re-derivation.
-    assert "1 timestamp, 2 OHLCV, 0 signal, 1 observation (raw)" in out
+    # Stage counts come from frame.attrs, not a re-derivation. The feature
+    # block is the pre-transform frame; the z-scored block (0 here, because
+    # --normalized was not passed) is the agent's actual observation.
+    assert "1 timestamp, 2 OHLCV, 0 signal, 1 features, 0 z-scored observation" in out
 
 
 def test_cli_export_data_dispatch_forwards_overrides():

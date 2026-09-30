@@ -91,7 +91,23 @@ kraken-trading-bot models --ticker ETH_USD --json
 
 # Paper-trade a trained model (no real orders)
 kraken-trading-bot paper-trade --ticker ETH_USD --model ppo_eth_01 --iterations 100
+
+# Dump the data pipeline's frame to CSV (same stages `train` runs)
+kraken-trading-bot export-data --ticker ETH_USD
 ```
+
+### Observations
+
+The policy is conditioned on the pipeline's `compute()` output,
+forward-filled then zero-filled and z-scored per feature with the mean/std
+moments in `normalization.npz` — the same map at train, backtest and paper
+time, so all three share one scale. `prepare_episode` fits those moments on
+the episode window only (never on a held-out tail), and `export-data`
+renders both sides: the `features` block is the pre-transform frame the
+moments were fitted on, and `--normalized` adds the `z_` block, which is
+exactly the vector the agent sees. Changing the feature pipeline or its
+window therefore requires a retrain — `normalization.npz` and `model.zip`
+travel together under `models/{TICKER_ID}/{model_name}/`.
 
 ### Python API
 

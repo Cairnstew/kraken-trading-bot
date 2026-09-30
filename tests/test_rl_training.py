@@ -200,6 +200,60 @@ def test_prepare_episode_slices_window_and_fits_stats():
     assert normalize_ticker_id("ETH/USD") == "ETH_USD"
 
 
+def test_prepare_episode_fits_stats_on_the_slice_only():
+    """The held-out tail must not leak into the fitted moments.
+
+    The stats condition the observation, so fitting them on the full
+    fetched frame would let bars the episode never trades on inform what
+    the policy sees. Fitting on the trailing window instead makes the
+    moments describe exactly the episode.
+    """
+    df = _synthetic_ohlcv(200)
+
+    sliced = FeaturePipeline(windows=[1, 4, 24])
+    window = prepare_episode(df, sliced, ticker_id="ETH/USD", episode_bars=100)
+
+    reference = FeaturePipeline(windows=[1, 4, 24])
+    reference.fit(window, ticker_id="ETH_USD")
+
+    full = FeaturePipeline(windows=[1, 4, 24])
+    full.fit(df, ticker_id="ETH_USD")
+
+    # Identical to fitting the returned window directly...
+    assert sliced.stats_for("ETH_USD").stats == pytest.approx(
+        reference.stats_for("ETH_USD").stats
+    )
+    # ...and different from the full-frame fit, i.e. the ordering matters.
+    assert sliced.stats_for("ETH_USD").stats["return_1"][0] != pytest.approx(
+        full.stats_for("ETH_USD").stats["return_1"][0]
+    )
+
+
+def test_prepare_episode_fits_stats_on_observation_frame():
+    """Fitted moments describe the ffilled frame the policy is given."""
+    from kraken_trading_bot.rl.features import observation_frame
+
+    df = _synthetic_ohlcv(200)
+    features = FeaturePipeline(windows=[1, 4, 24])
+    window = prepare_episode(df, features, ticker_id="ETH/USD")
+
+    observed = observation_frame(features.compute(window))
+    stats = features.stats_for("ETH_USD")
+
+    for name, (mean, std) in stats.stats.items():
+        assert mean == pytest.approx(float(observed[name].mean()))
+        assert std == pytest.approx(float(observed[name].std(ddof=0)))
+
+    # The transform is therefore the exact affine image of the
+    # observation matrix the environment hands the policy.
+    np.testing.assert_allclose(
+        features.transform(window, ticker_id="ETH_USD"),
+        stats.normalize(observed).to_numpy(dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_prepare_episode_not_enough_data():
     features = FeaturePipeline(windows=[1, 4, 24])
     small = _synthetic_ohlcv(5)

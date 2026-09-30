@@ -26,7 +26,12 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
-from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
+from .features import (
+    FeaturePipeline,
+    NormalizationStats,
+    normalize_ticker_id,
+    observation_frame,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -185,6 +190,8 @@ class TradingEnvironment(gym.Env):
                 self.pipeline.fit(self.data, ticker_id=self.ticker_id)
             self._features = self.pipeline.compute(self.data)
             self._feature_names = list(self._features.columns)
+            # Z-scored with the ticker's stats, so train, backtest and
+            # paper all condition the policy on the same scale.
             self._feature_matrix = self._raw_feature_array()
             self._start_index = self._first_valid_index()
         else:
@@ -443,9 +450,25 @@ class TradingEnvironment(gym.Env):
         return max(int(first), 0)
 
     def _raw_feature_array(self) -> np.ndarray:
-        """Pipeline features with NaNs forward-filled then zero-filled."""
-        arr = self._features.to_numpy(dtype=np.float64)
-        return pd.DataFrame(arr).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+        """The observation matrix: ffilled features, z-scored with the stats.
+
+        ``compute`` output is forward-filled then zero-filled (the frame
+        the stats were fitted on), then passed through the ticker's
+        :class:`NormalizationStats`.  The map is affine and per-feature, so
+        the width and column order are exactly the computed feature set —
+        only the scale changes, and a policy trained on these stats keeps
+        loading unchanged.
+
+        Without a pipeline there are no stats and the built-in features
+        are already ratios, so they pass through unscaled.
+        """
+        observed = observation_frame(self._features)
+        if self.pipeline is None:
+            return observed.to_numpy(dtype=np.float32)
+        stats = self.pipeline.stats_for(self.ticker_id)
+        if stats is None:
+            return observed.to_numpy(dtype=np.float32)
+        return stats.normalize(observed).to_numpy(dtype=np.float32)
 
     def _builtin_features(self) -> tuple[np.ndarray, list[str]]:
         close = self.data["close"].astype(float)

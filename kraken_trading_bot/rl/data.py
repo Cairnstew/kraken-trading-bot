@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import pandas as pd
 
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import SIGNAL_COLUMNS, FeaturePipeline, normalize_ticker_id
 
 if TYPE_CHECKING:
     from kraken_api import KrakenManager
@@ -43,21 +43,14 @@ _LOGGER = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "count")
 
-# Columns expected in signal JSONL records from sibling projects.
-# News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
-# Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
-# Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
-_SIGNAL_COLUMNS = (
-    "sentiment_score",
-    "article_count",
-    "novelty_flag",
-    "funding_rate",
-    "basis",
-    "open_interest",
-    "stt_mention_count",
-    "stt_tilt",
-    "fng_index",
-)
+# Columns expected in signal JSONL records from sibling projects. The one
+# allow-list lives in ``features``: ``merge_extra_features`` and the
+# ``signals`` feature group must agree, or a merged column reaches the
+# frame but never the observation vector.
+#   News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
+#   Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
+#   Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
+_SIGNAL_COLUMNS = SIGNAL_COLUMNS
 
 # Bars a 24-window feature pipeline needs before any indicator fills its
 # look-back window (max window + a small return/rolling cushion).
@@ -518,10 +511,16 @@ def prepare_episode(
     The :class:`TradingEnvironment` treats the DataFrame it is given as
     one episode (its ``reset(options=...)`` protocol is currently
     unused), so bounding episode length means bounding the DataFrame.
-    This helper fits the pipeline's per-ticker normalization stats on
-    the full frame, validates that enough data is present, then returns
-    the trailing ``episode_bars`` bars (or the whole frame when
-    ``episode_bars`` is None).
+    This helper validates that enough data is present, slices the
+    trailing ``episode_bars`` bars (or keeps the whole frame when
+    ``episode_bars`` is None), then fits the pipeline's per-ticker
+    normalization stats on **that window only**.
+
+    Slicing first is deliberate: the stats condition the observation, so
+    fitting them on bars outside the episode would leak the never-traded
+    tail of the fetched frame into the agent's inputs.  With
+    ``episode_bars=None`` there is nothing to exclude and the fitted
+    stats are unchanged.
 
     Args:
         df: Raw OHLCV DataFrame (``open/high/low/close/volume``).
@@ -544,7 +543,6 @@ def prepare_episode(
         raise NotEnoughDataError(1, 0, what="OHLC bars")
 
     ticker_key = normalize_ticker_id(ticker_id) if ticker_id else ""
-    features.fit(df, ticker_id=ticker_key)
 
     needed = _minimum_bars(features)
     available = len(df)
@@ -557,6 +555,10 @@ def prepare_episode(
         window = df.tail(int(episode_bars))
     else:
         window = df
+
+    # After the slice, on purpose: the stats must describe only the bars
+    # the policy is conditioned on.
+    features.fit(window, ticker_id=ticker_key)
 
     _LOGGER.debug(
         "Prepared %s-bar episode for %s (full frame %d bars)",

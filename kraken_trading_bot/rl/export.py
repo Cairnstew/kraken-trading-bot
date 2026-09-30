@@ -23,18 +23,22 @@ signals
 
 features
     ``FeaturePipeline.compute`` output under its native names, already
-    forward-filled and zero-filled. **These columns are the agent's
-    observation vector**, not a normalized stand-in:
-    ``TradingEnvironment`` feeds ``_raw_feature_array()`` — ``compute``
-    then ``ffill`` then ``fillna(0)`` — straight to the policy, and
-    ``PaperTrader._build_observation`` rebuilds the same raw row for
-    live inference. ``FeaturePipeline.transform`` sits on no
-    observation path in this repo.
+    forward-filled and zero-filled — the *pre-transform* matrix the
+    normalization stats are fitted on. Magnitudes are therefore raw and
+    heteroscaled (dollar-scale ``sma_*`` beside unit-scale ``return_*``);
+    what the agent consumes is the ``z_`` block below.
 
 normalized (opt-in, ``z_``-prefixed)
-    ``FeaturePipeline.transform``, i.e. what ``normalization.npz``
-    *would* emit. Off by default so the export never implies a scaling
-    stage the agent does not have.
+    The features z-scored with this ticker's ``normalization.npz``
+    moments — the value ``FeaturePipeline.transform`` returns, applied to
+    the block above rather than recomputed. **This is the agent's
+    observation vector**: ``TradingEnvironment`` feeds
+    ``_raw_feature_array()`` (``compute`` then ffill then ``fillna(0)``,
+    then the ticker's stats) straight to the policy, and
+    ``PaperTrader._build_observation`` rebuilds the identical row for
+    live inference.  Off by default because it doubles the column count;
+    the raw block above is the frame the moments were fitted on, so
+    ``z_col == (col - mean) / std`` exactly.
 
 ``warmup``
     ``True`` for rows before the environment's ``_start_index``
@@ -55,7 +59,7 @@ import numpy as np
 import pandas as pd
 
 from .data import _OHLCV_COLUMNS, prepare_episode, read_ohlc_dataframe
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import FeaturePipeline, normalize_ticker_id, observation_frame
 from .train import build_train_config
 
 _LOGGER = logging.getLogger(__name__)
@@ -106,7 +110,9 @@ def _warmup_mask(features: pd.DataFrame) -> np.ndarray:
     Mirrors ``TradingEnvironment._first_valid_index``: the first row
     whose features are *all* non-NaN, i.e. the indicator look-back
     region. Positional (rather than ``idxmax``) so it is correct on a
-    DatetimeIndex too, which is what this module exports.
+    DatetimeIndex too, which is what this module exports.  Takes the raw
+    ``compute`` output, not the filled frame — the leading NaNs are the
+    marker.
     """
     valid = features.notna().to_numpy().all(axis=1)
     if not valid.any():
@@ -138,8 +144,9 @@ def build_export_frame(
         episode_bars: Keep only the trailing N bars (None = all).
         manager: Optional KrakenManager for data fetching; defaults to
             whatever ``read_ohlc_dataframe`` builds.
-        include_normalized: Also append ``z_``-prefixed columns from
-            ``FeaturePipeline.transform`` (not used by the agent).
+        include_normalized: Also append ``z_``-prefixed columns holding
+            the agent's actual observation vector (the features z-scored
+            with this ticker's ``normalization.npz`` moments).
         overrides: Config overrides, e.g.
             ``ohlcv_interval_minutes=30``.
 
@@ -172,19 +179,20 @@ def build_export_frame(
         feature_groups=cfg.get("feature_groups", None) or _DEFAULT_FEATURE_GROUPS,
     )
 
-    # Fits the per-ticker stats on the full frame, then keeps the
-    # trailing episode — exactly what train_ticker hands the environment,
-    # so this frame is the training frame.
+    # Slices the trailing episode, then fits the per-ticker stats on that
+    # slice — exactly what train_ticker hands the environment, so this
+    # frame is the training frame.
     episode = prepare_episode(
         df, features, ticker_id=ticker_id, episode_bars=episode_bars
     )
 
     computed = features.compute(episode)
-    observed = computed.ffill().fillna(0.0)
+    observed = observation_frame(computed)
 
     out = episode.copy()
     out.insert(0, "timestamp", _timestamp_strings(out))
-    # Same fill the environment applies before handing rows to the policy.
+    # The fit frame: what the environment scales before handing rows to
+    # the policy.
     out[list(observed.columns)] = observed
     out.insert(len(out.columns), "warmup", _warmup_mask(computed))
 
@@ -192,10 +200,18 @@ def build_export_frame(
     signals = [c for c in episode.columns if c not in set(_OHLCV_COLUMNS)]
     normalized: list[str] = []
     if include_normalized:
-        z = features.transform(episode, ticker_id=normalize_ticker_id(ticker_id))
-        zframe = pd.DataFrame(
-            z, index=episode.index, columns=[f"z_{name}" for name in computed.columns]
-        )
+        # The agent's observation vector: the fitted moments applied to
+        # the frame above, column for column, so the z_* block is exactly
+        # the affine image of the features block.  prepare_episode
+        # registered the stats, so they are always present here.
+        stats = features.stats_for(normalize_ticker_id(ticker_id))
+        if stats is None:
+            raise RuntimeError(
+                f"No fitted normalization stats for {ticker_id!r}; the episode "
+                f"frame cannot be z-scored."
+            )
+        zframe = stats.normalize(observed)
+        zframe.columns = [f"z_{name}" for name in zframe.columns]
         normalized = list(zframe.columns)
         out = pd.concat([out, zframe], axis=1)
 

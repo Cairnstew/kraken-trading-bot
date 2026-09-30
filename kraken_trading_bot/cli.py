@@ -306,8 +306,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--normalized",
         action="store_true",
         help=(
-            "Also append z_-prefixed normalized columns "
-            "(inspection only; the agent does not use them)."
+            "Also append z_-prefixed columns holding the agent's "
+            "observation (the features z-scored with normalization.npz)."
         ),
     )
 
@@ -631,7 +631,7 @@ def cmd_export_data(args: argparse.Namespace) -> int:
         )
     print(
         "  stages:   {ts} timestamp, {ohlcv} OHLCV, {sig} signal, "
-        "{feat} observation (raw), {norm} normalized, warmup flag".format(
+        "{feat} features, {norm} z-scored observation, warmup flag".format(
             ts=len(stages.get("timestamp", [])),
             ohlcv=len(stages.get("ohlcv", [])),
             sig=len(stages.get("signals", [])),
