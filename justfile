@@ -82,7 +82,8 @@ backtest *CLI_ARGS="":
 # staged frame to CSV. Columns keep their pipeline order: timestamp, OHLCV,
 # any merged signals, then the raw observation features (plus a warmup flag
 # for the look-back rows the agent never trades on). --normalized appends
-# z_-prefixed columns for inspection; the agent itself reads the raw ones.
+# the z_-prefixed columns: the agent's z-scored observation (mirrors what
+# TradingEnvironment hands the policy, per normalization.npz).
 # e.g. just export-data --ticker SOL_USD
 #      just export-data --ticker SOL_USD --episode-bars 500 --normalized
 export-data *CLI_ARGS="":

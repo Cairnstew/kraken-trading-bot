@@ -24,12 +24,11 @@ _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 
-# Columns added by :func:`merge_extra_features` in ``data.py``.
+# Columns added by :func:`merge_extra_features` in ``data.py`` (which
+# imports this tuple — this module is the single canonical source so the
+# allow-list cannot drift between the merge seam and the observation).
 # The ``signals`` group passes them through as-is so they reach the
 # agent's observation vector and the normalization stats.
-# NOTE: MUST stay in sync with ``data._SIGNAL_COLUMNS`` — widening the
-# merge seam in one place without the other silently drops signal columns
-# from the observation vector.
 # News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
 # Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
 # Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
@@ -190,6 +189,13 @@ class FeaturePipeline:
     def fit(self, df: pd.DataFrame, ticker_id: str | None = None) -> "FeaturePipeline":
         """Compute and store per-ticker normalization stats.
 
+        Stats are fitted on the **ffilled observation frame** — ``compute``
+        then ``ffill`` then ``fillna(0)`` — exactly the matrix the
+        environment hands the policy, so :meth:`transform` output is an
+        affine image of the observation.  (Fitting on the raw compute
+        frame instead would record the NaN-warmup column's ``skipna``
+        mean, which no observation row ever sees.)
+
         Args:
             df: Raw OHLCV frame (columns: open/high/low/close/volume).
             ticker_id: Ticker these stats belong to.  When omitted the
@@ -198,7 +204,7 @@ class FeaturePipeline:
         Returns:
             ``self`` for chaining.
         """
-        features = self.compute(df)
+        features = self.compute(df).ffill().fillna(0.0)
         mean = features.mean()
         std = features.std(ddof=0)
         stats = NormalizationStats(
@@ -215,6 +221,12 @@ class FeaturePipeline:
     def transform(self, df: pd.DataFrame, ticker_id: str | None = None) -> np.ndarray:
         """Compute and normalize features for ``df``.
 
+        The input is the **ffilled observation frame** (``compute`` then
+        ``ffill`` then ``fillna(0)``) — the same matrix the environment
+        hands the policy — so the output is the observation's exact
+        affine image.  Leading warmup rows (zero-filled) therefore map to
+        ``(0 - mean) / std`` rather than to zero.
+
         When per-ticker stats exist they are used; otherwise the frame's
         own statistics are used (in-sample normalization, fine for
         exploratory use but not for evaluation).
@@ -226,15 +238,12 @@ class FeaturePipeline:
         Returns:
             ``float32`` array of shape ``(n_bars, n_features)``.
         """
-        features = self.compute(df)
+        features = self.compute(df).ffill().fillna(0.0)
         stats = self._stats.get(ticker_id or "")
         if stats is not None:
             normalized = stats.normalize(features)
         else:
             normalized = (features - features.mean()) / features.std(ddof=0).replace(0, 1.0)
-        # Normalized output is ready for the agent: forward-fill the
-        # indicator warm-up region and zero the remaining leading NaNs.
-        normalized = normalized.ffill().fillna(0.0)
         return normalized.to_numpy(dtype=np.float32)
 
     def fit_transform(

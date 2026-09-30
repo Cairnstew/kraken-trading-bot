@@ -306,8 +306,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--normalized",
         action="store_true",
         help=(
-            "Also append z_-prefixed normalized columns "
-            "(inspection only; the agent does not use them)."
+            "Also append z_-prefixed columns: the agent's z-scored "
+            "observation (mirrors what TradingEnvironment hands the "
+            "policy)."
         ),
     )
 

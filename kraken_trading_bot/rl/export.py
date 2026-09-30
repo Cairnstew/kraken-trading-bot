@@ -23,18 +23,23 @@ signals
 
 features
     ``FeaturePipeline.compute`` output under its native names, already
-    forward-filled and zero-filled. **These columns are the agent's
-    observation vector**, not a normalized stand-in:
-    ``TradingEnvironment`` feeds ``_raw_feature_array()`` — ``compute``
-    then ``ffill`` then ``fillna(0)`` — straight to the policy, and
-    ``PaperTrader._build_observation`` rebuilds the same raw row for
-    live inference. ``FeaturePipeline.transform`` sits on no
-    observation path in this repo.
+    forward-filled and zero-filled. **Pre-transform features**: the
+    environment applies the ticker's fitted ``NormalizationStats`` to
+    this matrix before handing a row to the policy (see
+    ``TradingEnvironment._raw_feature_array``) and
+    ``PaperTrader._build_observation`` re-derives the same scaled row
+    live.  These columns are the input to z-scoring, not the
+    observation itself.
 
 normalized (opt-in, ``z_``-prefixed)
-    ``FeaturePipeline.transform``, i.e. what ``normalization.npz``
-    *would* emit. Off by default so the export never implies a scaling
-    stage the agent does not have.
+    ``FeaturePipeline.transform``, i.e. the ticker's fitted stats applied
+    to the same ffilled matrix — **this block is the agent's observation
+    vector**: ``compute`` then ``ffill`` then ``fillna(0)`` then
+    ``(x - mean) / std`` per feature, exactly what
+    ``TradingEnvironment._observe`` returns (and what the policy was
+    trained on).  Off by default so a plain export stays lossless and
+    human-readable; ``--normalized`` turns the render of
+    ``normalization.npz`` into the live observation.
 
 ``warmup``
     ``True`` for rows before the environment's ``_start_index``
@@ -139,7 +144,9 @@ def build_export_frame(
         manager: Optional KrakenManager for data fetching; defaults to
             whatever ``read_ohlc_dataframe`` builds.
         include_normalized: Also append ``z_``-prefixed columns from
-            ``FeaturePipeline.transform`` (not used by the agent).
+            ``FeaturePipeline.transform`` — the agent's z-scored
+            observation, identical in construction to what the
+            environment hands the policy.
         overrides: Config overrides, e.g.
             ``ohlcv_interval_minutes=30``.
 
