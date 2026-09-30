@@ -598,6 +598,49 @@ inventory only.
   proposal: give the kraken-* seeder a `--check-store-mode` guard (refuse to
   seed a bot-bound root in fallback-CSV mode, or auto-warn) so the 0-bars trap is
   caught at seed time, not at bot read time.
+- 2026-09-30 — IMPROVE-EXISTING pass (Candidate 1, normalization.npz now shapes
+  the RL observation); gate PASS; two commits + a regression-test commit pushed.
+  Lessons:
+  - `team_merge` is NOT trustworthy as the only transport of a builder's fix
+    COMMIT: merging the builder branch brought in the WIP commit's content but
+    silently dropped the fix commit (`e57056d`) that sat on top of it — the
+    working tree's `data.py:547` still called `features.fit(df)` before slicing
+    after the merge said "Merged". Catch is cheap: after every `team_merge`,
+    verify the merged working tree against the builder's reported HEAD
+    (`git show <commit> --stat` and spot-check one landed line) before building
+    on it. The lead re-applied the fix via `git diff <wip> <fix> | git apply`
+    and re-ran pytest before committing.
+  - A force-shutdown for a model switch can race a builder that has genuinely
+    finished: the original builder had already completed and pushed the fix
+    when the shutdown landed, and the respawned model-switched builder then
+    duplicated the entire deliverable on a second branch (later force-shut,
+    unmerged). Before aborting a builder to change models, check its latest
+    team_message / branch HEAD first — if the work is done, just merge it.
+  - A builder worktree directory can be deleted mid-task (left `prunable` by a
+    concurrent `git worktree` operation) while the branch survives: teammate
+    recovered with `git worktree prune` + re-add. If a builder reports a lost
+    worktree but clean commits, trust the branch, not the directory.
+  - The qa reviewer's "stalled (low output tokens)" system notice is a false
+    positive during long `nix develop` builds + a live train smoke: reviewer was
+    nudged at ~47s working and had already completed all three integration steps
+    before the message arrived. Treat low-token silence on a `qa`/`build`
+    teammate as normal for at least ~5 min; only nudge on elapsed time.
+  - `--ticker USD_SOL` fails with `Unknown Kraken pair: 'USD/SOL'` (CLI expects
+    `BASE/QUOTE`, real Kraken base asset); `ETH_USD` is what `default.yaml`
+    sets and works. Future passes that assume a pair should default to
+    `ETH_USD` on this host.
+  - Live training windows are not reproducible while `market_data_store: null`:
+    measured this pass, one CLI train vs a later fetch disagreed 16% on
+    `rsi_24`'s fitted std (two fresh fetches agree to 1.2e-4; repeat train
+    reproduces to 6.5e-7) — the snapshot, not the code path, varies. For
+    cumulative features like `obv` compare fitted STDs across snapshots, never
+    MEANs (a cumsum start-level drifts 16% by design). This is now the measured
+    core of the Candidate-2 (store-seed) case, recorded in PLAN.md.
+  - `.data-audit/` is tracked in git despite the command's "do not commit it"
+    note (prior passes committed it, this pass re-committed audit/decision/
+    plan/validation docs). The note is stale guidance; decide once whether the
+    artifact dir is committed or ignored and say so — today repo history and
+    the note disagree.
 
 ---
 
