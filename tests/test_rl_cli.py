@@ -14,6 +14,7 @@ import json
 from datetime import datetime
 from unittest import mock
 
+import pandas as pd
 import pytest
 
 from kraken_trading_bot.cli import _build_parser, main
@@ -358,3 +359,121 @@ def test_cli_models_dispatch_empty(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "No models registered" in out
+
+
+# ---------------------------------------------------------------------------
+# export-data
+# ---------------------------------------------------------------------------
+def _export_frame() -> pd.DataFrame:
+    """A two-row staged frame shaped like build_export_frame's output."""
+    frame = pd.DataFrame(
+        {
+            "timestamp": ["2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z"],
+            "time": [0, 3600],
+            "close": [1.0, 1.5],
+            "return_1": [0.0, 0.5],
+            "warmup": [True, False],
+        }
+    )
+    frame.attrs["stages"] = {
+        "timestamp": ["timestamp"],
+        "ohlcv": ["time", "close"],
+        "signals": [],
+        "features": ["return_1"],
+        "normalized": [],
+        "warmup": ["warmup"],
+    }
+    return frame
+
+
+def test_cli_export_data_parser_flags():
+    args = _build_parser().parse_args(
+        [
+            "export-data",
+            "--ticker", "SOL_USD",
+            "--output", "out/data.csv",
+            "--config", "configs/default.yaml",
+            "--pages", "3",
+            "--interval-minutes", "30",
+            "--episode-bars", "500",
+            "--normalized",
+        ]
+    )
+    assert args.command == "export-data"
+    assert args.ticker == "SOL_USD"
+    assert args.output == "out/data.csv"
+    assert args.config == "configs/default.yaml"
+    assert args.pages == 3
+    assert args.interval_minutes == 30
+    assert args.episode_bars == 500
+    assert args.normalized is True
+
+
+def test_cli_export_data_parser_defaults():
+    args = _build_parser().parse_args(["export-data", "--ticker", "SOL_USD"])
+    assert args.output is None
+    assert args.config is None
+    assert args.pages == 6
+    assert args.interval_minutes is None
+    assert args.episode_bars is None
+    assert args.normalized is False
+
+
+def test_cli_export_data_dispatch_writes_csv(tmp_path, capsys):
+    destination = tmp_path / "out" / "SOL_USD.csv"
+    with mock.patch(
+        "kraken_trading_bot.rl.export.build_export_frame",
+        return_value=_export_frame(),
+    ):
+        rc = main(
+            [
+                "export-data",
+                "--ticker", "SOL_USD",
+                "--output", str(destination),
+                "--pages", "2",
+            ]
+        )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert destination.exists()
+    assert "Exported 2 bars x 5 columns" in out
+    assert "2026-01-01T00:00:00Z -> 2026-01-01T01:00:00Z" in out
+    # Stage counts come from frame.attrs, not a re-derivation.
+    assert "1 timestamp, 2 OHLCV, 0 signal, 1 observation (raw)" in out
+
+
+def test_cli_export_data_dispatch_forwards_overrides():
+    with mock.patch(
+        "kraken_trading_bot.rl.export.build_export_frame",
+        return_value=_export_frame(),
+    ) as build:
+        rc = main(
+            [
+                "export-data",
+                "--ticker", "SOL_USD",
+                "--config", "configs/default.yaml",
+                "--pages", "4",
+                "--interval-minutes", "30",
+                "--episode-bars", "100",
+                "--normalized",
+            ]
+        )
+    assert rc == 0
+    kwargs = build.call_args.kwargs
+    assert build.call_args.args == ("SOL_USD",)
+    assert kwargs["config_path"] == "configs/default.yaml"
+    assert kwargs["pages"] == 4
+    assert kwargs["episode_bars"] == 100
+    assert kwargs["include_normalized"] is True
+    assert kwargs["ohlcv_interval_minutes"] == 30
+
+
+def test_cli_export_data_dispatch_error_returns_1(capsys):
+    with mock.patch(
+        "kraken_trading_bot.rl.export.build_export_frame",
+        side_effect=RuntimeError("boom"),
+    ):
+        rc = main(["export-data", "--ticker", "SOL_USD", "--output", "x.csv"])
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error exporting SOL_USD: boom" in captured.err
