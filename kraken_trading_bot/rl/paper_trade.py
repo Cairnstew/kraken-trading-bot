@@ -300,11 +300,14 @@ class PaperTrader:
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:
         """Build the observation vector exactly as the training env did.
 
-        The environment feeds the agent the pipeline's raw computed
-        features (forward-filled, then zero-filled, ``float32`` — see
-        ``TradingEnvironment._observe``/``_raw_feature_array``), not the
-        normalized ``transform`` output; using the same construction keeps
-        live inference on the same scale as training.
+        The environment feeds the agent the pipeline's computed features
+        forward-filled, zero-filled, then **z-scored by the ticker's
+        fitted ``NormalizationStats``** — see
+        ``TradingEnvironment._observe``/``_raw_feature_array``.  This
+        applies the identical affine transform to the live window's last
+        row, so live inference stays on the same scale as training (the
+        VecNormalize loaded-stats-at-eval pattern, mirrored without a
+        VecEnv so the export CSV can reproduce the same row).
 
         Raises:
             ValueError: If the resulting width differs from the model's
@@ -312,10 +315,11 @@ class PaperTrader:
         """
         if self.context_bars is not None:
             df = df.tail(self.context_bars)
-        features = self.pipeline.compute(df)
-        arr = features.to_numpy(dtype=np.float64)
-        arr = pd.DataFrame(arr).ffill().fillna(0.0).to_numpy(dtype=np.float32)
-        obs = np.asarray(arr[-1], dtype=np.float32)
+        features = self.pipeline.compute(df).ffill().fillna(0.0)
+        stats = self.pipeline.stats_for(self.ticker_key)
+        if stats is not None:
+            features = stats.normalize(features)
+        obs = np.asarray(features.to_numpy(dtype=np.float32)[-1], dtype=np.float32)
         return self._validate_observation(obs)
 
     def _validate_observation(self, obs: np.ndarray) -> np.ndarray:

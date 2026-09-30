@@ -34,7 +34,11 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 import pandas as pd
 
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import (
+    FeaturePipeline,
+    _SIGNAL_COLUMNS,
+    normalize_ticker_id,
+)
 
 if TYPE_CHECKING:
     from kraken_api import KrakenManager
@@ -43,21 +47,12 @@ _LOGGER = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "count")
 
-# Columns expected in signal JSONL records from sibling projects.
+# Columns expected in signal JSONL records from sibling projects; the
+# canonical definition lives in ``features._SIGNAL_COLUMNS`` (imported
+# here so the merge seam and the observation allow-list share one source).
 # News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
 # Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
 # Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
-_SIGNAL_COLUMNS = (
-    "sentiment_score",
-    "article_count",
-    "novelty_flag",
-    "funding_rate",
-    "basis",
-    "open_interest",
-    "stt_mention_count",
-    "stt_tilt",
-    "fng_index",
-)
 
 # Bars a 24-window feature pipeline needs before any indicator fills its
 # look-back window (max window + a small return/rolling cushion).
@@ -518,10 +513,12 @@ def prepare_episode(
     The :class:`TradingEnvironment` treats the DataFrame it is given as
     one episode (its ``reset(options=...)`` protocol is currently
     unused), so bounding episode length means bounding the DataFrame.
-    This helper fits the pipeline's per-ticker normalization stats on
-    the full frame, validates that enough data is present, then returns
-    the trailing ``episode_bars`` bars (or the whole frame when
-    ``episode_bars`` is None).
+    This helper slices the trailing ``episode_bars`` bars **first**, then
+    fits the pipeline's per-ticker normalization stats on that window
+    only — never on the held-out tail of the fetched frame, which would
+    leak future bars into the stats.  With ``episode_bars`` None the
+    window is the full frame and nothing changes.  It validates that
+    enough data is present, then returns the window.
 
     Args:
         df: Raw OHLCV DataFrame (``open/high/low/close/volume``).
@@ -544,7 +541,6 @@ def prepare_episode(
         raise NotEnoughDataError(1, 0, what="OHLC bars")
 
     ticker_key = normalize_ticker_id(ticker_id) if ticker_id else ""
-    features.fit(df, ticker_id=ticker_key)
 
     needed = _minimum_bars(features)
     available = len(df)
@@ -557,6 +553,10 @@ def prepare_episode(
         window = df.tail(int(episode_bars))
     else:
         window = df
+
+    # Slice-first-then-fit: the stats now cover exactly the bars the
+    # episode trades, never bars outside the trailing window.
+    features.fit(window, ticker_id=ticker_key)
 
     _LOGGER.debug(
         "Prepared %s-bar episode for %s (full frame %d bars)",

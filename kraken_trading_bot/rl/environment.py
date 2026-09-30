@@ -443,9 +443,25 @@ class TradingEnvironment(gym.Env):
         return max(int(first), 0)
 
     def _raw_feature_array(self) -> np.ndarray:
-        """Pipeline features with NaNs forward-filled then zero-filled."""
-        arr = self._features.to_numpy(dtype=np.float64)
-        return pd.DataFrame(arr).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+        """Pipeline features forward-filled, zero-filled, then z-scored.
+
+        The ticker's fitted ``NormalizationStats`` are applied to the
+        ffilled observation matrix (compute -> ffill -> fillna(0)) — the
+        same affine image :meth:`FeaturePipeline.transform` emits — so
+        the policy observes the z-scored row it was trained on.  The
+        std-floor guard inside ``NormalizationStats.normalize`` keeps
+        constant columns at zero instead of raising.  Obs width is
+        unchanged (affine per-feature), so ``model.zip`` still loads.
+        """
+        filled = self._features.ffill().fillna(0.0)
+        stats = (
+            self.pipeline.stats_for(self.ticker_id)
+            if self.pipeline is not None
+            else None
+        )
+        if stats is not None:
+            filled = stats.normalize(filled)
+        return filled.to_numpy(dtype=np.float32)
 
     def _builtin_features(self) -> tuple[np.ndarray, list[str]]:
         close = self.data["close"].astype(float)
