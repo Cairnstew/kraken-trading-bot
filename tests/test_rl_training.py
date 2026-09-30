@@ -8,6 +8,8 @@ and the backtest evaluator.  Model artifacts are written under pytest's
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -315,3 +317,39 @@ def test_backtest_model_synthetic_walk(tmp_path):
     # Return/drawdown are sane bounded values.
     assert -1.0 <= result.total_return < 10.0
     assert 0.0 <= result.max_drawdown <= 1.0
+
+def test_load_train_config_falls_back_to_cwd_when_store_path_missing(
+    tmp_path, monkeypatch
+):
+    """The packaged console script imports this module from the Nix store,
+    where ``configs/`` is not installed, so the module-relative default
+    path does not exist.  :func:`load_train_config` must then fall back to
+    ``./configs/default.yaml`` under the current working directory (the
+    justfile and ``nix develop`` both run from the repo root) instead of
+    silently returning ``{}``.
+    """
+    import kraken_trading_bot.rl.train as train_module
+
+    monkeypatch.setattr(
+        train_module, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "default.yaml"
+    )
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+
+    cfg = train_module.load_train_config()
+    assert cfg, "expected the repo-root configs/default.yaml to be picked up"
+    assert cfg["ticker"] == "ETH/USD"
+    assert cfg["action_space"] == "continuous"
+    assert cfg["reward"]["mode"] == "pnl"
+
+
+def test_load_train_config_empty_when_no_candidate_exists(tmp_path, monkeypatch):
+    """With neither the module-relative nor the CWD config present the
+    loader stays backward-compatible and returns an empty dict."""
+    import kraken_trading_bot.rl.train as train_module
+
+    monkeypatch.setattr(
+        train_module, "_DEFAULT_CONFIG_PATH", tmp_path / "absent" / "default.yaml"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert train_module.load_train_config() == {}

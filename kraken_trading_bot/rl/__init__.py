@@ -21,6 +21,8 @@ with reinforcement learning:
   and episode slicing.
 - :func:`~kraken_trading_bot.rl.train.train_ticker` — end-to-end
   training orchestrator.
+- :func:`~kraken_trading_bot.rl.export.build_export_frame` — the same
+  data pipeline stages composed into a CSV-ready frame.
 - :func:`~kraken_trading_bot.rl.backtest.backtest_model` — walk-forward
   backtesting with standard performance metrics.
 - :class:`~kraken_trading_bot.rl.paper_trade.PaperTrader` and
@@ -41,10 +43,17 @@ from .data import (
     read_ohlc_dataframe,
 )
 from .environment import RewardSpec, TradingEnvironment
+from .export import build_export_frame, default_export_path, write_export_csv
 from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
 from .paper_trade import PaperSignal, PaperTrader, run_paper_trader
 from .registry import ModelRecord, list_models, register_model
-from .train import build_train_config, load_train_config, pair_from_ticker_id, train_ticker
+from .train import (
+    build_train_config,
+    load_train_config,
+    pair_from_ticker_id,
+    resolve_default_config_path,
+    train_ticker,
+)
 
 __all__ = [
     "TradingEnvironment",
@@ -62,9 +71,13 @@ __all__ = [
     "read_ohlc_dataframe",
     "prepare_episode",
     "load_train_config",
+    "resolve_default_config_path",
     "build_train_config",
     "pair_from_ticker_id",
     "train_ticker",
+    "build_export_frame",
+    "default_export_path",
+    "write_export_csv",
     "BacktestResult",
     "backtest_model",
     "PaperSignal",

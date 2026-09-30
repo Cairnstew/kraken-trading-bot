@@ -264,6 +264,53 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Model registry root (default: models).",
     )
 
+    # ── export-data command ───────────────────────────────────────────────
+    export_parser = sub.add_parser(
+        "export-data",
+        help="Export the RL data pipeline (OHLCV + features) to CSV.",
+    )
+    export_parser.add_argument(
+        "--ticker",
+        required=True,
+        help="Ticker to export, e.g. SOL_USD.",
+    )
+    export_parser.add_argument(
+        "--output",
+        default=None,
+        help="Destination CSV path (default: exports/{TICKER}.csv).",
+    )
+    export_parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML config to base the run on (default: configs/default.yaml).",
+    )
+    export_parser.add_argument(
+        "--pages",
+        type=int,
+        default=6,
+        help="OHLC pages to fetch (each ~720 candles).",
+    )
+    export_parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=None,
+        help="Override the OHLC interval in minutes.",
+    )
+    export_parser.add_argument(
+        "--episode-bars",
+        type=int,
+        default=None,
+        help="Keep only the trailing N bars.",
+    )
+    export_parser.add_argument(
+        "--normalized",
+        action="store_true",
+        help=(
+            "Also append z_-prefixed normalized columns "
+            "(inspection only; the agent does not use them)."
+        ),
+    )
+
     return parser
 
 
@@ -546,6 +593,55 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_data(args: argparse.Namespace) -> int:
+    """Run the RL data pipeline and write the staged frame to CSV."""
+    from kraken_trading_bot.rl.export import (
+        build_export_frame,
+        default_export_path,
+        write_export_csv,
+    )
+
+    # Only flags the user actually set become config overrides, so the
+    # rest of the run keeps its YAML config (defaults to configs/default.yaml).
+    overrides = {}
+    if args.interval_minutes is not None:
+        overrides["ohlcv_interval_minutes"] = args.interval_minutes
+
+    try:
+        frame = build_export_frame(
+            args.ticker,
+            config_path=args.config,
+            pages=args.pages,
+            episode_bars=args.episode_bars,
+            include_normalized=args.normalized,
+            **overrides,
+        )
+    except Exception as e:
+        _LOGGER.error("Exporting %s failed: %s", args.ticker, e)
+        print(f"Error exporting {args.ticker}: {e}", file=sys.stderr)
+        return 1
+
+    path = write_export_csv(frame, args.output or default_export_path(args.ticker))
+    stages = frame.attrs.get("stages", {})
+    print(f"Exported {len(frame)} bars x {len(frame.columns)} columns -> {path}")
+    if len(frame):
+        print(
+            f"  window:   {frame['timestamp'].iloc[0]}"
+            f" -> {frame['timestamp'].iloc[-1]}"
+        )
+    print(
+        "  stages:   {ts} timestamp, {ohlcv} OHLCV, {sig} signal, "
+        "{feat} observation (raw), {norm} normalized, warmup flag".format(
+            ts=len(stages.get("timestamp", [])),
+            ohlcv=len(stages.get("ohlcv", [])),
+            sig=len(stages.get("signals", [])),
+            feat=len(stages.get("features", [])),
+            norm=len(stages.get("normalized", [])),
+        )
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Main entry point for the CLI."""
     parser = _build_parser()
@@ -564,6 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "train": cmd_train,
         "backtest": cmd_backtest,
         "models": cmd_models,
+        "export-data": cmd_export_data,
     }
 
     if args.command is None:
