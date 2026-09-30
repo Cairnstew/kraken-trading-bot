@@ -1,123 +1,143 @@
-# PLAN — Phase 8: kraken-social-signals validation and wiring roadmap
+# PLAN — data-pipeline pass: Candidate 1 (normalization → observation)
 
-Author: reviewer, audit-pipeline team. Written after the build/integrate/verify
-phase. This is the **Phase 8** plan: what was audited, what was built, the
-validation evidence (full detail in `VALIDATION.md`), what was deferred, and
-the concrete next steps for fully wiring the social signal into the RL
-pipeline. Sibling docs: `AUDIT.md` (gap catalog), `RESEARCH.md` (three live
-surveys), `DECISION.md` (Gap 3 choice: StockTwits + alternative.me F&G).
+Author: reviewer, audit-pipeline team, Phase 6 (2026-09-30). Overwrites the
+prior-pass `PLAN.md` (the `kraken-deep-history` roadmap, still carried in
+git history at `d55cac0`). The gate verdict and full evidence live in
+`VALIDATION.md`; this document covers what was audited, what was deferred,
+what was built, and concrete next steps.
 
 ---
 
 ## 1. What was audited
 
-Phase 8 is the third exogenous-signal pass. After the store seam
-(kraken-market-data, Gap 1) and the funding seam (kraken-funding-rates,
-Gap 2), the audit re-mapped the pipeline and re-ranked the remaining gaps:
+Outcome type **IMPROVE-EXISTING**; target **Candidate 1** — the
+`normalization.npz` stack that `train.py` saved but that nothing ever
+applied to the observation the policy reads.
 
-- **Gap 3 — social / search-trend (this pass).** StockTwits v2 is keyless,
-  per-ticker, with bullish/bearish tags (mention velocity + tilt);
-  alternative.me Fear & Greed gives a free, full 2018+ history market-wide
-  0-100 index. Both join onto hourly bars through the same proven
-  `merge_extra_features` seam as news and funding. Live surveys confirmed
-  both sources are reachable keyless with the browser-grade UA and that
-  403s are retryable/non-fatal.
-- **Gap 4 — order-book / trades microstructure recorder** (now unlockable):
-  a dedicated `kraken-microstructure` recorder can build depth/flow features
-  on top of the store. Depth was live-verified this phase; needs a recorder
-  + feature columns.
-- **Gap 5 — on-chain metrics.** Backfill-limited free sources (Etherscan /
-  blockchain.info are not clean per-asset keyless historical feeds).
-  Deferred as deep-keyless-research.
-- **Gap 6 — macro calendar.** Feature-design-heavy (event-envelope encoding).
-  Deferred.
+- **The pipeline, end to end, as shipped on master:** `rl/data.py`
+  (`read_ohlc_dataframe`, `prepare_episode`) → `rl/features.py`
+  (`FeaturePipeline.compute/fit/transform`, `NormalizationStats`) →
+  `rl/environment.py` (`_raw_feature_array` → `_observe`) →
+  `rl/train.py` / `rl/backtest.py` / `rl/paper_trade.py` /
+  `rl/export.py`.
+- **The defect:** the fitted per-ticker stats were persisted next to every
+  model and read back by `backtest.py:155-161` / `paper_trade.py:187-188`,
+  but never shaped the observation. The policy trained and traded on raw
+  heteroscaled float — `obv` at ±55,000 sitting in the same `Box` as
+  `return_1` at ±0.01. It was already surfaced as a red test on the
+  working tree (`test_rl_export.py:157-161`).
+- **The fix as landed (`5df99ef`):** `prepare_episode` slices the episode
+  window *before* fitting (no look-ahead into the held-out tail);
+  `FeaturePipeline.fit/transform` operate on the **ffilled** observation
+  frame (`compute → ffill → fillna(0)`) rather than the raw compute frame;
+  `_raw_feature_array` applies the ticker's stats to the ffilled matrix;
+  `paper_trade._build_observation` applies the identical transform to the
+  live window. `1568771` then pinned all four consumers with 5
+  mutation-checked tests (101 → 106 passed).
+- **Verified in Phase 6** against the live keyless Kraken API: the
+  observation is now z-scored (raw `|max|` 55,082 → obs `|max|` 12.81,
+  per-column std 1.000000, width unchanged at 49), the npz is *applied*
+  not just saved, and train/backtest/paper/export all reach the identical
+  canonical row — all four comparisons exact (`max|Δ| = 0.0`). See
+  `VALIDATION.md`.
 
-Smaller findings carried over from the audit remain deferred: the news-signal
-hourly scheduler (systemd/cron — now four signals need one), model-config
-provenance hardening (`feature_windows/groups/reward` in `models/*/config.yaml`
-is partially recorded), throttle/retry policy (`KRAKEN_MIN_INTERVAL` unset by
-default).
+## 2. What was deferred (the runner-ups)
 
-## 2. What was built
+None of these were dropped; they lost on directness per `DECISION.md` §5
+and are listed here with what Phase 6 added to each.
 
-**New sibling repo `/home/seanc/Projects/kraken-social-signals`** (commit
-`71ca27d`, pushed to `github.com/Cairnstew/kraken-social-signals`):
-- `client.py` — keyless StockTwits v2 + alternative.me F&G clients.
-- `models.py` — `StockTwitsMessage`, `FearGreedRecord`, `SocialRecord`
-  (`ticker, timestamp, stt_mention_count, stt_tilt, fng_index`, JSON-safe).
-- `pipeline.py` / `export.py` — per-(ticker, hour) bucketing + tilt
-  `(bull−bear)/(bull+bear)`, extraction registry + `write_jsonl`.
-- `cli.py` (`pull`/`list`/`version`), `errors.py`, `logging_config.py`,
-  `utils.py`, Nix flake (dev shell + package), 52 offline tests, README,
-  `.env.example` (optional token only — default path keyless).
+1. **Candidate 2 — market-data depth + clean splits** (`since`/`until`
+   plumbing, `kraken-deep-history` seeder, store-backed reads). Biggest
+   deferred item, and Phase 6 turned one part of its case from assumption
+   into a measurement: with `market_data_store: null` and no store root on
+   this host, **a training window is whatever the live endpoint returns at
+   that moment**, so a trained model's `normalization.npz` is not
+   reconstructible afterwards. One CLI train and a later fetch of the
+   *same* 721-bar span disagreed by 16 % on `rsi_24`'s fitted std; two
+   later fetches agreed to 1.2e-4, and a repeat train reproduced a fresh
+   fit to 6.5e-7. The live path is deterministic; the *snapshot* is not.
+   A seeded store makes both the split and the stats reproducible.
+2. **Candidate 4 — `kraken-python` retry/backoff** (`transport.py:188-261`
+   raises `RequestException`/`RateLimitError` immediately, no retry;
+   proven in-family in `kraken-funding-rates` and `kraken-market-data`).
+   Sibling-repo change, no observation impact, correctly excluded from a
+   one-repo outcome. Still the cheapest safety win on the board.
+3. **Candidate 3 — scheduling + staleness + forward
+   `funding_rate_prediction`**. Operational, protects the three signal
+   seams, and `funding_rate_prediction` is a genuine zero-cost
+   forward-looking win — but all three signal projects still ship only a
+   manual `cli.py pull`, and none is wired into the bot flake.
+4. **NEW-DATA-SOURCE candidates — microstructure (5) and on-chain (7)**.
+   Lowest directness-vs-cost; both need recording/consolidation machinery,
+   and both only become worth building *because* this pass made the
+   observation pipeline normalize any incoming column. That precondition
+   now holds.
 
-**This repo — integration seam** (commits `6c88d2a` + `c95f984`):
-- `_SIGNAL_COLUMNS` widened to 9 in `rl/data.py` + `rl/features.py` (offset
-  `stt_mention_count`, `stt_tilt`, `fng_index`), kept in sync with a NOTE.
-- `social_features_file` config key in `configs/default.yaml`.
-- Third `merge_extra_features` call in `fetch_ohlc_dataframe` and
-  `read_ohlc_dataframe` (both store and fallback paths).
-- Propagated through `train.py` / `backtest.py` / `paper_trade.py`.
-- 2 new offline tests (social merge + all three signals combined).
+## 3. What was built
 
-## 3. Validation evidence (summary; full matrix in `VALIDATION.md`)
+**On master before Phase 6** (`2b3e065`, `5df99ef`, `1568771`) — the
+fix itself, its regression contract, and the `export-data` CLI. Phase 6
+contributed **validation only**: two documents, no source changes, no
+new tests, nothing committed from scratch. Artifacts from the integration
+test live under `/tmp` and were never committed.
 
-| Check | Result |
-|---|---|
-| kraken-social-signals `pytest tests/ -q` | **52 passed** |
-| kraken-social-signals `nix flake check` | all checks passed |
-| kraken-trading-bot `pytest tests/ -q` | **84 passed** (82 pre-existing + 2 seam) |
-| kraken-trading-bot `nix flake check` | all checks passed |
-| Live `pull --ticker ETH/USD --lookback-hours 48` | 3 records, ISO-UTC hours, fng present, StockTwits thin but non-empty |
-| **Integration train** (through source, `--pages 2 --timesteps 3000` discrete) | completed, **52 obs features** (49 base + 3 social), no width mismatch |
-| **Integration backtest** (through source) | return +0.17%, Sharpe 0.059, maxDD 5.54%, 419 trades |
-| **Baseline** train (same config, `social_features_file: null`) | completed, **49 obs features** |
-| **Baseline** backtest | return +0.49%, Sharpe 0.114, maxDD 8.44%, 54 trades |
-| Merge log | `Merged 3 signal records from .../eth_usd_social.jsonl onto 721 OHLCV bars` |
-| Observation-column proof | `normalization.npz` feature_names contains the 3 social columns; social values land on correct bars |
+## 4. Concrete next steps
 
-**Gate: PASS** — social-backed train + backtest complete without error, the
-social columns entered the observation (+3 features, confirmed via the model
-artifact and train log), and the backtest is equivalent to baseline within
-training stochasticity (|0.32 pts|, same sign, same Sharpe order).
+### 4.1 Finish wiring normalization into the RL pipeline
 
-Smoke artifacts (models, JSONL, configs) live under `/tmp/krss-test/` and were
-**not committed**; the repo tree stays clean except `.data-audit/`.
+The fix makes the observation z-scored, but three things are still open
+and are *not* required for correctness — they are what turns "correct
+observation" into "trained model that means something".
 
-## 4. What was deferred (explicitly out of this pass)
+1. **Persist the fitted-stats shape in `config.yaml` provenance.**
+   `config.yaml` records `feature_windows` and `feature_groups` but not
+   the feature *count* the npz was fitted on. A model whose
+   `feature_groups` were edited after training silently loads a 49-column
+   npz against a 50-column pipeline. The regression tests pin the 4
+   consumers; nothing pins *staleness*. Cheapest fix: record
+   `n_features` (and the `feature_groups` actually used) at train time and
+   have `scan_model`/`RLAgent.load` refuse a mismatch with a clear
+   message instead of a raw width error deep in the env.
+2. **Make `feature_groups` provenance exact, not just present.**
+   `_SIGNAL_COLUMNS` is duplicated (`features.py:36` and `data.py:50`)
+   and currently agrees by hand. Centralize it in one module so the
+   allow-list cannot drift from the normalize path — flagged in
+   `DECISION.md` §2.3 and still open.
+3. **Re-fit existing models.** `models/` is empty on this host, so there is
+   no retrain burden today — but the first model trained *before* `5df99ef`
+   learned on raw features and must be discarded, not backtested. The
+   README caveat added in `1568771` covers the documentation side; the
+   operational side is "delete and retrain", which has no automation yet.
 
-- **Normalization wiring.** The seam merges raw social values and the
-  `signals` group forwards them as-is into the same normalization stats as
-  every other feature — but there is no dedicated normalization policy for
-  bounded vs unbounded signal distributions yet; that is a correctness/tuning
-  slice, not a blocker (stats are per-ticker mean/std like all features).
-- **Scheduler.** The four sibling pollers (news, funding, social, and the
-  market-data timer) are not yet wired into one systemd/NixOS schedule.
-- **Microstructure (Gap 4) and on-chain (Gap 5) projects** — deferred
-  sibling projects; microstructure needs a recorder, on-chain needs a
-  keyless-history survey.
-- **Paper-trade live smoke of the social columns** — the call site is wired
-  (`paper_trade.py:296`) but was not run live in this pass.
-- Smaller audit findings listed in §1.
+### 4.2 For the next pass (in rough priority order)
 
-## 5. Concrete next steps to fully wire the signal into the RL pipeline
+1. **Candidate 2, split into its two independent halves.** The
+   `since`/`until` plumbing is config keys plus one function at the
+   `data.py` call sites and needs no sibling repo — do it alone as a
+   clean-splits improvement. Seeding a store (`kraken-deep-history seed`)
+   is ops, not code — do it separately, after the plumbing, because it
+   makes both splits and stats reproducible (`VALIDATION.md` §4).
+2. **Candidate 4** (`kraken-python` retry/backoff) as its own one-repo
+   pass. Pure reliability, proven in-family, no observation impact.
+3. **Candidate 3** (schedulers + staleness + `funding_rate_prediction`).
+   Unblocks the three signal JSONLs that are configured but never
+   populated.
+4. **A real convergence A/B.** `VALIDATION.md` §5 records why the optional
+   micro-A/B was deliberately skipped (721 bars / one seed = noise). Do it
+   properly once a store exists: multi-seed, multi-thousand-bar windows,
+   z-scored vs. raw, reporting a reward trajectory rather than a single
+   number. That is the experiment that would substantiate the fix's *value*,
+   as opposed to proving its *correctness* (which is now exact).
+5. **Microstructure / on-chain sources** — only after the above; the
+   normalization precondition is the thing that made them worth building,
+   and that part is done.
 
-1. **Collapse the pollers onto one scheduler.** Add a NixOS module (mirroring
-   `kraken-market-data`'s) that runs the social pull (and news + funding)
-   hourly → per-ticker JSONL into a stable `signals/` dir, and point the bot
-   config at those paths so train/backtest/paper read a continuously
-   refreshed source.
-2. **Honour `since`/`until` from config** on train/backtest so historical
-   windows can be selected (and backfill F&G 2018+ history rather than only
-   the live lookback).
-3. **Dedicated signal-normalization policy.** Decide whether bounded (tilt,
-   F&G 0-100) vs unbounded (mention count) columns should share one z-score
-   path, or get per-column handling; document the choice in
-   `features.py` next to `_SIGNAL_COLUMNS`.
-4. **Paper-trade live smoke** of the social columns end-to-end at a small
-   budget, confirming the 60-s loop keeps the merged observation 52-wide.
-5. **Microstructure (Gap 4).** Build the recorder on the store; add
-   `spread`/`order_book_imbalance` via `_add_microstructure_features` (the
-   feature group already handles those columns when present).
-6. **On-chain (Gap 5).** Re-survey keyless per-asset history; at minimum
-   gecko-free, else document clearly mitigated sources.
+### 4.3 Standing constraints for any future pass
+
+- A training window must be **recorded, not just fetched** — the
+  reproducibility gap in `VALIDATION.md` §4 is the concrete cost of not
+  doing so.
+- Scratch models, stores and exports go to `/tmp` and are never committed.
+- Phase 6's live runs needed `--ticker ETH_USD`; `--ticker USD_SOL` fails
+  with `Unknown Kraken pair: 'USD/SOL'`. Worth resolving before any pass
+  that assumes USD-quoted pairs resolve from the CLI's `USD_`-prefix form.

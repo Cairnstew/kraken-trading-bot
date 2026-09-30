@@ -1,135 +1,138 @@
-# DECISION — Phase 8: one (gap, library) pair for this pass
+# DATA PIPELINE DECISION — kraken-trading-bot (2026-09-30 pass)
 
-Author: Architect, audit-pipeline team. Read-only phase — this document decides; it does
-not scaffold. Fresh Phase-8 decision, superseding the Phase-3 Gap-1 decision (store) that
-was built and validated in `kraken-market-data`; this decision is taken **after** the store
-and funding seams landed, against the fresh AUDIT.md and the three live-verified research
-surveys (social, microstructure, on-chain; 2026-09-28).
+Written by the architect after reading AUDIT.md (fresh) and RESEARCH.md
+(consolidated R1/R2/R3). Overwrites the prior-pass DECISION.md. Grounded in
+the code on disk (verified: `environment.py:445-448`, `data.py:547`,
+`data.py:168-171`, `features.py:395-408`, `train.py:238`,
+`kraken-python/kraken_api/transport.py:188-261`).
 
-## 1. THE DECISION
+---
 
-- **Chosen gap: CANDIDATE 1 — Social / search-trend** (original Gap 3, still open) — the
-  audit's own "best new modality" and the only remaining gap whose source set is both
-  keyless **and** immediately backfillable for train/backtest.
-- **Libraries: none new — plain HTTP via the house transport/client pattern** exactly as
-  the prior sibling passes use (`ticker-news-signals`, `kraken-funding-rates`): an
-  `requests`-style thin client in `transport/client` modules, a manager facade, typed
-  dataclasses (raw `int`/`float`/`str`, no lossy floats), `export.py` registry, offline
-  tests + a live-verify script. No ccxt, no pytrends, no LunarCrush SDK. Both endpoints
-  are plain REST JSON (StockTwits v2, alternative.me F&G) — research verified no wrapper
-  is needed or maintained (blockchair-python-style stale wrappers rejected by precedent).
-- **Project name: `kraken-social-signals`.**
-- **Path: `../kraken-social-signals/` — a sibling git repo**, not nested in this repo and
-  not a submodule (same placement as `ticker-news-signals`, `kraken-market-data`,
-  `kraken-funding-rates`).
+## 1. OUTCOME TYPE + TARGET
 
-Name rationale: it is Kraken/crypto-specific — it produces the per-(ticker, hour) crypto
-sentiment axes for *this* bot's RL feature vector (StockTwits retail mention velocity on
-`BTC.X`/`ETH.X` plus the market-wide Fear & Greed index), so it belongs in the `kraken-*`
-family, consistent with the sibling signal projects. A source-oriented name
-(`stocktwits-poller`) would understate that it is one of the bot's own exogenous signal
-seams; `kraken-social-signals` makes the family obvious and matches the house-style map in
-RESEARCH.md (Researcher-social).
+**Outcome type: `IMPROVE-EXISTING`** — decided FIRST, on AUDIT.md §4/§6
+evidence, not a default. The audit's single highest-directness finding —
+Candidate 1, the saved-but-never-applied `normalization.npz` stack — is a
+pure-code improvement to this repo's own pipeline. AUDIT.md §6 is explicit
+that it must be weighed as highly as any new source, and RESEARCH.md's
+synthesis adds the decisive pressure: the working tree already carries a
+**red test** (`test_build_export_frame_normalized_block_is_z_scored`,
+`tests/test_rl_export.py:157-161`) on exactly this seam. There is no
+sourcing gap to chase before the code we already ship is made honest; every
+new-source column (Candidates 3/5) is unusable at a comparable scale until
+the observation stops being raw heteroscaled float.
 
-## 2. WHY THIS PAIR, AGAINST THE PIPELINE'S REAL SHAPE
+**Target (exactly one): the normalization stack — Candidate 1.** Apply
+`transform()` (fitted per ticker on the *ffilled observation frame*, not the
+raw NaN-warmup compute frame) inside the observation constructor, slice-first-
+then-fit to kill look-ahead, and let the red export test become a true
+contract. Zero new dependencies, ~1-1.5 d for the full wiring (R1, Approach A),
+no retrain burden (`models/` is empty on disk this pass), and it is the
+precondition that lowers the cost of every other candidate downstream.
 
-The landing point is **proven twice over** — this is the decisive fact. The bot's RL
-observation path (`configs/default.yaml` → `rl/data.py` → `rl/features.py` →
-`models/{TICKER_ID}/{model_name}/`) already has the exact seam this source needs:
+The clean-splits half of Candidate 2 (`since`/`until` plumbing — config keys +
+one function at `data.py` call sites, store seam already unit-tested) is
+**excluded from this outcome**; it shares the slice-first-then-fit fix but adds
+a sibling repo + seed-run dependency and is a separate, additive decision.
 
-- **Config keys already documented for sibling JSONL seams:** `extra_features_file: null`
-  (`default.yaml:57`) for news and `funding_features_file: null` (`default.yaml:65`) for
-  funding. `feature_groups` already contains `"signals"` (`default.yaml:48`). A social
-  seam is a *third* key in that proven row: `social_features_file: null`.
-- **The seam itself (`merge_extra_features`, `data.py:80-177`) is byte-identical in
-  behavior for any per-(ticker, hour) scalar file:** hour-floor left-join + ffill +
-  zero-fill. It is already invoked twice per load (`fetch_ohlc_dataframe` `data.py:319-320`,
-  `read_ohlc_dataframe` `data.py:430-431`); a third invocation for the social file is the
-  same 2-line pattern the funding pass already established.
-- **`_add_signals_features` (`features.py:388-401`) forwards ANY numeric column already in
-  `_SIGNAL_COLUMNS`.** The only code change required is the documented 2-file widening
-  (`data.py:49`, `features.py:32`) by `stt_mention_count`, `stt_tilt`, `fng_index`. The
-  audit's seam caveat (`AUDIT.md:112-117`) is acknowledged: the widenings must stay in
-  sync, and models must be retrained for the columns to enter the observation (see §5).
-- **Models layout land:** `FeaturePipeline.compute()` → `signals` group → the observation
-  vector; per-ticker stats are persisted to `models/{TICKER_ID}/{model_name}/normalization.npz`
-  and `config.yaml` records the merged `default.yaml` (via `build_train_config`), so a
-  retrained model carries the widened width and the new columns' stats. This is exactly
-  where a feature-engineering step reads the feature per ticker — same artifact tree the
-  news/funding columns already land in.
-- **Backfill is the differentiator vs the two other research-tested candidates.**
-  `train_ticker`/`backtest` knobs (pages, since/until) bound the OHLC frame at ~720 bars
-  (~30 d) without the store — and even through the now-existing store, the *social* pair
-  can be deep on day one: alternative.me F&G `limit=0` returns full 2018→ history in one
-  keyless call (`fng_index`), and StockTwits cursor-walk reaches the 60–180 d train window
-  (`stt_mention_count`, `stt_tilt`). No forward-only wait: train/backtest get a labeled
-  history immediately.
+## 2. JUSTIFICATION AGAINST THE RL PIPELINE'S REAL SHAPE
 
-Sourcing guardrails: both sources keyless, no geo-block, ToS-clean (F&G is an offered
-public API; StockTwits is user-generated posts with attribution requested). StockTwits'
-one caveat — Cloudflare bot-challenge on scripted HTTP — is a client hardening (browser UA,
-retry/backoff, non-fatal on challenge), not a blocker; it is folded into the client spec.
+- **Config inputs / knobs:** train/backtest/paper load `default.yaml` today
+  (`models/` is empty → every run falls back to defaults; AUDIT §1 F). The
+  relevant knobs already exist but invert meaning under the fix: normalization
+  is fitted/loaded via `normalization.npz` per ticker
+  (`train.py:238` saves → `backtest.py:161` / `paper_trade.py:188` load) yet
+  never shapes the observation. No new config key is required; the existing
+  npz is repurposed from "dead persistence" to "the actual conditioning".
+  `episode_bars` (per-episode window) is the one knob that interacts with the
+  look-ahead fix — see landing point 2.
+- **Artifact layout:** policy + `normalization.npz` + `config.yaml` under
+  `models/{TICKER_ID}/{model_name}/` (AUDIT §1 F). The fix must keep the
+  `is_trained()` gate (`registry.py:82`) and the SB3 obs-space guard coherent:
+  `backtest.py:155-161` and `paper_trade.py:187-188` currently read the npz as
+  the *whether-to-build-the-49-feature-pipeline* flag; deleting the stack is
+  explicitly off the table (R1 blast radius). The npz stays, changes meaning.
+- **Exact per-ticker landing points (this repo):**
+  1. `kraken_trading_bot/rl/environment.py` — `__init__:180-197` fits stats on
+     the full frame then `_raw_feature_array()` (`:445-448` = compute + ffill +
+     fillna(0)) builds the raw box as-is. **Apply the ticker's fitted stats to
+     the ffilled matrix here** so `_observe()` (`:367-375`) yields the z-scored
+     row the model was trained on.
+  2. `kraken_trading_bot/rl/data.py` — `prepare_episode:547` calls
+     `features.fit(df, ...)` on the full frame *before* `df.tail(episode_bars)`
+     at `:557`. **Slice first, fit on the window** — removes held-out-tail
+     leakage into the stats (R1 defect 3).
+  3. `kraken_trading_bot/rl/features.py` — `NormalizationStats.fit/transform/
+     fit_transform` + npz save/load: make fit and transform operate on the
+     **ffilled observation frame** (the mismatch behind the red test, R1 defect
+     2) rather than the raw compute frame. Optionally centralize `_SIGNAL_COLUMNS`
+     (here `:36` vs `data.py:50`) to one module so the allow-list can't drift.
+  4. `kraken_trading_bot/rl/paper_trade.py` — `_build_observation:300-319`
+     rebuilds the same raw row per 60 s tick; must apply the identical
+     transform so paper observations match backtest/train (no train/infer skew).
+  5. `kraken_trading_bot/rl/export.py` (WIP) + `tests/test_rl_export.py:157-161`
+     — the failing assertion becomes the regression contract for the whole fix;
+     export's `z_*` block must equal the observation-derived z-scores.
+- **Transport (for context, not in this outcome):** `kraken-python/kraken_api/
+  transport.py:188-261` confirmed — `_request` raises `RequestException`/
+  `RateLimitError` immediately, no retry/backoff; that fix (Candidate 4) is
+  proven in-family (`kraken-funding-rates/client.py:70-95`,
+  `kraken-market-data/client.py:115-142`) but is a sibling-repo change and is
+  excluded from this outcome (see runner-ups).
 
-## 3. INTEGRATION SKETCH (how the bot consumes it)
+**Seam note (Integrator):** this outcome lives entirely in this repo, so the
+Integrator's seam step **collapses** into *confirm the normalization path is
+wired through train/backtest/paper and close call-site gaps* — i.e. verify all
+four consumers (`train`, `backtest`, `paper`, `export`) reach the same
+ffilled-and-transformed row, and that `models/` provenance (`config.yaml`)
+records the fitted-stats shape at train time.
 
-**Output contract — the JSONL file `kraken-social-signals` writes:** one record per
-(ticker, hour): `{ticker: "ETH/USD", timestamp: <ISO-UTC hour>, stt_mention_count: <int>,
-stt_tilt: <float>, fng_index: <int>}` — same shape family as the news and funding JSONLs,
-so `merge_extra_features` consumes it with zero pipeline redesign. **Config key:**
-`social_features_file` added to `configs/default.yaml` (null = off), the third sibling
-JSONL key in the same documented pattern; the bot's `fetch_ohlc_dataframe` /
-`read_ohlc_dataframe` gain the matching parameter and the third `merge_extra_features`
-call. **Refresh cadence:** hourly `cli.py pull --ticker ETH/USD --output
-signals/eth_usd_social.jsonl` (mirrors the news pass; F&G is daily and the merge's ffill
-hands the sub-day gap exactly as it does for funding). NixOS module optional — both
-sources are cheap enough for the manual/cron hourly pull; a systemd timer is a possible
-add-on later, not a v1 requirement. **How the bot reads it per ticker:** `signals` group →
-`_add_signals_features` → raw observation columns with per-ticker normalization stats in
-`models/{TICKER_ID}/{model_name}/` exactly like the two completed seams.
+## 3. NAMING
 
-## 4. RUNNER-UPS AND WHY THEY LOST
+**No new project, no new repo, no naming step.** Touched repo:
+`kraken-trading-bot` (this repo). In-scope units as listed in §2. The only
+other repo that could be touched is `kraken-python` (Candidate 4 retry), but
+that is explicitly NOT this outcome.
 
-1. **Gap 4 / microstructure recorder (Kraken REST poller via house lib, zero new deps).**
-   The land-shape is arguably the cleanest — it activates the *dormant* `microstructure`
-   group (`features.py:373-386`) by writing `bid/ask/bid_vol/ask_vol` onto the frame with
-   **no `_SIGNAL_COLUMNS` widening at all**, and the research overturns the old blocker
-   (store now exists). But it is **forward-only** — no keyless depth history anywhere —
-   so train/backtest get nothing until weeks of runtime accumulate, and the operational
-   cost is medium-high (poller + storage + alignment + store must be enabled). It fails
-   the "train/backtest today" bar this pass targets. It is the natural *next* plumbing
-   pass once `market_data_store` is actually enabled on a host.
-2. **Gap 5 / on-chain (Blockchair v2 + Coin Metrics Community + DefiLlama + Whale Alert
-   archive).** Deep keyless backfill is real (2019 blocks, 2022 txs — overturns the
-   audit's "backfill-limited" fear), but Blockchair v2 is a **maintenance-mode API** (last
-   major update 2022-11-07, successor 3xpl) — the wrong reliability profile for the bot's
-   first non-venue exogenous heartbeat — and its strongest legs are chain-level/daily
-   (Coin Metrics 1h is paid-403; DefiLlama daily), cutting per-ticker hourly directness.
-   The audit's "park until the store has depth" still stands.
-3. **Gap 2 — funding rates** — already built (`kraken-funding-rates`), acknowledged
-   (near-constant 8h cadence, not a bot flake input; not this pass's problem).
-4. **Candidate 2 — normalization.npz wiring** — pure code fix, zero sourcing, highest
-   directness of all; but this pass's mandate is a (gap, library) *data-source* pair, and
-   making z-scores real is a code change inside this repo, not a sibling project. Recorded
-   as companion hardening (§5). Same for **Candidate 3 scheduling** (ops, not a source).
+## 4. INTEGRATION SKETCH
 
-## 5. EXPLICIT NOTE ON WHAT THIS PASS DOES NOT BUILD
+Because the chosen outcome is an in-repo code fix, no new data transport
+exists to integrate: the "output contract" is already satisfied — every feature
+is produced per (ticker, hour) by `FeaturePipeline.compute` and already lands
+in the observation at `environment.py:445-448` via the per-ticker keyed stats
+in `models/{TICKER_ID}/{model_name}/normalization.npz`. The entire integration
+is internal: (a) `prepare_episode` slices the frame, (b) `features.fit(window)`
+registers ticker stats on that slice, (c) `_raw_feature_array` applies them,
+(d) `paper_trade._build_observation` and `export.py --normalized` re-derive the
+identical row, (e) the red test pins all four to one canonical z-scoring. If a
+future outcome adds an external source, its JSON/JSONL per (ticker, timestamp)
+lands through the existing `merge_extra_features` → `_SIGNAL_COLUMNS` → signals
+group (`data.py:168-171`, `features.py:395-408`) and is then scaled correctly
+because this fix made the observation pipeline normalize *any* incoming column.
 
-- **No microstructure recorder / WS consumer / store extension.** No on-chain project.
-  No macro calendar. Both stay parked (runner-ups above).
-- **No normalization wiring fix** (Candidate 2) — this pass does not touch
-  `environment.py`/`paper_trade.py` to apply `transform()`. It pairs naturally with the
-  new heteroscaled columns (raw mention counts, 0–100 F&G) and can be the next hardening,
-  but is explicitly **not** this pass's deliverable.
-- **No scheduler for exogenous pulls** (Candidate 3) — timers for news/funding/social
-  remain manual/cron as documented; the bot's `nix/module.nix` stays credentials-only.
-- **No `_SIGNAL_COLUMNS`-from-config refactor.** The audit flags reading that tuple from
-  config so future sources stop needing the 2-file edit; this pass uses the *minimal
-  proven widening* to land the feature, and records the config-read + a
-  sync-check between the two tuples as follow-up hardening. Also **no model retraining**:
-  on-disk `models/ETH_USD` / `models/XRP_USD` are at 49 features (pre-seam); retraining
-  after the social seam is enabled is a downstream step, not a scoped deliverable.
-- **No paid or ToS-grey legs:** no LunarCrush social tier (~$90/mo), no X API, no Reddit
-  scrape, no pytrends/Google Trends scrape, no BlueSky phase-2 leg. The pass builds the
-  two keyless, ToS-clean columns (StockTwits velocity/tilt + Fear & Greed) and nothing else.
+## 5. RUNNER-UP OPTIONS AND WHY THEY LOST
+
+- **Candidate 2 (market-data depth + clean splits)** — the stakeholder-level
+  depth gap and a legitimate `NEW-DATA-SOURCE`-flavored improvement, but it is
+  more ops than plumbing: the store root does not exist on this host, the
+  `kraken-deep-history` seeder is not a flake input/PYTHONPATH (R2), and it
+  needs a seed run + config keys. It also *depends on* the C1 look-ahead fix for
+  its clean-split value to be composable. Lost on directness: it changes what
+  feeds the pipeline; C1 changes the vector itself. Deferred; not dropped.
+- **Candidate 4 (kraken-python retry/backoff + min_interval default)** — pure
+  code and proven in-family, but it is a *sibling-repo* reliability fix with no
+  observation impact, and one outcome must not span two repos. Weighing a
+  safety fix against a signal fix, the red test forces C1 first.
+- **Candidate 3 (scheduling + staleness + forward `funding_rate_prediction`)**
+  — cheap and protects the three signal seams, and `funding_rate_prediction`
+  is a real zero-cost forward-looking win, but it is operational (timers,
+  flake inputs) and depends on C1 to be usable at scale. Runner-up for any
+  phase-2 follow-on.
+- **NEW-DATA-SOURCE overall (Candidates 5 microstructure / 7 on-chain)** —
+  lowest directness-vs-cost per AUDIT §4; both need recording/consolidation
+  machinery and would only make sense after the observation pipeline is
+  normalized. Explicitly not the right first move.
+
+---
 
 DECISION COMPLETE

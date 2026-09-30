@@ -1,75 +1,103 @@
-# DATA PIPELINE AUDIT — kraken-trading-bot (FRESH, Phase 8)
+# DATA PIPELINE AUDIT — kraken-trading-bot (FRESH, 2026-09-30)
 
-Read-only auditor pass against the **actual code on disk** (not READMEs).
-Prior work acknowledged and re-read: the Phase 1 audit in this file's history
-identified 6 gaps; **Gap 1 (local parquet store) and Gap 2 (funding-rates /
-perp-basis) are now built and integrated** as sibling projects
-`kraken-market-data` and `kraken-funding-rates`. This audit re-examines the
-whole pipeline in that new state and re-ranks what remains.
+Read-only auditor pass. Written against the **code on disk right now** —
+uncommitted working tree included. This document replaces the prior-pass
+AUDIT.md (2026-09-29, the `kraken-deep-history` run). Prior artifacts
+(AUDIT/DECISION/RESEARCH/PLAN/VALIDATION, RESEARCH-1/2/3) were read for
+context but not copied.
 
-Files read (this run): `kraken_trading_bot/{engine,cli}.py`,
-`kraken_trading_bot/rl/{data,features,environment,train,backtest,paper_trade,agent,registry}.py`,
-`kraken_trading_bot/strategies/{base,sma}.py`, `configs/default.yaml`,
-`tests/*.py`, `flake.nix`, `nix/module.nix`, `.data-audit/{DECISION,PLAN,VALIDATION}.md`,
-plus sibling source at `../kraken-market-data/market_data/{store,client,cli,export}.py`,
-`../kraken-funding-rates/kraken_funding_rates/{client,models,export,cli}.py`,
-`../ticker-news-signals/ticker_news_signals/{client,pipeline,cli}.py`.
-
-Verification run this pass: `pytest tests/ -q` → **82 passed** (73 pre-existing
-+ 7 store-seam + 2 funding-seam); live feature-width probes → **49 core features,
-55 with both news + funding signal columns merged**.
+Key deltas since the 2026-09-29 pass:
+- The working tree now carries **uncommitted WIP**: new untracked
+  `kraken_trading_bot/rl/export.py` + `tests/test_rl_export.py`, modified
+  `cli.py` (new `export-data` subcommand), `rl/__init__.py` (exports
+  `.export`), `rl/train.py` (`resolve_default_config_path` CWD fallback),
+  `justfile` (new `bench` + `export-data` recipes), `.gitignore`
+  (`exports/`). This WIP is the subject of the audit as much as the
+  committed tree.
+- Verification run this pass (`nix develop --command bash -c "pytest tests/ -q"`):
+  **100 passed, 1 failed** — `test_rl_export.py::test_build_export_frame_normalized_block_is_z_scored`
+  FAILS on the current tree (it is the new untracked export test).
+- **The market-data store root does not exist on disk**
+  (`~/Projects/kraken-market-data/store`: No such file or directory), so
+  `market_data_store:` points nowhere in any config; deep history is still
+  unreachable. `kraken-deep-history` was scaffolded and shipped last pass but
+  nothing has seeded a store this host's bot reads.
+- **`models/` is empty** (only `.gitkeep`): there are no trained models,
+  no on-disk `models/*/config.yaml` provenance, so every `backtest` /
+  `paper-trade` today would fall back to `default.yaml` defaults.
+- The 3 sibling signal projects (`ticker-news-signals`, `kraken-funding-rates`,
+  `kraken-social-signals`) each ship only a manual `cli.py pull`; **none ships
+  a scheduler/timer** (only `kraken-market-data` has a systemd timer). The
+  bot flake lists only `kraken-python` + `kraken-market-data` as inputs.
+- `kurosearch` (Rule34 image search app, Svelte+API) and `researcher-python`
+  (academic paper aggregation over OpenAIRE/SemanticScholar/arXiv/Crossref)
+  exist as siblings but are **not in the data-source registry** and are
+  unrelated to this bot's pipeline as they stand.
 
 ---
 
-## 1. PIPELINE MAP (post Gap 1 + Gap 2)
+## 1. PIPELINE MAP (end to end, current code)
 
-Five data paths now; only Path A is the classical engine loop. Paths B–D are
-the RL family. Exogenous signals now feed the RL paths through **two** sibling
-JSONL files; the market store backs every RL fetch when configured (it is
-**off by default** — `market_data_store: null`).
+Eight entry points consume data. A is the classical strategy loop; B–F are the
+RL family; G/H are the new WIP export and the empty registry.
 
 ```
-                          kraken-python (KrakenManager, REST /0/public/*, paper transport)
-                          transport.throttle min_interval = 0.0 BY DEFAULT   (auth/transport)
-        A. ENGINE LOOP (run)           B. RL TRAIN / C. BACKTEST             D. PAPER TRADE
-        engine.run_iteration          train_ticker()/backtest_model()       PaperTrader.step()
-        every interval=60s              │                                      every interval=60s
-        ├─ manager.ticker ────────────  │ read_ohlc_dataframe(pages, since/until)
-        ├─ manager.ohlc(60) ────────────┤     │ store?.upsert  → parquet {PAIR}/{interval}/{YYYY-MM}
-        └─ manager.order_book(count=10)─┤     │ store?.read    → DeepHistory (>~720-bar REST ceiling)
-          3 calls/pair/iter, UNCACHED   │     └―market_data_store null ──► fetch_ohlc_dataframe (≤~720 bars)
-            │                           │            merge_extra_features(extra_features_file)   ← news JSONL
-            ▼                           │            merge_extra_features(funding_features_file) ← funding JSONL
-        strategy.tick({ticker,candles[-100:],                                            (hour-floor left-join, ffill, zero-fill)
-         order_book})                   │
-        SMA uses ONLY candles+ticker    ▼
-        order_book fetched & DISCARDED  FeaturePipeline.compute() → feature groups
-                                       price|technical|volume|microstructure|signals
-                                       microstructure group yields NOTHING (OHLC-only: Gap 4)
-                                       signals group = fixed allow-list → 6 cols (news+funding)
-                                       ▼
-        EXOGENOUS SEAMS (sibling JSONL)   TradingEnvironment (raw compute()+ffill → obs row)
-        ../ticker-news-signals  cli.py pull → signals/eth_usd.jsonl (sentiment/article/novelty)
-        ../kraken-funding-rates cli.py pull → signals/eth_usd_funding.jsonl (funding/basis/OI)
-           BOTH MANUAL — no systemd/cron in bot or siblings (news+funding)
-           ↓ configs/default.yaml extra_features_file / funding_features_file / market_data_store
-                                     (all null → all seams OFF by default)
-        Obs width: 49 core [+3 news][+3 funding] = 52 / 55   —   PPO(MlpPolicy)
-        artifacts: model.zip, normalization.npz (⚠ UNUSED by the policy, see Finding A),
-                   config.yaml
+                        kraken-python (KrakenManager, REST /0/public/*)
+                        transport.min_interval = 0.0 DEFAULT; NO retry/backoff
+                        (transport.py:108,113,180-190; errors raised, never retried)
+   A. ENGINE LOOP (run)       B. TRAIN / C. BACKTEST        D. PAPER TRADE
+   engine.run(): interval=60s   train_ticker()/backtest      PaperTrader.step()
+   fetch_market_data per pair   read_ohlc_dataframe(pages)   every interval=60s
+   ├─ manager.ticker  ──────┐   │  _page_candles loops pages=6 │ _FETCH_PAGES=2
+   ├─ manager.ohlc(60,1call)┤   │   << 720 bars/call ceiling >>│  2 OHLC calls/tick
+   │    keeps candles[-100:]  ──┤  store?.upsert -> parquet     │  re-fetches EVERY tick
+   └─ manager.order_book(10) ───┘  store?.read -> DeepHistory  │  recomputes full
+       3 calls/pair/iter UNCACHED  (since/until always None:    │  pipeline on window
+                                   whole store, or live ≤pages  │
+       strategy.tick({ticker,      * 720 bars)                  │
+        candles[-100:], order_book})  merge_extra_features x3    │
+       SMA uses ONLY candles+ticker  news / funding / social     │
+       order_book = DEAD             (hour-floor ffill, zero-fill)│
+                                     ▼                           ▼
+                                  FeaturePipeline.compute() -> 49-core feature frame
+                                  price|technical|volume|microstructure|=0|signals
+                                  microstructure group yields NOTHING (OHLC only)
+                                  signals group = _SIGNAL_COLUMNS allow-list (9 cols)
+                                     (all 3 config defaults null -> none merged)
+                                     ▼
+                                  TradingEnvironment
+                                  _raw_feature_array() = compute + ffill + fillna(0)
+                                  NO z-score. transform() not on any obs path.
+                                  obs row = raw[step], PPO(MlpPolicy)
+
+   E. ENGINE/SMA tick(): exogenous signal columns NEVER reach tick(); the engine
+      builds {ticker, candles[-100:], order_book} only (engine.py:57-76).
+
+   F. Model registry: models/{TICKER}/{NAME}/{model.zip, normalization.npz, config.yaml}
+      EMPTY on disk this pass.
+
+   G. EXPORT-DATA (WIP, untracked rl/export.py)  — the ONLY caller of transform()
+      rebuilds train pipeline + writes CSV (+ opt-in --normalized z_ columns).
+      The z-scored block it emits disagrees with the raw feature block, and a
+      test verifying the alignment FAILS (see §3, failing test note).
+
+   H. Decoys/latent: kraken-python exposes recent_trades()/spread() (manager.py:192,200)
+      but nothing in the bot calls them; feature code for spread / bid / ask /
+      bid_vol / ask_vol exists (features.py:380-393) but feeds nothing.
 ```
 
-**Where data enters the RL observation exactly:** `TradingEnvironment.__init__`
-(`environment.py:186-188`) runs `pipeline.compute(self.data)` and feeds the
-agent `_raw_feature_array()` (ffill + zero-fill, **no z-score**), observed
-per-step at `environment.py:367-375`. The `signals` group
-(`features.py:388-401`) forwards only the fixed `_SIGNAL_COLUMNS` allow-list
-(`features.py:32`). **Nothing else can enter the vector without editing code.**
+**Where each input enters the RL observation exactly:** `TradingEnvironment`
+(`environment.py:180-197`) — if the pipeline has no stored stats it `fit()`s
+on the whole frame, then `compute()` + `_raw_feature_array()`
+(`environment.py:186-188,445-448`, ffill/zero-fill to `float32`); observed per
+step via `_observe()` (`environment.py:367-375`). The `signals` group
+(`features.py:395-408`) forwards columns in `_SIGNAL_COLUMNS` present in the
+frame. Nothing else can enter the vector without editing code.
 
-**Where data enters a strategy tick() exactly:** `engine.py:136` passes
-`{ticker, candles[-100:], order_book}` from `fetch_market_data`
-(`engine.py:46-76`). SMA reads candles + ticker only; order_book is dead;
-**no exogenous signal ever reaches the engine loop.**
+**Where data enters a strategy tick():** `engine.py:136` passes
+`{ticker, candles[-100:], order_book}`; SMA reads candles + ticker only
+(`sma.py:68-69`); the order book is fetched every loop and discarded. No
+exogenous column ever reaches the engine loop.
 
 ---
 
@@ -77,161 +105,206 @@ per-step at `environment.py:367-375`. The `signals` group
 
 | # | Resource | Cadence | Consumer | Persistence | Evidence |
 |---|---|---|---|---|---|
-| 1 | Ticker (REST) | every engine tick 60 s | SMA `tick()` limit prices | none | `engine.py:59`, `sma.py:138-158` |
-| 2 | OHLC 60 m, last ~100 | every engine tick | SMA closes | none | `engine.py:65` `candles[-100:]` |
-| 3 | OrderBook depth count=10 | every engine tick | fetched, passed, **unused** | none | `engine.py:72`; SMA ignores it |
-| 4 | OHLC paged (≤ ~720 bars, ~30 d) | per train/backtest | FeaturePipeline + env | **now optional store-upsert** | REST ceiling verified (`DECISION.md`); `data.py:263 fetch`, `data.py:324 read` |
-| 5 | Local parquet store (Gap 1 ✅) | systemd poller in sibling repo (`OnCalendar *:*:30`) | any RL fetch via `read_ohlc_dataframe` | month-sliced parquet + `_meta.json` cursor | `../kraken-market-data/market_data/store.py:147 read,217 upsert,257 update`; `INTEGRATION.md`; **OFF by default (`default.yaml:78 null`)** |
-| 6 | News sentiment JSONL (prior pass) | **hourly, MANUAL** | `merge_extra_features` → `signals` | JSONL sibling repo | `data.py:80`, `default.yaml:57`; `ticker-news-signals/pipeline.py:100` |
-| 7 | Funding/basis/OI JSONL (Gap 2 ✅) | **hourly, MANUAL** | `merge_extra_features` → `signals` | JSONL sibling repo | `data.py:49 _SIGNAL_COLUMNS`, `default.yaml:65`; `kraken-funding-rates/export.py:120 write_jsonl` (timestamp floored `:148`) |
-| 8 | (latent, unused) `recent_trades`, `spread`, futures depth | n/a | never called | n/a | `kraken-python/manager.py:192,200` |
-
-Feature pipeline width today (verified live): **49 core / 52 with news / 55 with
-news+funding**. Stored on-disk models (`models/ETH_USD`, `models/XRP_USD`) were
-trained at **49 features** — before either exogenous seam existed.
-
-Network physics unchanged: default throttle OFF (`min_interval=0.0`), no retry
-in the bot (the sibling clients add retry/backoff; the bot does not).
+| 1 | Ticker REST | every engine tick (60 s) | SMA limit prices | none | `engine.py:59`, `sma.py:138-158` |
+| 2 | OHLC 60 m (1 call, last ~720) | every engine tick | SMA closes (keeps 100) | none | `engine.py:65-66`; SMA ignores ~620 bars |
+| 3 | OrderBook depth=10 | every engine tick | fetched, passed, **unused** | none | `engine.py:72`; SMA ignores |
+| 4 | OHLC paged (`pages`, ≤720/call) | per train/backtest/paper tick | FeaturePipeline + env | optional store-upsert | `data.py:223-264 _page_candles`; ~30 d at 1 h |
+| 5 | Local parquet store (sibling) | poller `*:*:15` **never run — store dir absent** | train/backtest/paper via `read_ohlc_dataframe` | month-sliced parquet | `kraken-market-data` module timer; **no store root on disk** |
+| 6 | News sentiment JSONL | **manual (`cli.py pull`)** | `merge_extra_features` → signals | JSONL sibling | `data.py:328`, `default.yaml:57` |
+| 7 | Funding/basis/OI JSONL | **manual (`cli.py pull`)** | `merge_extra_features` → signals | JSONL sibling | `data.py:329`, `default.yaml:65` |
+| 8 | Social (StockTwits + F&G) JSONL | **manual (`cli.py pull`)** | `merge_extra_features` → signals | JSONL sibling | `data.py:330`, `default.yaml:71-77` |
+| 9 | Deep OHLCV (Binance archive seeder) | **manual one-shot seed; never run** | store only | parquet | `kraken-deep-history`; store dir absent |
+| 10 | (latent) `recent_trades`, `spread` | never called | — | — | `kraken-python/manager.py:192,200` |
+| 11 | (latent) micro columns spread/bid/ask/bid_vol/ask_vol | — | code present, feeds nothing | — | `features.py:380-393` |
 
 ---
 
-## 3. RANKED CANDIDATE GAPS
+## 3. VERIFICATION FACTS (this pass, in the dev shell)
 
-Ranked by (a) directness into RL features or tick(), (b) sourcing cost
-(keyless → paid → scraped), (c) differentiation from completed passes. Each says
-Evidence → Feed path → Sourcing. Categories spanned: social/sentiment,
-**data-quality (NEW)**, **operations (NEW)**, microstructure, on-chain, macro.
-
-### CANDIDATE 1 — Social / search-trend signal (original Gap 3, still open)  *(social/sentiment)*
-- **Evidence:** unchanged — only GNews sentiment + Kraken-Futures funding feed
-  the `signals` group. `PLAN.md:109-111` and `DECISION.md:82` explicitly
-  deferred StockTwits v2 (keyless, per-ticker mention velocity/tilt) +
-  alternative.me **Fear & Greed** (free, 2018+ history, aggregate sentiment —
-  the missing *market-wide* risk axis). Genuinely new modality, orthogonal to
-  headline VADER.
-- **Feed path:** direct through `merge_extra_features`, **but the seam is a
-  fixed allow-list**: `_SIGNAL_COLUMNS` (`data.py:49`, `features.py:32`) — a new
-  source's columns (e.g. `mention_velocity`, `fear_greed`) are **dropped unless
-  added to both tuples** (a 2-file edit that must stay in sync). `PLAN.md:151`
-  already proposes reading `_SIGNAL_COLUMNS` from config. No pipeline redesign
-  otherwise.
-- **Sourcing cost:** low-medium. StockTwits REST unauthenticated (keyless,
-  throttled) + alt.me F&G JSON (keyless). Best new-modality value of the
-  remaining list. **Pair with Candidate 2's normalization fix** so the raw
-  mention-count/scaled-F&G columns enter the observation properly scaled.
-
-### CANDIDATE 2 — Normalization.npz never shapes the observation  *(data-quality, NEW)*
-- **Evidence:** the policy is trained and run on **raw computed features**, not
-  the z-score output. `environment.py:186-188` uses `pipeline.compute()` +
-  `_raw_feature_array()` (`environment.py:445-448`, ffill/zero-fill only);
-  `transform()`/`NormalizationStats.normalize()` are called **nowhere** in
-  train/backtest/paper (grep: only `fit_transform`, which itself is unused).
-  Yet `train.py:209` **saves** normalization.npz and `backtest.py:160` /
-  `paper_trade.py:188` **load** it. The `paper_trade.py:314` docstring confirms
-  the raw-scale design ("same scale as training") — parity, but on an
-  un-normalized scale: dollar-denominated `sma_24`/`ema_24`/`bb_upper_*`/`atr_*`
-  dominate unit-scale `return_*`/`volume_zscore_*`. The z-score machinery is
-  effectively **ceremonial**.
-- **Feed path:** direct — it IS the observation vector. Fix = apply
-  `transform()` (with per-model stats) in both `environment.py` and
-  `_build_observation` (`paper_trade.py:299-318`), or delete the dead
-  persistence. Caution: `prepare_episode` fits stats on the full frame **before**
-  slicing the episode (`data.py:514-524`) — if z-scoring is switched on, those
-  tail bars leak into the normalization stats (look-ahead).
-- **Sourcing cost:** zero (pure code). Highest directness of any remaining item;
-  grows more important as Candidates 1/3 add heteroscaled columns.
-
-### CANDIDATE 3 — Exogenous scheduling + staleness visibility  *(operations, NEW)*
-- **Evidence:** two of the three exogenous feeds (news, funding) are pulled
-  **manually** (`VALIDATION.md:69` "deferred", `PLAN.md:117-120`); only
-  `kraken-market-data` ships its own NixOS timer. The bot's `nix/module.nix` is
-  credentials-only — it schedules nothing. `merge_extra_features`
-  forward-fills and zero-fills missing hours (`data.py:164-167`), so a stale
-  `sentiment_score`/`funding_rate` is **indistinguishable** from a fresh one;
-  no age/freshness column exists, and `novelty_flag` is computed only at pull
-  time (`ticker-news-signals/pipeline.py:39,91-97`).
-- **Feed path:** indirect but cheap — systemd/cron set to re-pull both JSONLs
-  hourly; optionally add a `signal_age_hours` (now − last-merged-hour) feature
-  so the agent (and any human reading feature values) can discount staleness.
-- **Sourcing cost:** zero for timers; one extra column if freshness is added.
-  Protects the information value of the two completed passes.
-
-### CANDIDATE 4 — Order-book / trades microstructure recorder (orig. Gap 4)  *(market microstructure)*
-- **Evidence:** `_add_microstructure_features` (`features.py:373-386`) is ready
-  (`spread`, `order_book_imbalance` columns already coded) but **outputs
-  nothing** from the OHLC-only path; the engine fetches top-10 depth every loop
-  and discards it (`engine.py:72`); `recent_trades`/`spread` REST endpoints
-  exist unused (`kraken-python/manager.py:192,200`). Previously blocked on the
-  store (ephemeral snapshots) — **the store now exists**, so a book/trades
-  recorder is the unlock to activate the dormant group.
-- **Feed path:** direct once recorded — a `microstructure`-group input
-  (`bid/ask/bid_vol/ask_vol/spread`) joined onto bars; needs its own poller +
-  consolidation component.
-- **Sourcing cost:** keyless (existing endpoints), **medium-high operationally**
-  (polling + storage + alignment). Ride on top of Candidate 3's timers.
-
-### CANDIDATE 5 — On-chain (orig. Gap 5) / CANDIDATE 6 — Macro calendar (orig. Gap 6)
-- **Evidence (both):** unchanged — no on-chain or macro source anywhere
-  (`Gap 5`, `Gap 6` in the prior audit, reaffirmed by `DECISION.md:83`).
-- **Feed:** on-chain slots into `merge_extra_features` (per asset-hour) but is
-  backfill-limited (large-transfer/whale feeds are paid or scraped); macro
-  events aren't natural hourly scalars — event-envelope encoding is
-  feature-design-heavy.
-- **Sourcing:** medium-high (on-chain), low-medium (macro) but lowest
-  directness of the list. Park until the store has depth worth joining onto.
+- `pytest tests/ -q`: **100 passed, 1 failed**.
+  `test_build_export_frame_normalized_block_is_z_scored` fails because `z_*`
+  (from `transform()`, stats fitted on the raw NaN-warmup frame) disagrees
+  with a naive (x-mean)/std re-derivation of the ffilled observation columns
+  (`test_rl_export.py:133-161`, assertion at line 157-161). This is exactly
+  the Candidate-1 (normalization) mismatch bubbling up as a red test.
+- Feature width: **49 features** with no exogenous columns merged; **58** with
+  all 9 signal columns. `_SIGNAL_COLUMNS` in `data.py:50` and `features.py:36`
+  currently agree (verified equal), but nothing tests that agreement.
+- `export.py` is the ONLY caller of `FeaturePipeline.transform` in the repo.
+- `models/` registry is empty; store root absent; no model config on disk
+  carries `market_data_store` or any signal file.
 
 ---
 
-## 4. NOTABLE SMALLER FINDINGS (not ranked)
+## 4. RANKED CANDIDATE GAPS (≥3, spanning >1 category)
 
-- **`_SIGNAL_COLUMNS` is duplicated** in `data.py:49` and `features.py:32`;
-  nothing tests that both agree. A column added to one and not the other is
-  silently excluded from the observation (merge warns; `_add_signals_features`
-  just skips).
-- **Historical models have thin provenance**: on-disk `config.yaml` for
-  ETH/XRP carry only `ticker`, `model_name`, `action_space` (verified), so
-  backtest/paper reconstruct pipeline settings from `default.yaml` defaults —
-  and those models were trained at 49 features, before either signal seam. A
-  fresh `train_ticker` today would record a full config (`build_train_config`
-  merges all of `default.yaml`), but **no model has been retrained** since the
-  seams landed.
-- **`n_features()` is stateful, not config-derived** (`features.py:404-417`):
-  returns the column count of the *last* `compute()`, not the loaded
-  normalization.npz — after `load_normalization` it can under-report until a
-  fresh compute.
-- **`merge_extra_features` reparses the whole JSONL every call and is invoked
-  twice per load** (news + funding) — fine for batch train, wasteful for the
-  paper trader that rebuilds the window every 60 s.
-- **Paper trader still hits the network on every tick even with the store**
-  (`paper_trade.py:56,280-297`): the adapter appends, but the fetch leg isn't
-  skipped; `data.py:382-386` todo (collapse to append + tail read) not done.
-- **Engine and RL are still fully disjoint**: the `signals` groups exist only
-  in the RL feature space; `strategy.tick()` has no exogenous feed.
-- **Funding columns are near-constant**: funding settles ~8-hourly while bars
-  are hourly and the merge ffill's — `funding_rate`/`basis`/`open_interest`
-  are quasi-constant within a day; effectively one scalar/basis value per
-  8 h × related columns. z-scoring (Candidate 2) matters here more than for
-  price features.
-- **Basis is mark-vs-index, not spot-vs-perp** (`..kraken-funding-rates/
-  models.py:101`): `(mark−index)/index` is intravenue (Kraken Futures index),
-  a slightly weaker "perp premium" reading than spot-vs-mark; acceptable, but
-  worth knowing when interpreting the column.
-- **`kraken-funding-rates` is not a flake input of the bot** (`flake.nix:6-8`
-  lists only kraken-python + kraken-market-data), so `nix develop` cannot run
-  the funding CLI; `VALIDATION.md:69` flagged this as deferred.
+Ranked by (a) directness into the RL observation or `tick()`, (b) sourcing
+cost, (c) differentiation. Category of each item explicitly stated. **The
+highest-directness finding is a pure-code IMPROVE-EXISTING item — not a new
+project.**
+
+### CANDIDATE 1 — normalization.npz never shapes the observation; the new export test is RED on it *(IMPROVE-EXISTING, data-quality)*
+- **Evidence:** `transform()` is reachable only from WIP `export.py:195`
+  (`--normalized`) and `features.fit_transform` (never called). The policy
+  trains and infers on `_raw_feature_array()`
+  (`environment.py:445-448` = compute + ffill + fillna(0)), not z-scored
+  output; `paper_trade.py:300-319` rebuilds the same raw row. Yet `train.py:238`
+  **saves** and `backtest.py:161` / `paper_trade.py:188` **load**
+  `normalization.npz`. Dollar-denominated `sma_24/ema_24/bb_upper_*/atr_*`
+  (>1e3) sit beside unit-scale `return_*/volume_zscore` in the same Box; the 9
+  signal columns are even more heteroscaled. And the new WIP test FAILS
+  because the stats in `.npz` are fitted on the raw (NaN-warmup) frame while
+  the agent's observation is the ffilled one.
+- **Feed path:** direct — it IS the observation vector (`environment.py:186`).
+  Fix = apply `transform()` (or fitted stats) before `_observe`, or delete the
+  dead persistence. **Caution:** `prepare_episode` fits stats on the full
+  frame before slicing (`data.py:534`), so z-scoring on leaks the held-out
+  tail into stats (look-ahead); fit on the training slice only.
+- **Sourcing cost:** zero (pure code). A precondition for any new-source
+  column (Candidates 3/5) to be usable at comparable scale.
+
+### CANDIDATE 2 — Market-data depth: the 720-bar / ~30-day REST clamp plus an absent store leaves nothing compensating *(data-quality + new-source)*
+- **Evidence:** Kraken OHLC returns ≤720 bars/call regardless of `since`
+  (`INTEGRATION.md`; RESEARCH-1 verified); single-call depth ≈30 d at 1 h.
+  Engine loop: `engine.py:65` one un-paged `ohlc(60)` call → ~30 d, then
+  `candles[-100:]` discards ~620 bars/tick. RL `pages=6` ≈ ~180 d at 1 h. The
+  store seam fixes this but **the store root does not exist on disk** and
+  `market_data_store:` is `null` everywhere (default.yaml:97); the
+  `kraken-deep-history` seeder shipped last pass has not been run against a
+  bot-visible root. `read_ohlc_dataframe` never passes `since`/`until` to the
+  store (`data.py:407-453`); the documented INTEGRATION to-do (train/eval
+  split, walk-forward via `reset(options=...)`) is open.
+- **Feed path:** direct and big — deeper history + clean train/eval splits
+  change what the feature pipeline and every train/backtest sees. Enabling the
+  store + seeding it (or 1 m/5 m intervals for more bars) is the concrete fix;
+  the seam is already written.
+- **Sourcing cost:** low once the store is populated; seeding deep history is
+  the only paid/scraped part (Binance archive, keyless). Note the poller is
+  systemd-scheduled only on the store host, not in this bot's config.
+
+### CANDIDATE 3 — Exogenous seams: manual pulls, no staleness signal, no scheduler, not flake inputs *(operations)*
+- **Evidence:** news/funding/social pulls are all manual `cli.py pull` (each
+  README); none of the three sibling projects ships a timer — only
+  `kraken-market-data` has a systemd module+timer. The bot's `flake.nix:5-8`
+  lists **only** `kraken-python` + `kraken-market-data` as inputs, so
+  `nix develop` cannot even run the other three CLIs. `merge_extra_features`
+  ffill + zero-fills missing hours (`data.py:168-171`), so a stale
+  `funding_rate` / `sentiment_score` / `fng_index` is identical to a fresh one;
+  no age/asof column, and `novelty_flag` is computed only at pull time.
+- **Feed path:** indirect but cheap — systemd/cron to re-pull all three hourly,
+  plus a `signal_age_hours` column so the agent (and the WIP export CSV) can
+  discount staleness. Protects the three completed seams.
+- **Sourcing cost:** zero for timers; ~1 column for freshness.
+  **Sub-evidence:** funding settles ~8-hourly (`kraken-funding-rates
+  models.py:25`); the model also emits `funding_rate_prediction` and
+  `index_price`, but `_SIGNAL_COLUMNS` only forwards `funding_rate/basis/
+  open_interest` — a sibling column already exists that the bot does not see.
+
+### CANDIDATE 4 — Fetch-layer reliability: no retry, no throttle, uncached re-fetch every tick *(reliability, operations)*
+- **Evidence:** `kraken-python/transport.py` min_interval defaults 0.0
+  (`transport.py:108,113`) and has no retry/backoff — any
+  `RequestException`/`RateLimitError` is raised immediately
+  (`transport.py:210-219,249-250`); `KRAKEN_MIN_INTERVAL` exists (auth.py:42)
+  but defaults to 0.0. The engine's 3 public calls/pair/60 s and the paper
+  trader's 2 OHLC calls/tick are unthrottled; each failure is logged and only
+  retried next tick (`engine.py:57-74`). The engine re-fetches the same
+  ~100-bar window every 60 s with no cache, and the paper trader refetches +
+  recomputes the whole episode window on every tick
+  (`paper_trade.py:280-298`) — the append+tail optimization in
+  `data.py:401-406` is a to-do.
+- **Feed path:** cadence/reliability of every existing fetch; a small ttl-60 s
+  bar cache and retry+backoff on the transport would give headroom for
+  Candidates 2/3 without new requests.
+- **Sourcing cost:** zero (pure code, same kraken-python fix benefits every
+  sibling).
+
+### CANDIDATE 5 — Market-microstructure / cross-exchange recorder: dormant feature group + dead order_book + unused recent_trades/spread *(microstructure)*
+- **Evidence:** `_add_microstructure_features` (`features.py:380-393`) is ready
+  (`spread`, `order_book_imbalance` coded) but emits nothing from the OHLC-only
+  path; the engine fetches top-10 depth every loop and discards it
+  (`engine.py:72`); `manager.recent_trades`/`spread` (`manager.py:192,200`)
+  are unused. The store (Candidate 2) is the natural home for a
+  book/trades recorder. Cross-exchange comparison is possible now that
+  `kraken-deep-history` (Binance) feeds the store — Binance-vs-Kraken
+  divergence for the same asset is one more per-(ticker, hour) vector.
+- **Feed path:** a joined `spread`/`imbalance` column set would activate the
+  group that today contributes 0 of 49 features — a genuine observation-width
+  change.
+- **Sourcing cost:** keyless endpoints, but medium-high operationally (poller
+  + consolidation + storage); ride on Candidates 2/3.
+  Sub-point: 1 m/5 m OHLC from the store is a cheaper "microstructure proxy"
+  (bar-internal range/volume shape) than a true book recorder.
+
+### CANDIDATE 6 — Foot-gun qualities in the merged exogenous columns *(data-quality, small)*
+- **Evidence:** social's "missing F&G day" is emitted as `fng_index: 0`
+  (`kraken-social-signals/pipeline.py:38,136` `_FNG_MISSING=0`), and 0 is also
+  the genuine "extreme fear" end of the 0-100 scale — after the bot's zero-fill
+  the agent cannot distinguish absence from panic. Raw-scale mention counts
+  dwarf z-scored price features whenever Candidate 1 is ignored and Schedule 3
+  enabled.
+- **Feed path:** feature logic in `data.py:168-171` + sibling emitters.
+- **Sourcing cost:** zero (encoding decisions).
+
+### CANDIDATE 7 — On-chain / crypto-native signals *(new-source; lowest on directness-vs-cost)*
+- **Evidence:** no on-chain source exists anywhere in the repo or the registry.
+  Nothing in `_SIGNAL_COLUMNS`, configs, or the store covers chain activity
+  (flows, whale movements, stablecoin supply, network/gas). The pipeline's
+  only non-OHLC inputs today are news/funding/social JSONL.
+- **Feed path:** a per-(ticker, hour) or per-(asset, day) vector joined the same
+  way as the existing three seams; most on-chain feeds are asset- rather than
+  pair-oriented, so directness is lower than Candidates 2-4.
+- **Sourcing cost:** mostly API-key/paid (Glassnode, CryptoQuant) or scraped
+  explorers; keyless free tiers exist but are sparse. Lowest priority by
+  directness/cost.
 
 ---
 
-## 5. BOTTOM LINE FOR THE DECISION PHASE
+## 5. SMALLER FINDINGS (not ranked)
 
-Two of the six original gaps are **done and verified** (store, funding — both
-off by default and unretrained). The next vector with the most differentiation
-per effort is **Gap 3 social/search-trend (StockTwits + Fear&Greed)** via the
-existing signal seam — with the caveat that the seam is a hard-coded allow-list
-and needs the 2-file `_SIGNAL_COLUMNS` widening. Before/alongside it, two cheap
-foundation items newly in scope: **actually apply (or remove) the normalization
-stack** and **schedule + timestamp the exogenous pulls** so the completed news +
-funding seams stop going stale silently. Gap 4 (microstructure recorder) is now
-operational on top of the store; on-chain and macro stay parked.
+- **New failing test in the tree:** `test_build_export_frame_normalized_block_is_z_scored`
+  (untracked WIP) fails under `just test`; either the test or the export must be
+  fixed before CI is green — and it is a live manifestation of Candidate 1.
+- **`_SIGNAL_COLUMNS` duplicated** in `data.py:50` and `features.py:36`;
+  currently in sync (verified), but nothing tests that agreement, and a new
+  sibling column added to one is silently dropped from the observation.
+- **All nine signal columns are three modalities in one allow-list** — the seam
+  cannot widen without touching both tuples plus config docs.
+- **`n_features()` is stateful** (`features.py:411-424`): returns the last
+  computed width; after `load_normalization` it can disagree with the `.npz`
+  until a fresh compute.
+- **Engine and RL remain fully disjoint:** the strategy `tick()` and the RL
+  observation share no exogenous feed and no store; two data worlds. `order_book`
+  is fetched and thrown away each engine tick.
+- **Paper trader observation is near-constant between hourly bars** yet the
+  whole pipeline (2 live OHLC pages + 3 JSONL reparses + full-window compute)
+  is redone every 60 s; `merge_extra_features` reparses each sibling JSONL on
+  every call (3x per load, `data.py:328-330`), O(file) per paper tick.
+- **Model provenance is absent:** `models/` is empty, so `backtest` /
+  `paper-trade` against a freshly trained model records what it trained against,
+  but no model on disk carries the seam keys; the two-key pre-`build_train_config`
+  shape (only `ticker` + `model_name`) appears in earlier passes' history.
+- **CLI help drift:** `paper-trade --help` mentions `rl-train` / `rl.train_ticker`
+  in an error string (`cli.py:427-430`) while the actual subcommand is `train`;
+  the `--models-root` default of `models` is hard-coded in two subcommands.
+- **`.`data-audit/` is tracked** contrary to the command's "do not commit it"
+  note; it includes this run's overwrite and prior RESEARCH-1/2/3 files.
+
+---
+
+## 6. BOTTOM LINE FOR THE DECISION PHASE
+
+The biggest, cheapest, most observation-impacting finding is a pure-code
+**IMPROVE-EXISTING** item: the normalization/normalization.npz stack is saved
+and loaded but never applied, and the current working tree holds a *red test*
+on exactly that seam (Candidate 1). Market-data depth (Candidate 2) remains
+the stakeholder-level gap and the machinery already exists — a store seam +
+Binance-archive seeder — but nothing has populated a store this host reads.
+Operations (Candidate 3, scheduling + staleness for the 3 signal seams) and
+fetch-layer reliability (Candidate 4, retry/throttle/cache) are zero-cost
+improvements that protect every other item. Microstructure/cross-exchange
+(Candidate 5) and on-chain (Candidate 7) are the two genuinely new-source
+directions; both are lower directness and cost more. **No single category has
+been committed to; the Decision phase must weigh an IMPROVE-EXISTING outcome
+(Candidates 1/2/4) as highly as a NEW-DATA-SOURCE one.**
 
 AUDIT COMPLETE
