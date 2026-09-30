@@ -13,6 +13,7 @@ from kraken_trading_bot.rl import (
     RewardSpec,
     TradingEnvironment,
     normalize_ticker_id,
+    prepare_episode,
 )
 
 
@@ -292,3 +293,73 @@ def test_environment_buy_hold_sell_confidence():
 
     env.step(np.array([0.9, 0.0, 0.2], dtype=np.float32))  # buys
     assert env.position > 0.0
+
+# ---------------------------------------------------------------------------
+# normalization wiring: env observation == FeaturePipeline.transform
+# ---------------------------------------------------------------------------
+def test_raw_feature_array_is_the_transformed_frame():
+    """The env's observation matrix IS ``FeaturePipeline.transform``.
+
+    Regression contract for the Candidate-1 normalization wiring: the
+    environment applies the ticker's fitted ``NormalizationStats`` to the
+    ffilled matrix (``compute`` -> ``ffill`` -> ``fillna(0)`` ->
+    ``(x - mean) / std``), so the row handed to the policy is the exact
+    affine image ``export.py --normalized`` renders as its ``z_*`` block
+    and ``PaperTrader._build_observation`` re-derives live.  Pre-fix this
+    returned the *raw* ffilled matrix, which no other consumer produced.
+    """
+    df = _synthetic_ohlcv(n=320)
+    pipe = FeaturePipeline(windows=(1, 4, 24))
+    # Mirror the training path exactly: prepare_episode slices, then fits.
+    episode = prepare_episode(df, pipe, ticker_id="ETH/USD", episode_bars=200)
+    env = TradingEnvironment("ETH/USD", data=episode, feature_pipeline=pipe)
+
+    expected = pipe.transform(episode, ticker_id=normalize_ticker_id("ETH/USD"))
+    matrix = env._raw_feature_array()
+
+    assert matrix.shape == expected.shape
+    np.testing.assert_allclose(matrix, expected, rtol=1e-5, atol=1e-6)
+
+    # And it is genuinely z-scored, not the raw heteroscaled row.
+    raw = pipe.compute(episode).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+    assert not np.allclose(matrix, raw)
+
+    # _observe() is a positional slice of that matrix, so the first traded
+    # bar is transform[start_index] -- i.e. z-scored too.
+    obs, _ = env.reset(seed=0)
+    np.testing.assert_allclose(
+        obs, expected[env._start_index], rtol=1e-5, atol=1e-6
+    )
+
+
+def test_observation_uses_saved_stats_not_a_refit(tmp_path):
+    """A pipeline carrying loaded npz stats scales by *those*, not a refit.
+
+    The backtest/paper call sites build a pipeline and load
+    ``normalization.npz``; the env must then use the loaded stats instead
+    of re-fitting on the replay frame (which would make backtest and paper
+    in-sample normalized and silently skew against the trained policy).
+    """
+    df = _synthetic_ohlcv(n=320)
+    train_pipe = FeaturePipeline(windows=(1, 4, 24))
+    episode = prepare_episode(df, train_pipe, ticker_id="ETH/USD", episode_bars=200)
+
+    path = tmp_path / "normalization.npz"
+    train_pipe.save_normalization("ETH_USD", path)
+
+    # Fresh pipeline + loaded stats, exactly what backtest.py/paper_trade.py do.
+    live_pipe = FeaturePipeline(windows=(1, 4, 24))
+    live_pipe.load_normalization("ETH_USD", path)
+    env = TradingEnvironment("ETH/USD", data=episode, feature_pipeline=live_pipe)
+
+    np.testing.assert_allclose(
+        env._raw_feature_array(),
+        train_pipe.transform(episode, ticker_id="ETH_USD"),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    # A refit would have overwritten the loaded stats; it did not.
+    loaded = live_pipe.stats_for("ETH_USD")
+    saved = train_pipe.stats_for("ETH_USD")
+    for name in saved.feature_names:
+        assert loaded.stats[name] == pytest.approx(saved.stats[name], rel=1e-9)

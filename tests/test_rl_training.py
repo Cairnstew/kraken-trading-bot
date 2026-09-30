@@ -318,6 +318,69 @@ def test_backtest_model_synthetic_walk(tmp_path):
     assert -1.0 <= result.total_return < 10.0
     assert 0.0 <= result.max_drawdown <= 1.0
 
+
+def test_backtest_env_applies_loaded_normalization(tmp_path, monkeypatch):
+    """The backtest call site hands the env the *loaded* npz stats.
+
+    ``backtest_model`` builds a ``FeaturePipeline`` from the saved config
+    and calls ``load_normalization`` before constructing the environment.
+    This spies on the environment the call site actually builds and
+    asserts its observation matrix is the z-scored transform — not the raw
+    ffilled features, and not a fresh in-sample refit over the replay
+    frame.
+    """
+    import kraken_trading_bot.rl.backtest as bt_mod
+
+    base = int(pd.Timestamp("2024-01-01T00:00:00Z").timestamp())
+    n = 300
+    closes = 2000.0 * np.exp(np.cumsum(np.random.default_rng(0).normal(0.0, 0.01, n)))
+    candles = [_candle(base + i * 3600, float(closes[i]), "150.0", 5) for i in range(n)]
+
+    class OneShotManager:
+        def ohlc(self, pair, interval, since=None):
+            return candles, 0
+
+    train = train_ticker(
+        "ETH/USD",
+        "ppo_norm",
+        manager=OneShotManager(),
+        pages=2,
+        total_timesteps=200,
+        seed=5,
+        models_root=tmp_path,
+    )
+    assert train.is_trained()
+
+    built: list[TradingEnvironment] = []
+    real_env_cls = bt_mod.TradingEnvironment
+
+    def spy(*args, **kwargs):
+        env = real_env_cls(*args, **kwargs)
+        built.append(env)
+        return env
+
+    monkeypatch.setattr(bt_mod, "TradingEnvironment", spy)
+
+    fresh = _synthetic_ohlcv(150, seed=77)
+    backtest_model("ETH/USD", "ppo_norm", data=fresh, models_root=tmp_path)
+
+    assert len(built) == 1
+    env = built[0]
+    stats = env.normalization_stats()
+    assert stats is not None
+    # Stats came off disk, keyed by the normalized ticker id.
+    assert stats.ticker_id == "ETH_USD"
+    assert stats.feature_names
+
+    # The env's matrix is exactly the saved stats applied to its own frame.
+    expected = env.pipeline.transform(env.data, ticker_id="ETH_USD")
+    np.testing.assert_allclose(
+        env._raw_feature_array(), expected, rtol=1e-5, atol=1e-6
+    )
+    raw = env.pipeline.compute(env.data).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+    assert not np.allclose(env._raw_feature_array(), raw)
+
+
 def test_load_train_config_falls_back_to_cwd_when_store_path_missing(
     tmp_path, monkeypatch
 ):
