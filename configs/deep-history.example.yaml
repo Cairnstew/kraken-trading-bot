@@ -58,6 +58,12 @@ feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 extra_features_file: null
 funding_features_file: null
 social_features_file: null
+# Signal-merge guard rails, as in default.yaml (see the long comments
+# there): null derives a one-hour carry from the bar interval — with years
+# of seeded bars, 1h still matches the hourly signal cadence, and 0 would
+# demand a record on the exact hour of every bar.
+signal_max_age_hours: null
+signal_require_ticker: true
 
 # --- Local market-data store (deep history enabled) ----------------------
 # Root of the store seeded by `kraken-deep-history` (same layout the

@@ -32,6 +32,13 @@ _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 # News signals (ticker-news-signals): sentiment_score, article_count, novelty_flag
 # Funding signals (kraken-funding-rates): funding_rate, basis, open_interest
 # Social signals (kraken-social-signals): stt_mention_count, stt_tilt, fng_index
+# Freshness/provenance of the merge itself, written by the same seam for
+# every source it joins: signal_observed says a record for this ticker
+# landed inside the freshness window, signal_age_hours says how old the
+# stalest live reading is (-1.0 = none — see ``data._NO_SIGNAL_AGE``).
+# They are the reason a zero-filled value can be told apart from a
+# genuine 0 / balanced reading, so they must be added here once, not
+# re-declared per source.
 _SIGNAL_COLUMNS = (
     "sentiment_score",
     "article_count",
@@ -42,7 +49,16 @@ _SIGNAL_COLUMNS = (
     "stt_mention_count",
     "stt_tilt",
     "fng_index",
+    "signal_age_hours",
+    "signal_observed",
 )
+
+# The two columns above that describe freshness rather than a signal
+# reading.  Both are finite floats by construction (the age carries a
+# sentinel instead of NaN, the flag is 0.0/1.0), so a bar that saw no
+# signal at all still contributes a usable number to the observation
+# instead of a NaN that would spread through the z-scoring.
+_SIGNAL_FRESHNESS_COLUMNS = ("signal_age_hours", "signal_observed")
 
 
 @dataclass
@@ -409,7 +425,10 @@ class FeaturePipeline:
         These columns are added by :func:`merge_extra_features` in
         ``data.py`` and need no further computation — they are already
         numeric (sentiment_score is a float, article_count is an int,
-        novelty_flag is a bool).  Columns not present in the input are
+        novelty_flag is a bool, ``signal_observed`` is 0.0/1.0 and
+        ``signal_age_hours`` is a float age in hours carrying a -1.0
+        sentinel instead of NaN, so no column here can poison the
+        z-scored observation).  Columns not present in the input are
         silently skipped (the merge may not always be active).
         """
         for col in _SIGNAL_COLUMNS:

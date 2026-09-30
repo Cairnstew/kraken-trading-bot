@@ -294,6 +294,8 @@ class PaperTrader:
             extra_features_file=self.config.get("extra_features_file"),
             funding_features_file=self.config.get("funding_features_file"),
             social_features_file=self.config.get("social_features_file"),
+            signal_max_age_hours=self.config.get("signal_max_age_hours"),
+            signal_require_ticker=self.config.get("signal_require_ticker", True),
             market_data_store=self.config.get("market_data_store"),
         )
 

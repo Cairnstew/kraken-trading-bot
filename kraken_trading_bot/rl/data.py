@@ -12,7 +12,14 @@ pagination to kraken-python itself; it lives in this package.
 Exogenous signal merging (:func:`merge_extra_features`) left-joins
 per-(ticker, hour) signal vectors produced by the sibling
 ``ticker-news-signals`` project onto the OHLCV frame by floored
-bar timestamp.
+bar timestamp.  That single seam is the only door every exogenous
+column travels through, so it also carries the three properties the
+join needs to be trustworthy: the records are filtered to the
+requested ticker, each floored hour keeps exactly one record (last
+write wins), and a reading is only carried forward for a *bounded*
+number of hours — with ``signal_age_hours`` / ``signal_observed``
+recorded next to it so "no record within the window" is a value the
+agent can see rather than a silent ``0.0``.
 
 Local market-data store integration (:func:`read_ohlc_dataframe`): when the
 ``market_data_store`` config key points at the sibling ``kraken-market-data``
@@ -29,14 +36,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .features import (
     FeaturePipeline,
     _SIGNAL_COLUMNS,
+    _SIGNAL_FRESHNESS_COLUMNS,
     normalize_ticker_id,
 )
 
@@ -58,6 +68,44 @@ _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "cou
 # look-back window (max window + a small return/rolling cushion).
 _WARMUP_PAD = 6
 
+# Freshness/provenance columns written by :func:`merge_extra_features`
+# beside the signal values themselves.  They are part of the canonical
+# allow-list in ``features._SIGNAL_COLUMNS`` (imported above), so they ride
+# the existing ``signals`` feature group into the observation with no new
+# plumbing: ``signal_observed`` says "a record for this ticker landed
+# inside the freshness window" and ``signal_age_hours`` says how old the
+# stalest live reading is.  The names come from the features module so
+# the seam and the observation cannot drift.
+_SIGNAL_AGE_COLUMN, _SIGNAL_OBSERVED_COLUMN = _SIGNAL_FRESHNESS_COLUMNS
+
+# Default staleness bound in hours, used when the ``signal_max_age_hours``
+# config key is null.  One hour of signal time — i.e. exactly one hourly
+# bar, the seam's own resolution — is enough to bridge a single missed
+# pull without letting a stale reading impersonate a current one for days.
+# Set the key to widen it (funding settles ~8-hourly, so an 8-hourly
+# source wants a bound above 1) or to 0 for a strict per-hour match.
+_DEFAULT_SIGNAL_MAX_AGE_HOURS = 1.0
+
+# ``signal_age_hours`` value for a bar with no live reading.  Ages are
+# always >= 0, so -1.0 is an unambiguous "nothing within the window"
+# marker, and it stays a finite float on purpose: a NaN here would flow
+# into ``NormalizationStats.normalize`` and poison the whole z-scored
+# observation vector.  Both columns are combined across the three merged
+# sources with ``max`` (stalest live reading wins; the sentinel loses to
+# any real age), which is why it must sort below 0.
+_NO_SIGNAL_AGE = -1.0
+
+# Kraken quotes Bitcoin as XBT while configs, model ids and the other
+# signal projects use BTC, so both spellings must fold to the same key or
+# a genuine BTC file would be rejected against a BTC/USD model.
+_TICKER_ALIASES = {"XBT": "BTC"}
+
+# Ticker field name carried by every signal record shape
+# (``ticker-news-signals``, ``kraken-funding-rates``, ``kraken-social-
+# signals``).  Records without it are treated as an explicitly one-ticker
+# file (WARNING, still merged) for backwards compatibility.
+_TICKER_FIELD = "ticker"
+
 
 class NotEnoughDataError(ValueError):
     """Raised when the available OHLCV bars are too few to train/backtest.
@@ -76,33 +124,218 @@ class NotEnoughDataError(ValueError):
         )
 
 
+class SignalTickerMismatchError(ValueError):
+    """Raised when a signal file holds no record for the requested pair.
+
+    The sibling signal projects write a ``ticker`` field on every record,
+    so a file whose tickers exclude the pair being loaded is a
+    mis-pointed config (``extra_features_file`` still holding the BTC
+    file while ETH is being trained), not a data gap.  Merging it anyway
+    is the silent-corruption failure this class exists to stop: BTC
+    sentiment landing on ETH bars with no error and no log.
+
+    Attributes:
+        requested: The pair the caller asked for, e.g. ``"ETH/USD"``.
+        found: Sorted canonical tickers the file actually contains.
+        path: The signal file that was rejected.
+    """
+
+    def __init__(self, requested: str, found: Sequence[str], path: "Path | str") -> None:
+        self.requested = requested
+        self.found = list(found)
+        self.path = str(path)
+        super().__init__(
+            f"Signal file {self.path} holds no records for {requested} "
+            f"(contains: {', '.join(self.found) or 'none'}); point the "
+            f"signal file config key at a {requested} file or set "
+            f"signal_require_ticker: false to merge it unfiltered."
+        )
+
+
+def _canonical_ticker(value: Any) -> str:
+    """Fold a pair/ticker string to a separator-free comparison key.
+
+    ``"ETH/USD"``, ``"ETH_USD"``, ``"eth/usd"`` and ``"ETHUSD"`` all fold
+    to ``"ETHUSD"`` so a signal file and a model config can be compared
+    without depending on one spelling.  Kraken's ``XBT`` is aliased to
+    ``BTC``.  Returns ``""`` for an empty/None value.
+
+    Args:
+        value: Raw pair or ticker string from a record or a config.
+
+    Returns:
+        The canonical uppercase key, or ``""`` when there is nothing to
+        fold.
+    """
+    text = "" if value is None else str(value).strip().upper()
+    if not text:
+        return ""
+    parts = [part for part in re.split(r"[^A-Z0-9]+", text) if part]
+    if not parts:
+        return ""
+    parts[0] = _TICKER_ALIASES.get(parts[0], parts[0])
+    return "".join(parts)
+
+
+def _bar_hours(index: pd.DatetimeIndex) -> float:
+    """Median spacing of ``index`` in hours (the environment bar interval).
+
+    Args:
+        index: UTC ``DatetimeIndex`` of the OHLCV frame.
+
+    Returns:
+        The median gap between consecutive bars in hours, clamped to
+        ``[1/60, 24]``; ``1.0`` when the index has fewer than two bars or
+        its spacing is unusable.
+    """
+    if len(index) < 2:
+        return 1.0
+    gaps = pd.Series(index).diff().dropna().dt.total_seconds()
+    step = float(gaps.median()) if len(gaps) else 0.0
+    if not step > 0:
+        return 1.0
+    return min(max(step / 3600.0, 1.0 / 60.0), 24.0)
+
+
+def _resolve_max_age_hours(max_age_hours: float | int | None) -> float:
+    """Resolve the configured staleness bound in hours.
+
+    Args:
+        max_age_hours: The ``signal_max_age_hours`` config value.  ``None``
+            (the config default) means "derive it": one hour of signal
+            time, i.e. exactly one bar at the seam's hourly resolution.
+
+    Returns:
+        A non-negative hour count.  A non-positive configured value is
+        clamped to ``0.0``, which disables forward-fill entirely (a
+        reading then only applies to the bar whose hour it belongs to).
+    """
+    if max_age_hours is None:
+        return _DEFAULT_SIGNAL_MAX_AGE_HOURS
+    try:
+        hours = float(max_age_hours)
+    except (TypeError, ValueError):
+        _LOGGER.warning(
+            "signal_max_age_hours=%r is not a number — using the derived "
+            "default of %.1fh",
+            max_age_hours,
+            _DEFAULT_SIGNAL_MAX_AGE_HOURS,
+        )
+        return _DEFAULT_SIGNAL_MAX_AGE_HOURS
+    if hours < 0.0:
+        _LOGGER.warning(
+            "signal_max_age_hours=%r is negative — clamping to 0 (no carry)",
+            max_age_hours,
+        )
+        return 0.0
+    return hours
+
+
+def _signal_ages(
+    raw: pd.DataFrame, filled: pd.DataFrame, columns: Sequence[str]
+) -> pd.DataFrame:
+    """Hours since the record that produced each (carried) value.
+
+    Args:
+        raw: The reindexed signal frame *before* the bounded forward-fill,
+            where a non-null cell means "this bar has its own record".
+        filled: The forward-filled frame; a non-null cell means "this
+            bar's value came from a record inside the freshness window".
+        columns: The signal columns present in both frames.
+
+    Returns:
+        Float frame aligned to ``filled``; ``0.0`` on a bar that carries
+        its own record, growing by the bar interval while a value is
+        carried forward, and ``NaN`` where no record is live.
+    """
+    hours = pd.Timedelta(hours=1)
+    out = pd.DataFrame(index=filled.index, columns=list(columns), dtype=float)
+    for col in columns:
+        # Timestamp of the record a bar is reading, carried forward
+        # without limit purely to find it.
+        own = raw[col].notna()
+        seen = pd.Series(filled.index, index=filled.index).where(own).ffill()
+        age = (filled.index - seen) / hours
+        # Mask to the live rows: a bar with no live reading is unobserved,
+        # not stale-but-usable, and gets no age.
+        out[col] = age.where(filled[col].notna()).to_numpy(dtype=float)
+    return out
+
+
 def merge_extra_features(
     df: pd.DataFrame,
     extra_features_file: str | None = None,
+    *,
+    ticker: str | None = None,
+    max_age_hours: float | int | None = None,
+    require_ticker: bool = True,
 ) -> pd.DataFrame:
     """Merge exogenous per-(ticker, hour) signal vectors onto an OHLCV frame.
 
-    Reads a JSONL file produced by the sibling ``ticker-news-signals``
-    project — each record has a ``timestamp`` (ISO 8601, UTC) and the
-    three signal columns: ``sentiment_score`` (float in [-1, 1]),
-    ``article_count`` (int) and ``novelty_flag`` (bool).
+    Reads a JSONL file produced by the sibling signal projects
+    (``ticker-news-signals``, ``kraken-funding-rates``,
+    ``kraken-social-signals``) — each record has a ``timestamp`` (ISO 8601,
+    UTC), a ``ticker`` and that source's signal columns, e.g. news writes
+    ``sentiment_score`` (float in [-1, 1]), ``article_count`` (int) and
+    ``novelty_flag`` (bool).
+
+    This is the single seam every exogenous column travels through, so it
+    is also where four properties the join depends on are enforced:
+
+    1. **Ticker filter** — records are filtered to ``ticker`` before the
+       join, so one ticker's signals can never annotate another's bars.  A
+       file whose tickers do not include ``ticker`` raises
+       :class:`SignalTickerMismatchError` (a mis-pointed config key, not a
+       data gap).  A file with *no* ``ticker`` field is treated as an
+       explicitly one-ticker file: it is merged unchanged at WARNING, which
+       keeps pre-ticker-tagged files and the documented one-ticker cron
+       working.  ``require_ticker=False`` opts out of the filter entirely.
+    2. **De-duplicated hours** — the sibling's documented hourly cron
+       re-appends the current hour on every pull, so the floored index
+       repeats.  Records are de-duplicated on the raw timestamp and then
+       collapsed to one per floored hour (last write wins, i.e. the most
+       recent pull), which is what stops the reindex from raising
+       ``ValueError: cannot reindex on an axis with duplicate labels``.
+    3. **Bounded carry + freshness** — a reading is forward-filled for at
+       most ``max_age_hours`` (default: one hour, derived from the bar
+       interval), never unboundedly, and ``signal_age_hours`` /
+       ``signal_observed`` record how old the reading is and whether there
+       was one at all.
+    4. **Absence is not neutral** — the value columns keep their historical
+       zero-fill (so no ``NaN`` can reach the z-scored observation), but a
+       row with no live reading is now marked ``signal_observed=False``
+       with ``signal_age_hours=-1.0``; "no record" and "a genuine
+       ``0.0``/balanced reading" are therefore distinguishable.
 
     Both the OHLCV bar index and the signal timestamps are floor-truncated
     to the hour before joining, so the merge is robust to minor timestamp
-    offsets (e.g. 1-minute candles with non-zero minutes).  Missing hours
-    in the signal file are forward-filled and then zero-filled (neutral
-    sentiment, 0 articles, no novelty) so every OHLCV row always has the
-    three signal columns.
+    offsets (e.g. 1-minute candles with non-zero minutes).
 
     Args:
         df: OHLCV DataFrame indexed by UTC ``DatetimeIndex`` (``time``).
         extra_features_file: Path to the signal JSONL; ``None`` or empty
             returns ``df`` unchanged.
+        ticker: The pair the frame is for, e.g. ``"ETH/USD"``; used to
+            filter records.  ``None`` (a direct call that does not know
+            the pair) skips the filter with a WARNING.
+        max_age_hours: Staleness bound in hours; ``None`` (the
+            ``signal_max_age_hours`` config default) derives one hour of
+            carry from the bar interval.  ``0`` disables forward-fill.
+        require_ticker: Fail loudly on a ticker mismatch (default).  When
+            ``False`` every record is merged and a mismatch only logs a
+            WARNING.
 
     Returns:
-        The input DataFrame with ``sentiment_score``, ``article_count``
-        and ``novelty_flag`` columns added (when a file is provided and
-        readable).
+        The input DataFrame with the source's signal columns plus
+        ``signal_age_hours`` and ``signal_observed`` added (when a file is
+        provided and readable).  The freshness columns are combined across
+        repeated calls: ``signal_observed`` is true if *any* merged source
+        had a live reading and ``signal_age_hours`` is the age of the
+        stalest one.
+
+    Raises:
+        SignalTickerMismatchError: If the file is ticker-tagged but holds
+            no record for ``ticker`` and ``require_ticker`` is true.
     """
     if not extra_features_file:
         return df
@@ -136,15 +369,43 @@ def merge_extra_features(
         _LOGGER.warning("No 'timestamp' column in %s — skipping merge", path)
         return df
 
+    # ── 1. ticker filter ──────────────────────────────────────────────
+    # Runs before the join, on the raw records: without it a BTC file
+    # annotates ETH bars with BTC sentiment, silently.
+    signal_df = _filter_ticker(signal_df, ticker, path, require_ticker=require_ticker)
+
     signal_df["timestamp"] = pd.to_datetime(signal_df["timestamp"], utc=True)
+    undated = signal_df["timestamp"].isna()
+    if undated.any():
+        _LOGGER.warning(
+            "Dropping %d record(s) with an unparseable 'timestamp' in %s",
+            int(undated.sum()),
+            path,
+        )
+        signal_df = signal_df[~undated]
     signal_df = signal_df.set_index("timestamp")
 
+    # ── 2. de-duplicate the floored hour ───────────────────────────────
+    # Exact-duplicate timestamps first (keep the later line), then a stable
+    # sort so "the most recent pull" is the last row of its floored hour,
+    # then one row per hour.  `last()` is per column and skips nulls, so a
+    # record that updates only some fields keeps the last known value of
+    # the others.
+    signal_df = signal_df[~signal_df.index.duplicated(keep="last")]
+    signal_df = signal_df.sort_index(kind="stable")
     # Floor both indices to the hour so 60-min candles align cleanly
     # even if bar timestamps land at e.g. 14:01 due to exchange quirks.
     signal_df.index = signal_df.index.floor("h")
+    signal_df = signal_df.groupby(level=0).last()
 
-    # Keep only the three signal columns; ignore extras (ticker, etc.).
-    available_cols = [c for c in _SIGNAL_COLUMNS if c in signal_df.columns]
+    # Keep only the columns on the canonical allow-list; ignore the rest
+    # (the raw ticker, ids, any future sibling extras).  The freshness pair
+    # is derived here, never read from the file.
+    available_cols = [
+        c
+        for c in _SIGNAL_COLUMNS
+        if c in signal_df.columns and c not in _SIGNAL_FRESHNESS_COLUMNS
+    ]
     if not available_cols:
         _LOGGER.warning(
             "No signal columns found in %s — expected %s",
@@ -153,27 +414,185 @@ def merge_extra_features(
         )
         return df
 
-    signal_df = signal_df[available_cols].sort_index()
+    signal_df = signal_df[available_cols]
 
-    # ── left-join onto the OHLCV frame ────────────────────────────────
+    # ── 3. bounded forward-fill + freshness ────────────────────────────
     ohlc_index = df.index.floor("h")
+    bar_hours = _bar_hours(ohlc_index)
+    bound_hours = _resolve_max_age_hours(max_age_hours)
+    # The bound is in hours, ffill counts rows, so translate through the
+    # bar interval the frame actually has (1 row on hourly bars, 4 on
+    # 15-minute bars, ...).  Never unbounded.
+    limit = max(0, int(round(bound_hours / bar_hours)))
 
     merged = signal_df.reindex(ohlc_index)
+    # `ffill(limit=0)` is rejected by pandas, and it is exactly the
+    # "carry nothing" case anyway, so skip the pad entirely.
+    filled = merged[available_cols]
+    if limit > 0:
+        filled = filled.ffill(limit=limit)
 
-    # Forward-fill gaps (hours without new signals inherit the last known),
-    # then zero-fill the leading NaNs (first bar onward with no signal yet).
+    # ── 4. absence is not neutral ─────────────────────────────────────
+    # A row is "observed" when at least one of this source's columns holds
+    # a live reading there; `signal_age_hours` is the age of its stalest
+    # live column.  The value columns keep the historical zero-fill so no
+    # NaN reaches `FeaturePipeline`/`NormalizationStats` — the flag pair is
+    # what makes the zero-fill unambiguous.
+    observed = filled.notna().any(axis=1)
+    ages = _signal_ages(merged, filled, available_cols)
+    source_age = ages.max(axis=1).fillna(_NO_SIGNAL_AGE)
+
     for col in available_cols:
-        df[col] = merged[col].ffill().fillna(0.0).values
+        df[col] = filled[col].fillna(0.0).to_numpy()
+
+    if not bool(observed.any()):
+        _LOGGER.warning(
+            "No %s signal record overlaps the %d-bar read window from %s — "
+            "every %s value is zero-filled with signal_observed=False "
+            "(widen signal_max_age_hours if the records are simply older)",
+            ticker or "any",
+            len(df),
+            path,
+            "/".join(available_cols),
+        )
+    _combine_freshness(df, observed, source_age)
 
     _LOGGER.debug(
-        "Merged %d signal records from %s onto %d OHLCV bars "
-        "(columns: %s)",
-        len(records),
+        "Merged %d signal record(s) (%d hour(s)) from %s onto %d OHLCV bars "
+        "(columns: %s, ticker: %s, carry: %d row(s) = %.1fh)",
+        len(signal_df),
+        len(signal_df.index),
         path,
         len(df),
         available_cols,
+        ticker or "unfiltered",
+        limit,
+        bound_hours,
     )
     return df
+
+
+def _filter_ticker(
+    signal_df: pd.DataFrame,
+    ticker: str | None,
+    path: "Path | str",
+    *,
+    require_ticker: bool = True,
+) -> pd.DataFrame:
+    """Keep only the records written for ``ticker``.
+
+    A file without a usable ``ticker`` field is an explicitly one-ticker
+    file: it is returned unchanged with a WARNING, so pre-ticker-tagged
+    files (and the documented one-ticker cron) keep working.
+
+    Args:
+        signal_df: Raw signal records, one row per JSONL line.
+        ticker: The pair the frame is for, e.g. ``"ETH/USD"``.
+        path: The signal file, for logging.
+        require_ticker: Fail loudly on a mismatch instead of merging the
+            other tickers' records.
+
+    Returns:
+        The filtered records.
+
+    Raises:
+        SignalTickerMismatchError: If the file is ticker-tagged, holds no
+            record for ``ticker``, and ``require_ticker`` is true.
+    """
+    # A config key that is present but null must not silently disable the
+    # filter, so only an explicit False opts out.
+    if require_ticker is None:
+        require_ticker = True
+
+    if _TICKER_FIELD not in signal_df.columns:
+        _LOGGER.warning(
+            "Signal file %s has no '%s' field — treating it as a one-ticker "
+            "file and merging every record (set the field on the producer "
+            "side to get the per-ticker filter)",
+            path,
+            _TICKER_FIELD,
+        )
+        return signal_df
+
+    keys = signal_df[_TICKER_FIELD].map(_canonical_ticker)
+    present = sorted({key for key in keys if key})
+    if not present:
+        _LOGGER.warning(
+            "Signal file %s carries an empty '%s' field on every record — "
+            "treating it as a one-ticker file and merging every record",
+            path,
+            _TICKER_FIELD,
+        )
+        return signal_df
+
+    if ticker is None:
+        _LOGGER.warning(
+            "No ticker requested for signal file %s (contains: %s) — merging "
+            "every record unfiltered",
+            path,
+            ", ".join(present),
+        )
+        return signal_df
+
+    wanted = _canonical_ticker(ticker)
+    mask = keys == wanted
+    if not mask.any():
+        if require_ticker:
+            raise SignalTickerMismatchError(ticker, present, path)
+        _LOGGER.warning(
+            "Signal file %s holds no %s record (contains: %s) and "
+            "signal_require_ticker is false — merging every record unfiltered",
+            path,
+            ticker,
+            ", ".join(present),
+        )
+        return signal_df
+
+    kept = int(mask.sum())
+    if kept < len(signal_df):
+        _LOGGER.debug(
+            "Filtered %d/%d signal record(s) from %s to ticker %s "
+            "(dropped: %s)",
+            kept,
+            len(signal_df),
+            path,
+            ticker,
+            ", ".join(key for key in present if key != wanted),
+        )
+    return signal_df[mask]
+
+
+def _combine_freshness(
+    df: pd.DataFrame,
+    observed: pd.Series,
+    ages: pd.Series,
+) -> None:
+    """Fold one source's freshness into the frame's ``signal_*`` pair.
+
+    The three merged sources share one pair of columns, so they are
+    combined rather than overwritten: ``signal_observed`` is true if any
+    source had a live reading and ``signal_age_hours`` is the age of the
+    stalest one (the ``-1.0`` "nothing live" sentinel loses to any real
+    age, which is always >= 0).  A source that is silent for the whole
+    window therefore does not inflate the age, but it is logged as a
+    WARNING by the caller.
+
+    Args:
+        df: Frame being merged into; updated in place.
+        observed: Per-bar bool, "this source had a live reading here".
+        ages: Per-bar float age in hours for this source.
+    """
+    new_observed = observed.to_numpy(dtype=bool)
+    new_age = ages.to_numpy(dtype=float)
+
+    if _SIGNAL_OBSERVED_COLUMN in df.columns:
+        previous_observed = df[_SIGNAL_OBSERVED_COLUMN].to_numpy(dtype=bool)
+        previous_age = df[_SIGNAL_AGE_COLUMN].to_numpy(dtype=float)
+        df[_SIGNAL_OBSERVED_COLUMN] = previous_observed | new_observed
+        df[_SIGNAL_AGE_COLUMN] = np.maximum(previous_age, new_age)
+    else:
+        df[_SIGNAL_OBSERVED_COLUMN] = new_observed
+        df[_SIGNAL_AGE_COLUMN] = new_age
 
 
 def candles_to_dataframe(candles: Sequence[Any]) -> pd.DataFrame:
@@ -268,6 +687,8 @@ def fetch_ohlc_dataframe(
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
     social_features_file: str | None = None,
+    signal_max_age_hours: int | None = None,
+    signal_require_ticker: bool = True,
 ) -> pd.DataFrame:
     """Page through Kraken OHLCV history into a training DataFrame.
 
@@ -297,6 +718,13 @@ def fetch_ohlc_dataframe(
             hour) social/search-trend vectors from the sibling
             ``kraken-social-signals`` project.  Merged after funding
             signals via the same timestamp-floor left-join.
+        signal_max_age_hours: Staleness bound applied to every merged
+            signal file, in hours (the ``signal_max_age_hours`` config
+            key).  ``None`` (the config default) derives one hour of
+            carry from the bar interval; ``0`` disables forward-fill.
+        signal_require_ticker: Fail loudly when a ticker-tagged signal
+            file holds no record for ``pair`` (the
+            ``signal_require_ticker`` config key, default true).
 
     Returns:
         DataFrame as produced by :func:`candles_to_dataframe` with
@@ -305,6 +733,9 @@ def fetch_ohlc_dataframe(
 
     Raises:
         NotEnoughDataError: If no candles could be fetched at all.
+        SignalTickerMismatchError: Propagated from
+            :func:`merge_extra_features` when a ticker-tagged signal file
+            holds no record for ``pair``.
     """
     if manager is None:  # deferred import: only needed for live fetching
         from kraken_api import KrakenManager
@@ -320,9 +751,14 @@ def fetch_ohlc_dataframe(
     # The exchange may return overlapping boundary candles across pages;
     # keep the first occurrence per timestamp.
     df = df[~df.index.duplicated(keep="first")].sort_index()
-    df = merge_extra_features(df, extra_features_file)
-    df = merge_extra_features(df, funding_features_file)
-    df = merge_extra_features(df, social_features_file)
+    for signal_file in (extra_features_file, funding_features_file, social_features_file):
+        df = merge_extra_features(
+            df,
+            signal_file,
+            ticker=pair,
+            max_age_hours=signal_max_age_hours,
+            require_ticker=signal_require_ticker,
+        )
     return df
 
 
@@ -337,6 +773,8 @@ def read_ohlc_dataframe(
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
     social_features_file: str | None = None,
+    signal_max_age_hours: int | None = None,
+    signal_require_ticker: bool = True,
     market_data_store: Any = None,
     market_data_source: Any = None,
 ) -> pd.DataFrame:
@@ -373,6 +811,13 @@ def read_ohlc_dataframe(
             hour) social/search-trend vectors from the sibling
             ``kraken-social-signals`` project.  Merged after funding
             signals via the same timestamp-floor left-join.
+        signal_max_age_hours: Staleness bound applied to every merged
+            signal file, in hours (the ``signal_max_age_hours`` config
+            key).  ``None`` (the config default) derives one hour of
+            carry from the bar interval; ``0`` disables forward-fill.
+        signal_require_ticker: Fail loudly when a ticker-tagged signal
+            file holds no record for ``pair`` (the
+            ``signal_require_ticker`` config key, default true).
         market_data_store: ``null`` (live fetch), a store root path, or a
             store-like object exposing ``upsert``/``read`` (see
             :func:`_resolve_store`).
@@ -392,6 +837,9 @@ def read_ohlc_dataframe(
         TypeError: If ``market_data_store`` is neither null, a path, nor a
             store-like object.
         NotEnoughDataError: If the read window is empty.
+        SignalTickerMismatchError: Propagated from
+            :func:`merge_extra_features` when a ticker-tagged signal file
+            holds no record for ``pair``.
 
     .. todo:: Follow-up integration pass (see ``kraken-market-data/
        INTEGRATION.md``): honour ``since``/``until`` from config; drive
@@ -409,6 +857,8 @@ def read_ohlc_dataframe(
             extra_features_file=extra_features_file,
             funding_features_file=funding_features_file,
             social_features_file=social_features_file,
+            signal_max_age_hours=signal_max_age_hours,
+            signal_require_ticker=signal_require_ticker,
         )
 
     # DEEP-HISTORY (kraken-deep-history): with a store seeded by the
@@ -454,9 +904,14 @@ def read_ohlc_dataframe(
     df = store.read(pair, interval, since=since, until=until)
     if isinstance(df, pd.DataFrame) and df.empty:
         raise NotEnoughDataError(1, 0, what="OHLC candles")
-    df = merge_extra_features(df, extra_features_file)
-    df = merge_extra_features(df, funding_features_file)
-    df = merge_extra_features(df, social_features_file)
+    for signal_file in (extra_features_file, funding_features_file, social_features_file):
+        df = merge_extra_features(
+            df,
+            signal_file,
+            ticker=pair,
+            max_age_hours=signal_max_age_hours,
+            require_ticker=signal_require_ticker,
+        )
     return df
 
 
@@ -575,6 +1030,7 @@ def _minimum_bars(features: FeaturePipeline) -> int:
 
 __all__ = [
     "NotEnoughDataError",
+    "SignalTickerMismatchError",
     "candles_to_dataframe",
     "merge_extra_features",
     "fetch_ohlc_dataframe",

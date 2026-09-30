@@ -37,6 +37,7 @@ from .agent import RLAgent
 from .backtest import BacktestResult, backtest_model
 from .data import (
     NotEnoughDataError,
+    SignalTickerMismatchError,
     candles_to_dataframe,
     fetch_ohlc_dataframe,
     prepare_episode,
@@ -66,6 +67,7 @@ __all__ = [
     "list_models",
     "register_model",
     "NotEnoughDataError",
+    "SignalTickerMismatchError",
     "candles_to_dataframe",
     "fetch_ohlc_dataframe",
     "read_ohlc_dataframe",

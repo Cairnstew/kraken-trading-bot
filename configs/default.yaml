@@ -72,6 +72,34 @@ funding_features_file: null
 # signals via the same timestamp-floor left-join.  Null/empty disables it.
 social_features_file: null
 
+# How long a merged signal reading may be carried forward, in hours, for
+# ALL three files above.  A reading is forward-filled for at most this many
+# hours (and never unboundedly), then the bar is marked unobserved; every
+# merge also writes the two freshness columns into the `signals` feature
+# group, so "how old is this?" is a number the agent sees rather than
+# something it has to guess:
+#   signal_age_hours  hours since the stalest live reading (-1.0 = none)
+#   signal_observed   1.0 when a record for `ticker` landed in the window
+# A value with no reading behind it keeps its historical 0.0 fill, so this
+# pair is what tells a genuine 0 (extreme fear, balanced tilt) apart from
+# "nothing was reported".
+# null (default) derives the bound from the bar interval — one hour of
+# carry, i.e. one hourly bar, which is enough to bridge a single missed
+# pull.  Set an int to widen it (kraken-funding-rates settles ~8-hourly, so
+# a funding-heavy run wants e.g. 12) or 0 for a strict per-hour match.
+signal_max_age_hours: null
+
+# Require every merged signal file to actually be this ticker's file.
+# The sibling projects write a `ticker` field on every record, so a file
+# whose tickers exclude `ticker` is a mis-pointed config key (the BTC file
+# still configured while ETH trains) — that raises instead of silently
+# merging BTC's numbers onto ETH bars.  A file with NO `ticker` field at all
+# is treated as an explicitly one-ticker file: it still merges, with a
+# WARNING, so pre-ticker-tagged files and the documented one-ticker cron
+# keep working.  Set false to merge unfiltered and only log a mismatch
+# (re-enables the ticker-blind join; only for deliberately mixed files).
+signal_require_ticker: true
+
 # --- Local market-data store (optional) ----------------------------------
 # Path to the root of the sibling `kraken-market-data` store — the
 # directory containing its `_meta.json` cursor sidecar and the

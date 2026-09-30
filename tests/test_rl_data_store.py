@@ -16,11 +16,14 @@ or credentials.
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 import pytest
 from kraken_api.models import Candle
 
-from kraken_trading_bot.rl import fetch_ohlc_dataframe, read_ohlc_dataframe
+from kraken_trading_bot.rl import SignalTickerMismatchError, fetch_ohlc_dataframe, read_ohlc_dataframe
+from kraken_trading_bot.rl.data import merge_extra_features
 
 # 2026-08-01 12:00 UTC, the same anchor the sibling store's fixtures use.
 _BASE = 1785585600
@@ -372,3 +375,210 @@ def test_read_ohlc_dataframe_all_signal_files_merge(tmp_path) -> None:
     assert df["funding_rate"].iloc[-1] == pytest.approx(0.0003)
     assert df["stt_mention_count"].iloc[-1] == 42
     assert df["stt_tilt"].iloc[-1] == pytest.approx(0.8)
+
+
+# ----------------------------------------------------------------------
+# merge seam: ticker filter, hour de-duplication, bounded carry,
+# and absence-is-not-neutral.  All four are regressions for the signal
+# join that every exogenous column travels through.
+# ----------------------------------------------------------------------
+def _ohlc_frame(bars: int = 6, start_hour: int = 12) -> pd.DataFrame:
+    """A flat OHLCV frame of ``bars`` hourly bars from 2026-08-01T12:00Z."""
+    index = pd.to_datetime(
+        [f"2026-08-01T{hour:02d}:00:00Z" for hour in range(start_hour, start_hour + bars)],
+        utc=True,
+    )
+    return pd.DataFrame(
+        {
+            "open": 1000.0,
+            "high": 1000.0,
+            "low": 1000.0,
+            "close": 1000.0,
+            "volume": 10.0,
+        },
+        index=index,
+    )
+
+
+def test_read_ohlc_dataframe_signal_ticker_mismatch_does_not_merge(tmp_path) -> None:
+    """A BTC-only signal file cannot annotate ETH bars, with or without opt-in.
+
+    This is the failure the merge used to commit silently: ``-0.9`` of BTC
+    sentiment landing on an ETH frame with no error and no log.  The pair
+    is threaded from the call site, so the guard works for every consumer,
+    and ``signal_require_ticker: false`` remains a deliberate escape hatch
+    for a file that is knowingly mixed.
+    """
+    store = FakeStore([_candle(0), _candle(1)])
+    source = FakeSource([_candle(2)], last=0)
+
+    signals = tmp_path / "btc.jsonl"
+    signals.write_text(
+        '{"ticker": "BTC/USD", "timestamp": "2026-08-01T14:00:00Z", '
+        '"sentiment_score": -0.9}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SignalTickerMismatchError) as excinfo:
+        read_ohlc_dataframe(
+            "ETH/USD",
+            60,
+            pages=1,
+            manager=source,
+            extra_features_file=str(signals),
+            market_data_store=store,
+        )
+    assert "ETH/USD" in str(excinfo.value)
+    assert "BTCUSD" in str(excinfo.value)
+
+    # Opting out merges (and says so) rather than refusing the read.
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        extra_features_file=str(signals),
+        signal_require_ticker=False,
+        market_data_store=store,
+    )
+    assert df["sentiment_score"].iloc[-1] == pytest.approx(-0.9)
+
+
+def test_merge_extra_features_filters_to_requested_ticker(tmp_path) -> None:
+    """A multi-ticker file contributes only the requested ticker's records."""
+    signals = tmp_path / "mixed.jsonl"
+    signals.write_text(
+        '{"ticker": "BTC/USD", "timestamp": "2026-08-01T14:00:00Z", '
+        '"sentiment_score": -0.9}\n'
+        '{"ticker": "ETH_USD", "timestamp": "2026-08-01T14:00:00Z", '
+        '"sentiment_score": 0.6}\n'
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T12:00:00Z", '
+        '"sentiment_score": 0.4}\n',
+        encoding="utf-8",
+    )
+
+    df = merge_extra_features(_ohlc_frame(3), str(signals), ticker="ETH/USD")
+    # 12:00 is our own record; 14:00 is ETH's (BTC's -0.9 never arrives,
+    # and the underscore spelling of the same pair is not a second ticker).
+    assert df["sentiment_score"].iloc[0] == pytest.approx(0.4)
+    assert df["sentiment_score"].iloc[-1] == pytest.approx(0.6)
+    assert df["signal_age_hours"].iloc[-1] == pytest.approx(0.0)
+    assert bool(df["signal_observed"].iloc[-1]) is True
+
+
+def test_merge_extra_features_untagged_file_still_merges(tmp_path, caplog) -> None:
+    """A file with no ``ticker`` field is a one-ticker opt-in, not a failure.
+
+    The eight merge tests above and the documented one-ticker cron all
+    write untagged records; they must keep working, but loudly, because
+    only a tagged file can be filtered per pair.
+    """
+    signals = tmp_path / "untagged.jsonl"
+    signals.write_text(
+        '{"timestamp": "2026-08-01T14:00:00Z", "sentiment_score": 0.5}\n',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="kraken_trading_bot.rl.data"):
+        df = merge_extra_features(_ohlc_frame(3), str(signals), ticker="ETH/USD")
+
+    assert df["sentiment_score"].iloc[-1] == pytest.approx(0.5)
+    assert any("no 'ticker' field" in rec.message for rec in caplog.records)
+
+
+def test_merge_extra_features_duplicate_hour_does_not_raise(tmp_path) -> None:
+    """The documented hourly-append cron re-emits the current hour.
+
+    Every pull inside the same hour therefore re-appends that hour, which
+    used to make the reindex raise ``ValueError: cannot reindex on an axis
+    with duplicate labels`` and kill every train/backtest/paper tick.  The
+    last write for an hour wins — the most recent pull.
+    """
+    signals = tmp_path / "hourly_append.jsonl"
+    signals.write_text(
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T13:00:00Z", '
+        '"sentiment_score": 0.1}\n'
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T13:30:00Z", '
+        '"sentiment_score": 0.7}\n'
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T13:59:00Z", '
+        '"sentiment_score": 0.9}\n',
+        encoding="utf-8",
+    )
+
+    df = merge_extra_features(_ohlc_frame(3), str(signals), ticker="ETH/USD")
+    assert df["sentiment_score"].iloc[1] == pytest.approx(0.9)  # 13:00 bar
+    assert df["signal_age_hours"].iloc[1] == pytest.approx(0.0)
+    assert df["signal_age_hours"].iloc[2] == pytest.approx(1.0)  # 14:00 bar
+    assert list(df["sentiment_score"]) == [0.0, 0.9, 0.9]
+
+
+def test_merge_extra_features_ffill_is_bounded_and_age_grows(tmp_path) -> None:
+    """A reading is carried for a bounded number of hours, and says how old.
+
+    One record at 12:00 used to propagate unchanged for the whole frame,
+    so a 3-day-old funding rate was indistinguishable from a current one.
+    The default bound is one bar of carry; ``signal_max_age_hours`` widens
+    it and ``signal_age_hours`` reports the age of the reading that is
+    being used.
+    """
+    signals = tmp_path / "one_record.jsonl"
+    signals.write_text(
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T12:00:00Z", '
+        '"funding_rate": 0.0001}\n',
+        encoding="utf-8",
+    )
+
+    # Default: one hour of carry on hourly bars, then the value is gone.
+    default = merge_extra_features(_ohlc_frame(6), str(signals), ticker="ETH/USD")
+    assert list(default["funding_rate"]) == [0.0001, 0.0001, 0.0, 0.0, 0.0, 0.0]
+    assert list(default["signal_age_hours"]) == [0.0, 1.0, -1.0, -1.0, -1.0, -1.0]
+    assert list(default["signal_observed"]) == [True, True, False, False, False, False]
+
+    # Configured bound: three hours of carry, and the age grows with it.
+    widened = merge_extra_features(
+        _ohlc_frame(6), str(signals), ticker="ETH/USD", max_age_hours=3
+    )
+    assert list(widened["funding_rate"]) == [0.0001, 0.0001, 0.0001, 0.0001, 0.0, 0.0]
+    assert list(widened["signal_age_hours"]) == [0.0, 1.0, 2.0, 3.0, -1.0, -1.0]
+    assert list(widened["signal_observed"]) == [True, True, True, True, False, False]
+
+    # 0 hours: the reading only applies to the bar whose hour it is in.
+    strict = merge_extra_features(
+        _ohlc_frame(6), str(signals), ticker="ETH/USD", max_age_hours=0
+    )
+    assert list(strict["funding_rate"]) == [0.0001, 0.0, 0.0, 0.0, 0.0, 0.0]
+    assert list(strict["signal_observed"]) == [True, False, False, False, False, False]
+
+
+def test_read_ohlc_dataframe_absence_is_distinguishable_from_zero(tmp_path) -> None:
+    """``fng_index=0`` ("extreme fear") and "no record at all" must differ.
+
+    The value column keeps its historical zero-fill so no NaN can reach
+    the z-scored observation, so the freshness pair is what carries the
+    distinction — which is only true if it reaches the frame on every read
+    the store branch performs.
+    """
+    store = FakeStore([_candle(0), _candle(1), _candle(2)])
+    source = FakeSource([_candle(3)], last=0)
+
+    social = tmp_path / "social_zero.jsonl"
+    social.write_text(
+        '{"ticker": "ETH/USD", "timestamp": "2026-08-01T13:00:00Z", '
+        '"fng_index": 0}\n',
+        encoding="utf-8",
+    )
+
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=source,
+        social_features_file=str(social),
+        market_data_store=store,
+    )
+    # 12:00 = no record; 13:00 = a genuine reading of 0; 14:00 = that same
+    # reading carried one bar (the default bound); 15:00 = nothing at all.
+    # Every value is 0.0 — only the freshness pair tells them apart.
+    assert list(df["fng_index"]) == [0.0, 0.0, 0.0, 0.0]
+    assert list(df["signal_observed"]) == [False, True, True, False]
+    assert list(df["signal_age_hours"]) == [-1.0, 0.0, 1.0, -1.0]
