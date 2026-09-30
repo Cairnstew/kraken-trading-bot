@@ -1,247 +1,316 @@
-# RESEARCH-3 — Candidate 3 (exogenous seams, ops) + Candidate 4 (fetch reliability)
+# RESEARCH-3 — G3: fetch reliability (retry/backoff, throttle default, tick-level cache)
 
 Read-only survey, researcher 3 of 3. Written against the working tree on disk
-(2026-09-30). Own file; does not touch RESEARCH.md.
+(2026-09-30). Overwrites the prior pass's `RESEARCH-3.md` (Candidates 3+4),
+which is preserved in git at `17899e1`. Scope: **G3** only.
 
-Scope: **Candidates 3 + 4** from the fresh AUDIT.md.
+Every environment/library fact below was verified by running the commands shown,
+not recalled. Evidence: `kraken-python/kraken_api/transport.py`,
+`kraken_trading_bot/{engine.py,rl/data.py,rl/paper_trade.py}`,
+`kraken-python/tests/test_transport.py`, both `pyproject.toml`, both
+`nix/default.nix`, both `flake.nix`, and the bot's actual `.venv`.
 
 ---
 
-## CANDIDATE 3 — Operations: the three signal seams are unscheduled, staleness-blind, and not flake inputs
+## 0. The three findings that decide this gap
 
-### 3.1 Maintenance status of each seam
+**(F1) Kraken signals rate limit in the BODY, with HTTP 200.**
+`kraken-python/tests/test_transport.py:63-67` builds the rate-limit case as
+`FakeResponse({"error": ["EAPI:Rate limit exceeded"], "result": {}})` with the
+default `status=200`, and `transport.py:249-250` raises `RateLimitError` by
+matching `_RATE_LIMIT_MARKERS` (`transport.py:45-48`) **against the decoded
+JSON envelope**, not the HTTP status. So `urllib3.Retry(status_forcelist=[429])`
+— the single most common "add retry to requests" recipe — **does not fire for
+Kraken's rate limit at all**. Any retry design that only sees HTTP status is
+solving the wrong failure mode. This is the single most important fact in the
+survey and it eliminates the most popular option by inspection.
 
-All three signal siblings ship exactly one pull path (`cli.py pull`) and a
-flake with `packages` + `devShells` only — **no `nixosModules`, no timer**:
+**(F2) `KrakenManager.from_env(min_interval=...)` is a silent no-op.**
+`kraken-python/kraken_api/auth.py:58-90` — `client_from_env(**kwargs)` reads
+`min_interval` **only** from the environment (`auth.py:73`:
+`float(_env(ENV_MIN_INTERVAL) or 0.0)`); `kwargs` is consulted only for
+`require_credentials`. So the natural-looking bot-side override
+`KrakenManager.from_env(min_interval=0.08)` (the exact call at
+`kraken_trading_bot/cli.py:328,355,374,398`) is accepted and discarded, with no
+warning. `client_from_credentials` (`auth.py:104`) *does* honour the kwarg, so
+the two constructors disagree — a live footgun, not a hypothetical.
 
-| Sibling | CLI | Scheduling | Flake module | Notes |
+**(F3) The throttle is not load-bearing at the current cadence; the *re-fetch*
+is.** The engine does 3 calls/pair per 60 s (`engine.py:57-74`) and the paper
+trader 2 per 60 s (`paper_trade.py:56,289-298`) — i.e. ~0.05 calls/s against
+Kraken's documented ~15-20/s (`kraken-python/.env.example`, restated at
+`transport.py:93-96`). That is ~300x under the limit. The real cost is not
+"too many requests per second", it is **"the same ~720-bar window is
+re-requested 60x an hour"** and **"each tick re-parses 3 whole JSONLs"**. So the
+throttle-default sub-question is largely a documentation/footgun fix, and the
+cache/append sub-question is where the actual savings are. Effort should be
+spent accordingly.
+
+---
+
+## 1. RECOMMENDED DESIGN
+
+### 1a. Retry policy — hand-rolled loop in the sibling transport, zero new deps
+
+**Where:** `kraken-python/kraken_api/transport.py:188-261` (`_request`). This is
+the only place in either repo that knows about HTTP, the envelope, and the
+rate-limit markers. Putting it here fixes the engine, the paper trader, train,
+backtest and export with one change, and the module's own docstring
+(`transport.py:1-18`) already scopes it as "the part of the stack that knows
+*how* to talk to Kraken".
+
+**Shape (~25 lines, stdlib only):** wrap the existing `try` block
+(`transport.py:202-221`) in an attempt loop. Retry when:
+
+| condition | detection site | safe to retry? |
+|---|---|---|
+| connection error / timeout | `requests.RequestException` at `:210` | **yes** — no request reached Kraken |
+| HTTP 5xx / 429 | `raise_for_status()` at `:208` | **yes** for GET |
+| envelope rate limit | `_RATE_LIMIT_MARKERS` at `:249` (**F1**) | **yes** for GET |
+| other `APIError` | `:251` | **no** — a deterministic rejection; retrying burns the budget |
+
+**Backoff:** `delay = min(cap, base * 2**attempt)`, then **full jitter**
+(`random.uniform(0, delay)`). Full jitter over equal jitter because a burst of
+tickers all retrying in lockstep is exactly what trips the limiter again; full
+jitter is the standard fix. Suggested constants: `base=0.5`, `cap=30.0`,
+`max_attempts=5` (worst case ≈ 0.5+1+2+4 jittered ≈ ≤7.5 s, comfortably inside a
+60 s tick so a retry storm cannot overrun the interval).
+
+**Honor `Retry-After`:** when a response carries the header, use
+`max(Retry-After, jittered_backoff)` — never less than the jittered value, or a
+misbehaving/absent-jitter path could poll faster than the server asked. Kraken
+does send it on some throttles, and the alternative is a blind 429 loop.
+
+**The one real design trap — nonces.** `private()` (`transport.py:134-163`)
+signs a payload with a **strictly-increasing nonce** (`transport.py:169-178`).
+Blindly retrying a signed POST is how you double-place an order: the first
+attempt may have reached Kraken and been executed while the client saw a
+timeout. So: **retry `public()` unconditionally; retry `private()` only for
+exceptions raised before any response was read** (connect failure / read
+timeout), and even then expose `retry_private` as an opt-in that defaults to
+off. Order placement (`engine.py:104-116`) gets no retry. This must be stated
+explicitly, because a naive "wrap `_request` in a retry decorator" gets it wrong
+and the failure mode is a real-money duplicate order.
+
+**Cost of this option in the sibling:** one file
+(`transport.py`), plus ~15 lines of new tests in `tests/test_transport.py`
+alongside the existing `FakeSession`/`FakeResponse` fakes — which already
+support exactly what is needed (inject a sequence of responses, then assert call
+count and the `sleep` sequence). No `pyproject.toml`, no `nix/default.nix`, no
+`flake.lock`.
+
+### 1b. Throttle — fix the footgun, set one documented default, don't move the library default
+
+**Do NOT change `min_interval: float = 0.0` (`transport.py:108`) in the
+sibling.** Reasons, in order of weight:
+1. It is a library default shared by every consumer (`auth.py:73,75,104`).
+   Silently inserting a sleep into someone's test suite is a behaviour change
+   with no migration note.
+2. `transport.py:181` short-circuits on `<= 0`, so 0.0 is the "no throttle"
+   opt-out and the code already reads as intentional.
+3. Per **F3**, the current workloads are ~300x under the limit; changing the
+   default buys nothing here.
+
+**Do instead, two changes:**
+- **Sibling (2 lines, real bug fix):** make `client_from_env` honour a
+  `min_interval` kwarg the way `client_from_credentials` already does
+  (`auth.py:104`) — `min_interval=kwargs.pop("min_interval", None) or
+  float(_env(ENV_MIN_INTERVAL) or 0.0)`. This closes **F2**. Without it, every
+  "just set it in the bot" attempt is a silent no-op.
+- **Bot (no code change needed at all):** `KRAKEN_MIN_INTERVAL` is already
+  honoured today by `auth.py:73`, and `.env.example` already documents the
+  value. Set `KRAKEN_MIN_INTERVAL=0.08` in the bot's `.env.example` /
+  `configs/default.yaml` guidance. **`0.08` is the number to use**: it is the
+  repo's own documented advice (`kraken-python/.env.example` — "Spot REST is
+  limited to ~15-20 calls/s by tier. Set e.g. 0.08 for ~12/s"), which is ~2x
+  headroom under the lowest tier and costs 0.16 s per paged pull of 2 pages.
+  For the 60 s engine the value is irrelevant (3 calls need ≥0.08x3), so one
+  setting serves both paths.
+
+**Where the paged-pull burst actually lives:** `kraken_trading_bot/rl/data.py:247-259`
+(`_page_candles`) loops `pages` times back-to-back. Train/backtest use
+`pages=6` → 6 rapid calls. That burst is the only place `min_interval` earns its
+keep, and 0.08 handles it. (One caveat to verify before relying on call counts:
+`kraken-python/kraken_api/manager.py:178-180` resolves the pair through
+`self.catalog` on every `ohlc`; the catalog is documented as cached
+(`kraken-python/README.md`, "a cached pair catalog"), so this should be free
+after first use — but it is the one thing I would confirm with a call counter
+before claiming an exact "3 calls/tick" number.)
+
+### 1c. Tick-level cache / incremental read — three seams, ranked by value per line
+
+**Seam 1 (highest value, ~20 lines): stop re-fetching the OHLC window every
+tick in the engine.**
+`engine.py:65-66` refetches the full OHLC window and discards all but
+`candles[-100:]`. On a 60-minute candle interval the window's contents change
+**once an hour**; 59 of 60 ticks re-request ~720 bars to read the same 100. The
+correct trigger is **bar-close, not wall-clock**: keep the last bar's `time`
+and re-fetch only when `now - last_bar_time >= interval_minutes`, then splice
+the new bars in. Ticker (`engine.py:59`) and order book (`engine.py:72`) stay
+per-tick — they are genuinely live and are the actual inputs. Result: **3
+calls/pair/tick → 1 call/pair/tick steady-state**, which is the literal
+"each tick makes ≤1 small request" target, plus one OHLC pull per bar close.
+This is the change that actually pays for itself and it touches one function.
+
+**Seam 2 (~30 lines): append + tail read in the paper trader.**
+`paper_trade.py:289-298` calls `read_ohlc_dataframe(..., pages=2)` with **no
+`since`**, every tick. The seam already exists: `since` is a parameter
+(`data.py:335`), already forwarded to `_page_candles` (`data.py:314,250`) and
+to the store read (`data.py:454`), and already unit-tested
+(`tests/test_rl_data_store.py:170-181`). So:
+- `PaperTrader` keeps the accumulated frame across ticks (it currently does not
+  — `step()` at `paper_trade.py:358-359` gets a fresh `df` every tick);
+- each tick passes `since=<last bar epoch>`, so `_page_candles` asks Kraken only
+  for bars the client does not have;
+- concat + dedupe. Dedup is already free: `data.py:322` does
+  `df[~df.index.duplicated(keep="first")]`, and Kraken's `since` returns the
+  boundary bar inclusively, so overlap is expected and handled.
+
+**Two caveats to fix as part of this, both real:**
+- **`until` is silently dropped on the live path.** `read_ohlc_dataframe`'s
+  null-store branch (`data.py:402-412`) forwards `since` to
+  `fetch_ohlc_dataframe` but **never forwards `until`** — it is accepted,
+  documented (`data.py:364-365`) and then ignored. Any tail-read design that
+  relies on an upper bound is broken on the default (null-store) path. One-line
+  pass-through fix, and it should come with a test.
+- Feature recompute. `_build_observation` (`paper_trade.py:316-318`) runs the
+  **full** `FeaturePipeline.compute` over the whole window each tick, but
+  `self.context_bars` already caps it (`:316-317`). Precompute on bar-append
+  only and reuse the frame between appends — this is the same bar-close trigger
+  as Seam 1, so it is the same one-line condition, not a second mechanism.
+
+**Seam 3 (best value per line of the whole survey, ~15 lines): tokenize each
+JSONL once.**
+`merge_extra_features` opens and fully parses the file on **every** call
+(`data.py:119` `path.open()`, `:125` `json.loads` per line) and is called
+**three times per load** (`data.py:323-325` and again `:457-459`) — so one
+paper tick is 3 × O(file) `json.loads` passes, every 60 s, forever. A
+module-level cache holding the **already-built `signal_df`** (i.e. the value as
+of `data.py:156`, after flooring and column selection) keyed by
+`(resolved_path, st_size, st_mtime_ns)` turns calls 2 and 3 — and every
+subsequent tick — into a `stat()` plus a dict lookup. `stat()` is O(1), and
+size+mtime is a correct invalidator for the siblings' append-only JSONLs
+(`kraken-funding-rates` `pull --append`; the news/social CLIs write per-hour
+rows). No new dependency.
+
+**Why not a byte-offset tail read of the JSONL** (the literal reading of the
+`data.py:396-401` todo): `merge_extra_features` reindexes the signal frame onto
+the *whole* OHLC index and then `.ffill().fillna(0.0)` (`data.py:161-166`).
+That is a **prefix-dependent** operation — an hour's value depends on every
+earlier hour. A tail read would need the last value before the window carried
+forward as state. Doable, but strictly more state for a file that is
+hourly-resolution and therefore small. Cache-the-parsed-frame gets ~99% of the
+win at ~15 lines and no new failure modes. (The `data.py:396-401` todo also
+spans `since`/`until`-from-config and walk-forward, which are **not** this gap.)
+
+---
+
+## 2. LIBRARY CANDIDATES
+
+Environment fact that governs the whole table (**verified** in
+`/home/seanc/Projects/kraken-trading-bot/.venv`):
+`requests 2.34.2`, **`urllib3 2.8.0` present (transitive)**, `filelock 4.0.4`
+(torch transitive via stable-baselines3), and **`tenacity`, `backoff`,
+`requests-cache`, `cachetools`, `diskcache` all MISSING**.
+
+Cost of adding *any* new dependency to either repo = **3 files**:
+`pyproject.toml` `dependencies`, `nix/default.nix` `propagatedBuildInputs`
+(bot `nix/default.nix:60-68`; sibling `nix/default.nix:40-44`), and the
+`flake.nix` devShell `withPackages` list (bot `flake.nix:66-77`; sibling
+`flake.nix:66-73`) — plus a `flake.lock` bump on the sibling input. For
+reference the entire bot is 5,700 lines.
+
+| candidate | license | last release | nixpkgs unstable | new dep? | catches Kraken's **body** rate limit (F1)? | verdict |
+|---|---|---|---|---|---|---|
+| **hand-rolled loop in `transport.py`** | MIT (repo's own) | n/a | n/a | **no** | **yes** (reuses `_RATE_LIMIT_MARKERS`, `:249`) | **RECOMMENDED** — only option that is correct for F1 at zero dep cost |
+| `urllib3.Retry` via `requests.adapters.HTTPAdapter` | MIT | 2.8.0 runtime / 2.2.3 nix | `python3Packages.urllib3` | **no** (transitive) | **NO** — status-only | partial: connect/5xx/429-header only. Useful as a *complement* inside the hand-rolled loop, never as the retry policy |
+| `tenacity` | Apache-2.0 | **9.1.4** | `python3Packages.tenacity` | **yes** (3 files) | yes (custom `retry=` predicate on the raised exception) | viable, 3x cost. See trap below |
+| `backoff` | MIT | **2.2.1** | `python3Packages.backoff` | **yes** (3 files) | yes | viable but decorator-shaped; a decorator on `transport._request` is *exactly* the shape that gets the private-nonce retry wrong (1a) |
+| `requests-cache` | BSD-3 | **1.3.3** | `python3Packages.requests-cache` | **yes** (3 files + attrs/cattrs transitive) | n/a | **rejected** — wrong failure mode (caches; does not retry). Also a *correctness hazard* here: a cached ticker is a stale trading input |
+| `cachetools` / `diskcache` | MIT | in nixpkgs | yes | **yes** | n/a | **rejected** — 3 in-process call sites, single-writer, no cross-process need |
+| `filelock` | MIT | 4.0.4 | yes | present **only** as an undeclared torch transitive | n/a | **rejected** — depending on an undeclared transitive is a silent breakage; and there is no writer race to lock against (the G4 schedulers are the thing that would create one) |
+
+**Trap to flag if anyone revisits this:** bare `tenacity` in nixpkgs resolves to
+the **GPL-2.0 audio editor** (`nixos_nix info tenacity` → 1.3.4,
+tenacityaudio.org). The Python package is `python3Packages.tenacity` (9.1.4).
+A typo in `propagatedBuildInputs` would pull a GPL binary into an MIT project
+and still evaluate cleanly.
+
+**Incidental finding (out of scope, flagging not fixing):**
+`kraken-python/nix/default.nix:17` pins `version = "0.3.0"` while
+`kraken-python/pyproject.toml` says `0.4.0`. The Nix package metadata is stale
+and disagrees with the library it builds.
+
+### Scoring against the gap's own acceptance target
+
+*"each tick makes ≤1 small request"* + *"transient errors retry"*:
+
+| option | ≤1 req/tick | retries transient | deps added | net |
 |---|---|---|---|---|
-| `ticker-news-signals` | `pull --ticker --output --lookback-hours` | none | none | flake uses an **overlay** for `gnews` + `vaderSentiment` (not in nixpkgs) |
-| `kraken-funding-rates` | `pull --pair --output [--append]` | none | none | plain `buildPythonPackage`; `extract --all` exists |
-| `kraken-social-signals` | `pull --ticker --output --lookback-hours` | none | none | plain `buildPythonPackage` |
-| `kraken-market-data` (**the exemplar**) | `market update --pair --interval` | **systemd service+timer** | **yes** (`nix/module.nix`) | per-(pair, interval) unit; `DynamicUser`, `StateDirectory`, `OnCalendar *-*-* *:*:30`, `Persistent=true` |
+| hand-rolled + Seam 1 | **yes** (3→1 calls/pair/tick) | yes (incl. F1 rate limit) | 0 | **ship this** |
+| hand-rolled only | no (still 3) | yes | 0 | half a fix |
+| `urllib3.Retry` only | no | **no** for Kraken rate limit | 0 | does not work |
+| `tenacity` only | no | yes | 3 files | same outcome, 3x cost, plus nonce trap |
+| `tenacity` + Seam 1 | yes | yes | 3 files | same outcome as hand-rolled + Seam 1 |
+| `requests-cache` | no | no | 4 files | none of it |
 
-The only scheduler in the family is `kraken-market-data/nix/module.nix`:
-
-- one `systemd.services.kraken-market-data-<pair>-<interval>` per pair
-  (`Type=oneshot`, `DynamicUser=true`, `StateDirectory`, `ExecStart` =
-  `pkg/bin/kraken-market-data market update --pair ... --store dataDir`);
-- a matching `systemd.timers.*` with `OnCalendar` (default `*-*-* *:*:30`),
-  `Persistent=true`, wired `wantedBy = timers.target`.
-
-Key detail: `Persistent=true` means a missed run fires at the next boot/start —
-exactly the property a funding/∂‑news poller needs. The market-data module is
-the reference implementation for Candidate 3; the other three just never got
-one.
-
-### 3.2 The bot flake cannot run the three CLIs at all
-
-`flake.nix:4-8` lists **only** `kraken-python` + `kraken-market-data` as
-inputs. The devShell puts `kraken-market-data` on `PYTHONPATH`
-(`flake.nix:71`) and imports `kraken_api`, `market_data` — but there is no
-path to `ticker_news_signals`, `kraken_funding_rates`, or
-`kraken_social_signals`, so `nix develop` cannot run their `pull` commands and
-the config-default `null` signal files stay `null`.
-
-Patch shape (additive, no bot code risk): three new `inputs`
-(`github:Cairnstew/<repo>`), each `PKG.outPath` on `PYTHONPATH` in the
-devShell like `kraken-market-data` already is (`flake.nix:71`). **Caveat:**
-`ticker-news-signals`' package build needs its overlay (`nix/gnews.nix`,
-`nix/vader-sentiment.nix`); the bot flake would have to import that overlay or
-pin a prebuilt package. Funding and social are plain `buildPythonPackage`
-and drop straight in.
-
-### 3.3 Staleness is silent; no age/asof column
-
-`merge_extra_features` (`data.py:168-171`):
-```python
-merged = signal_df.reindex(ohlc_index)
-for col in available_cols:
-    df[col] = merged[col].ffill().fillna(0.0).values
-```
-A `funding_rate`/`sentiment_score`/`fng_index` from 5 days ago is byte-identical
-to one from 5 minutes ago. Staleness-relevant facts found:
-
-- `novelty_flag` is computed **only at pull time** — `ticker-news-signals/
-  pipeline.py:159` `_is_novel(items, current)`; once written to JSONL the flag
-  never decays. The bot sees "novel today" for a week.
-- Funding is a per-moment snapshot: `kraken-funding-rates/export.py` floors
-  the timestamp to the hour on **write** (`:149-150`), and funding settles
-  ~8-hourly (`models.py:25`, `funding_rate_coefficient` default 8 = 3× daily).
-  Pulling hourly and ffill'ing 8 identical values is the current semantics.
-- Social's missing-F&G-day is `fng_index: 0` (`pipeline.py:38,136` `_FNG_MISSING=0`)
-  — the zero-fill in `data.py:171` then makes absence indistinguishable from
-  "extreme fear" (already flagged as Candidate 6).
-
-**Approach — a `signal_age_hours` column.** Two clean options, both reduce to
-per-(ticker, hour) scalar columns that flow through the existing `_SIGNAL_COLUMNS`
-allow-list:
-
-1. **Emitter-side (best provenance):** each sibling writes `fetched_at` (or a
-   per-record `age_at_pull`) next to the signal in its JSONL. `merge_extra_features`
-   then merges it like any other column and the agent/export CSV can discount
-   `age > k` rows. Minimal per-sibling change; the bot change is one allow-list
-   entry + forwarding (both copies of `_SIGNAL_COLUMNS` are already duplicated,
-   `data.py:50` + `features.py:36`).
-2. **Merge-side (zero sibling change):** in the loop above, also emit
-   `(now - merged_timestamp).total_seconds()/3600` ffilled alongside the
-   values — i.e. keep the ffilled **row timestamp** as an `asof` column and
-   let the feature pipeline convert it to `signal_age_hours`. This is the
-   pandas `merge_asof` idea in spirit without replacing the existing
-   index-based join.
-
-**Reference:** pandas `merge_asof`
-(https://pandas.pydata.org/docs/reference/api/pandas.merge_asof.html) is the
-canonical backward-asof join (each OHLCV row gets the most-recent-prior signal
-plus a distance). The repo already uses `reindex().ffill()` which is the
-index-aligned special case; adding the ffilled timestamp back as a column is
-strictly less invasive and drops the same age signal. Directionally, anything
-fancier (SQL `ASOF JOIN`) is unnecessary at one JSONL file per ticker.
-
-**Score by cost-to-protect:** the audio pitch in AUDIT.md is "scheduler +
-`signal_age_hours` so the agent can discount staleness; protects the three
-completed seams". The scheduler is copy-the-market-data-module (same module
-shape, `OnCalendar=*-*-* *:00:00`, `Persistent=true`) — near-zero new code
-with the flake-input add as the only prerequisite. The staleness column is
-~10 lines. Both together are the cheapest way to make the three seams
-trustworthy.
-
-### 3.4 Forwarding `funding_rate_prediction` / `index_price` — is it a real win?
-
-`kraken-funding-rates/models.py` `FundingSnapshot` has 12 fields; the siblings'
-JSONL carries the full `to_dict()`. `_SIGNAL_COLUMNS` currently forwards only
-`funding_rate`, `basis`, `open_interest`.
-
-- `funding_rate_prediction`: **real win, zero cost.** It is the exchange's own
-  predicted *next* funding rate — the current `funding_rate` is stale-by-design
-  (settles 8-hourly), so the prediction is plausibly the more predictive scalar
-  of the two at hour resolution. Adding it is one string in both
-  `_SIGNAL_COLUMNS` tuples. It is already written into every funding JSONL
-  record (verified in `models.py:54-65,76,108`).
-- `index_price`: **marginal.** It is the perp's spot index; for the RL
-  observation it is a dollar-denominated price level, collinear with `close`,
-  `mark_price`, and `basis` (which is already computed from index). Given
-  Candidate 1 (no z-scoring applied), feeding another dollar-scale column
-  into the raw Box adds scale-noise, not signal.
-- `bid`/`ask`/`vol24h`: not in the allow-list, and better left to the
-  microstructure recorder (Candidate 5) than bolted onto the signal seam.
-
-So the concrete win is forwarding **one** column (`funding_rate_prediction`),
-not the whole snapshot. The `_SIGNAL_COLUMNS` duplication (data.py vs features.py)
-means a widening must touch both places; there is no test locking the two in
-sync (confirmed in AUDIT §3/§5).
+The library choice is worth ~25 lines of code. **The cache/incremental seams are
+worth the entire saving** — which is the opposite of the framing in the gap
+description and is the main thing I would tell the architect.
 
 ---
 
-## CANDIDATE 4 — Fetch-layer reliability: no retry, no throttle, uncached re-fetch
+## 3. REJECTED OPTIONS AND WHY
 
-### 4.1 Maintenance status
-
-`kraken-python/transport.py` — the only transport in the family without
-retry/backoff:
-
-- `min_interval` defaults `0.0` (constructor `transport.py:108`), `KRAKEN_MIN_INTERVAL`
-  exists (`auth.py:42`) but also defaults `0.0` (`auth.py:73,104`); `_throttle`
-  (`transport.py:180-186`) is a no-op at 0.
-- `_request` (`transport.py:188-261`): `requests.RequestException` → logged +
-  re-raised immediately (`:210-219`); envelope errors → `RateLimitError`/`APIError`
-  raised immediately (`:249-250`). Timeout=30, no retry.
-- The `requests.Session` is a plain session (`:114`); no `HTTPAdapter`/`Retry`.
-
-**Contrast — the same family already ships the pattern.** Both siblings'
-clients wrap requests with retry/backoff + throttle:
-
-- `kraken-market-data/market_data/client.py` `_public`: `self._limiter.wait()`
-  (rate limiter) then `for attempt in range(max_retries+1)` with
-  `backoff_seconds(attempt, base=retry_backoff)` on `RequestException`/`ValueError`
-  (`:115-142`).
-- `kraken-funding-rates/kraken_funding_rates/client.py` `_get`: exponential
-  backoff `_RETRY_BACKOFF * 2**attempt` on HTTP 429, ≥500, and
-  `requests.RequestException` (`:70-95`), `max_retries=3`.
-
-So Candidate 4 is **not** a design problem — kraken-python's transport simply
-predates its own siblings' clients. The fix has an in-family reference.
-
-### 4.2 Callers that pay for the gap
-
-- **Engine loop** (`engine.py`): per pair per 60 s, `ticker` + `ohlc` +
-  `order_book` = 3 unthrottled public calls; no cache; `candles[-100:]`
-  re-fetched every tick and ~620 bars discarded.
-- **Paper trader** (`paper_trade.py:280-298`): `pages=2` OHLC fetch **every
-  tick**; `_build_observation` recomputes the whole window
-  (`pipeline.compute` on the full frame, `:315`); additionally
-  `merge_extra_features` re-parses each sibling JSONL **on every call**, 3×
-  per `read_ohlc_dataframe` (`data.py:328-330`), O(file) per paper tick.
-  `data.py:401-406` already carries the append+tail-read TODO.
-
-### 4.3 Approach — three layered, all reference-only
-
-1. **Retry + backoff in `transport._request`.** Minimal, dependency-free loop
-   mirroring `kraken-funding-rates/client.py:70-95`: retry on
-   `requests.RequestException`, on HTTP 429/5xx, and on `RateLimitError`, with
-   exponential backoff (base ~1 s, capped) + small jitter, `max_retries`
-   default ~3. Non-retryable: 4xx envelope errors other than 429, malformed
-   envelope, auth failures. This single change hardens **every** sibling and
-   every bot path (engine, train, backtest, paper) at once.
-   Libraries: `tenacity` and `backoff` are the two standard decorators, but both
-   are new deps; the 25-line hand-rolled loop is already proven in-repo and
-   keeps kraken-python dependency-light (it currently depends on requests +
-   python-dotenv only).
-2. **Throttle default.** Flip `min_interval` default from `0.0` to something
-   small but non-zero (e.g. `0.05`) in `transport.py:108` and/or
-   `auth.py:73,104` — or land it purely in the env default so two clients
-   sharing one key don't fight. Kraken spot REST is ~15-20 calls/s; the engine's
-   3 calls/pair/60 s is nowhere near that, but the paper trader's 2 pages/tick
-   and any `extract --all` fan-out is.
-3. **TTL cache for the 100-bar window.** A tiny `(pair, interval, since) ->
-   (candles, monotonic_ts)` map with a 60 s TTL in the engine and paper-trader
-   fetch path kills redundant re-fetches; combine with the `data.py:401-406`
-   append+tail TODO for the paper window. Standard library answer is
-   `cachetools.TTLCache` (https://cachetools.readthedocs.io/en/latest/) or a
-   5-line `time.monotonic()` dict; both are reference options, no new dep
-   strictly needed. Note `functools.lru_cache` is wrong here (no TTL, no
-   clock-based expiry).
-
-**Score by cost-to-protect:** pure code, zero sourcing; the transport fix is a
-prerequisite that makes every other fetch (Candidates 2/3 included) cadence-safe.
-The 100-bar TTL cache is independent and immediate. The paper-trader
-recompute is the biggest per-tick waste and the append+tail TODO already names
-the fix.
+1. **`requests-cache` in front of the transport** — it is a *cache*, and G3's
+   first requirement is *retry*. It also actively harms correctness here: the
+   engine's ticker and order book are live trading inputs, and a TTL cache that
+   serves a 30 s-stale book is a worse bug than the extra request. It would
+   need per-endpoint TTL policy (OHLC long, ticker zero) which is more config
+   than the thing it replaces.
+2. **Changing the shared `min_interval=0.0` default in the sibling** — silent
+   behaviour change for every consumer of a library, zero measured benefit at
+   this cadence (**F3**), and it contradicts the documented meaning of `0.0`
+   (`transport.py:181`). Fix the kwarg footgun instead (**F2**); the env var
+   already works.
+3. **A generic polling-loop framework** (APScheduler / schedule / a job runner)
+   — G3's complaint is the *cost inside* the tick, not the scheduling of ticks.
+   The tick cadence is a config value (`engine.py:36`). This would import a
+   whole lifecycle model to fix an inner-loop problem.
+4. **Byte-offset tail-read of the JSONLs** — prefix-dependent `ffill`
+   (`data.py:161-166`) means a tail read needs the pre-window value carried
+   forward as state; more state, more failure modes, for an hourly-resolution
+   file that is small. Cache-the-parsed-frame is strictly better here.
+5. **Caching at the `requests.Session` / adapter layer** — cannot express
+   "one OHLC per bar close, ticker every tick" per-endpoint without the same
+   TTL policy that killed `requests-cache`.
+6. **A `diskcache`/`cachetools` TTL dict for the JSONL frames** — works, but
+   the invalidator needed here is `(size, mtime_ns)`, which is 3 lines of
+   `path.stat()`. A dependency for that is not a trade.
+7. **Retrying `private()` order placement** — actively dangerous. Strictly
+   increasing nonces (`transport.py:169-178`) mean a retried signed POST can
+   double-place a real order after a read timeout. Out of scope for a public-
+   data bot, but it is the reason the retry must be `public()`-scoped.
+8. **Dependence on the `filelock` already in the venv** — it is a transitive of
+   torch/stable-baselines3, not declared in `pyproject.toml` or
+   `nix/default.nix`. Fine to observe; not fine to import.
 
 ---
 
-## Per-candidate reduction to shape
+## 4. SUGGESTED SLICE ORDER (if the architect picks G3)
 
-- **Candidate 3** reduces cleanly to per-(ticker, hour) scalar columns: a
-  scheduler (systemd timer, `Persistent=true`) produces/refreshes the JSONL;
-  `signal_age_hours` (and optionally `fetched_at`) is another per-hour scalar;
-  `funding_rate_prediction` joins the allow-list. All three land in the existing
-  `merge_extra_features` → `_SIGNAL_COLUMNS` → `signals` group path — no
-  architectural change, only tuple widening (both copies) + one module.
-- **Candidate 4** is per-fetch: one transport function (`_request`) gains
-  retry/backoff; one default (`min_interval`) changes; one small cache object
-  (TTL dict) at the two refetch call sites. No column shape change at all.
+1. **Seam 3** — `merge_extra_features` parsed-frame cache. ~15 lines, no dep,
+   no behaviour change, removes 3 O(file) parses per tick. Lowest risk, and it
+   exercises the `data.py` test surface that already exists.
+2. **Seam 1** — engine bar-close gate. ~20 lines, 3 calls/pair/tick → 1.
+3. **1a** — transport retry loop (sibling repo, with the `public()`-only scope
+   and the `Retry-After`/jitter rules) + its tests.
+4. **1b** — the 2-line `client_from_env` kwarg fix (closes F2) and documenting
+   `KRAKEN_MIN_INTERVAL=0.08` in the bot.
+5. **Seam 2** — paper-trader append + tail read, including the `until`
+   pass-through fix at `data.py:402-412` and a test for it.
 
-## Recommendation ranking (cost-to-protect vs the AUDIT pitch)
-
-1. **Transport retry/backoff + non-zero `min_interval` default in kraken-python**
-   — cheapest, protects every path and sibling; in-family reference exists
-   (`kraken-funding-rates/client.py`). Candidate 4 core.
-2. **Forward `funding_rate_prediction`** (one allow-list entry ×2) — zero-cost,
-   adds the exchange's next-funding estimate the current `funding_rate` lacks.
-3. **`signal_age_hours` staleness column** (merge-side, or emitter-side
-   `fetched_at`) so ffill no longer lies — protects the three completed seams.
-4. **Flake inputs for the 3 signal siblings + market-data-style systemd
-   timer** (`OnCalendar=*-*-* *:00:00`, `Persistent=true`, `DynamicUser`,
-   `StateDirectory`) — the "scheduler half"; zero new code, requires the flake
-   inputs (news needs its gnews/vader overlay) and is the one genuinely new
-   operational surface.
-5. **TTL bar cache + paper-trader append/tail** — efficiency win, independent,
-   medium effort.
-
-`index_price` forwarding is **not recommended** (collinear dollar-scale
-column; interacts badly with open Candidate 1 normalization). `tenacity`/
-`backoff`/`cachetools` are cited as library references; the in-repo hand-rolled
-patterns are preferred over new deps.
+Steps 1-2 are entirely inside this repo and are independently shippable.
+Steps 3-4 are in the sibling `kraken-python` and need a flake-input bump.
 
 RESEARCH COMPLETE

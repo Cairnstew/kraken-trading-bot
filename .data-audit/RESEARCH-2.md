@@ -1,334 +1,441 @@
-# RESEARCH-2 — Market-data depth & clean splits for the RL pipeline (AUDIT Candidate 2)
+# RESEARCH-2 — G2: pin and guard the fitted feature width at load
 
-Date: 2026-09-30. Fresh audit pass (begins a new 720-cap / absent-store state).
-Researcher: researcher-2, audit-pipeline team. Read-only pass; findings only.
+Read-only research pass (2026-09-30, tree `17899e1`, working tree clean).
+Gap owner: **G2** (`AUDIT.md:149-171`, ranked candidate 2 at `AUDIT.md:300-308`).
+No code changed; no commit. This file is the handoff artifact.
 
-**Gap (AUDIT Candidate 2, market-data depth):** Kraken REST OHLC caps at ~720
-recent bars/call regardless of `since` (≈30 d at 1 h, ≈12 h at 1 m), so the
-single-call live path is ~30 d and even `pages=6` paging collapse at ~720 bars
-(empirically re-proven at `--pages 21` → 721 bars). The fixes already exist as
-*parts* — a store seam (`market_data_store:`) + a Binance-archive seeder
-sibling (`kraken-deep-history`) — but the store root does not exist on disk and
-the training/backtest readers never pass `since`/`until` to the store, so deep
-history is unreachable and train/eval splits are not sliceable today.
-
-Everything below was verified against the code on disk (uncommitted working
-tree) and against the exchange/archive APIs on 2026-09-30 (probes noted inline).
+All claims below marked **[verified]** were executed against the installed
+`.venv` (python 3.14.7, numpy 2.5.3, pandas 3.0.6, gymnasium 1.3.0,
+stable-baselines3 2.9.0, torch 2.14.0+cu130) rather than inferred.
 
 ---
 
-## 0. The reduction target (what every candidate must produce)
+## 0. Headline: two corrections to the gap's premise
 
-`read_ohlc_dataframe` → `MarketDataStore.read(pair, interval, since, until)` ->
-pandas DataFrame with a UTC `DatetimeIndex` named `time` and columns
-`time, open, high, low, close, vwap, volume, count` (prices float at the
-boundary; `time`/`count` int; since inclusive / until exclusive; month-sliced
-parquet at `{root}/{PAIR_ID}/{interval_min}/{YYYY-MM}.parquet` + `_meta.json`
-cursor). `upsert(pair, interval, candles)` takes Candle-like rows and dedupes on
-`time` keep-last (so re-polls overwrite the still-forming bar). The store is
-**venue-agnostic**: `OHLC_INTERVALS = (1,5,15,30,60,240,1440,10080,21600)` is the
-only interval gate, and the bot never sees the venue.
+### 0.1 The `feature_names` persistence the audit asks for **already exists**
 
-So every candidate reduces to: an OHLC(P) series → per-(ticker, bar-bucket-start)
-rows in that 8-column schema → `upsert_csv`/`upsert_jsonl` (bulk backfill) or a
-`store.update(source=...)` duck-typed live source
-(`ohlc(pair, interval, since) -> (candles, last)`).
+`AUDIT.md:157-159` and `§4 #2` ask to "persist `n_features` / the fitted
+feature-name vector (e.g. an ordered `feature_names` array alongside
+mean/std in the npz)". That array is already written and read:
 
----
+- `NormalizationStats.feature_names` field — `features.py:59`
+- written into the npz — `features.py:78` (`feature_names=np.asarray(self.feature_names)`,
+  `'U'` dtype, `allow_pickle=False` on read at `features.py:100`)
+- read back and rehydrated — `features.py:101,105,106`
 
-## 1. The 720-cap: verified from Kraken's own spec (not folklore)
+**[verified]** `np.load(..., allow_pickle=False)` works, so the array is
+pickle-free and safe. `tests/test_rl_environment.py:218-235` already
+round-trips it and asserts `stats2.feature_names == stats.feature_names`.
 
-Kraken's OpenAPI spec for `GET /0/public/OHLC` (fetched today) reads verbatim:
+**So the remaining work is an *assertion*, not a format change.** The npz
+carries the ground-truth ordered column vector; nothing ever compares it
+to what the live pipeline computes. That makes G2 far cheaper than the
+audit frames it — no migration, no format bump, no retrain (models/ is
+empty; `AUDIT.md:381`).
 
-> "Returns up to 720 of the most recent entries (older data cannot be
-> retrieved, regardless of the value of `since`)."
+### 0.2 The `paper_trade` guard the audit credits is **tautological** for this threat
 
-And the `interval` enum is exactly `1, 5, 15, 30, 60, 240, 1440, 10080, 21600`
-— **bit-for-bit the store's `OHLC_INTERVALS`**, so every store interval has a 720
-bar/call ceiling = 30 d at 1 h, 12 h at 1 m, 5 d at 5 m. Paging (`pages=N`) does
-**not** extend depth: the exchange re-returns the same recent ~720 window; the
-DEEP-TEST run trained on 721 bars at `--pages 21`. This makes Kraken a
-*forward-poll* venue (append the tail every poll) and never a *backfill* venue.
+`AUDIT.md:154-155` and `§4 #2` rest the recommendation on "the paper trader
+guards observation width (`paper_trade.py:325-338`) but backtest does not".
+The guard exists, but **it cannot fire on the drift it was written for**,
+because both sides of its comparison are produced by the *same* dropping
+function:
 
-There is **no** official Kraken spot-OHLC archive dump (futures CSV
-downloads exist but are a different instrument family).
+- `expected` = `self.env.observation_space.shape[0]` — the env builds its
+  space from `self._feature_matrix.shape[1]` (`environment.py:194-196`),
+  and `_feature_matrix` comes from `_raw_feature_array()`
+  (`environment.py:445-464`), which applies **`stats.normalize(filled)`**.
+- `actual` = `_build_observation` (`paper_trade.py:320-323`), which applies
+  **`stats.normalize(features)`**.
 
----
+`NormalizationStats.normalize` iterates `self.feature_names` and silently
+`continue`s on a missing column (`features.py:122-124`). A stale 49-name
+npz therefore produces 49 columns on *both* sides of the comparison.
 
-## 2. Store seam: `since`/`until` ARE plumbed into `store.read` — but no caller supplies them
-
-Precise state of the read path (verified line-by-line):
-
-- `read_ohlc_dataframe` **does** forward both bounds to the store:
-  `df = store.read(pair, interval, since=since, until=until)` (`data.py:459`).
-- But the **four production call sites** all omit them, so they always ask for
-  the whole store (or the live ≤720 tail when unseeded):
-  - `train_ticker` — `train.py:185-194`
-  - `backtest_model(data=None)` — `backtest.py:138-147`
-  - `PaperTrader._fetch_data` — `paper_trade.py:289-298`
-  - `export` — `export.py:159-167`
-- Nothing in `configs/default.yaml` (or `build_train_config`) carries
-  `since`/`until`; the documented adapter to-dos (honour since/until from
-  config; drive walk-forward via the currently-unused
-  `TradingEnvironment.reset(options=...)` at `environment.py:211-221`) are exactly
-  the clean-split work this pass scopes.
-
-**Source of the audit's phrasing "never passes since/until":** true at the
-config/call-chain level, not in `read_ohlc_dataframe` itself. The kwargs are
-plumbed and unit-tested (`tests/test_rl_data_store.py:170-182`); the config
-chain just never populates them.
-
-### Clean-split support is already IN the store read
-`MarketDataStore.read` does **month partition pruning**: `months_between(since,
-until)` (`store.py:168`, `utils.py:94-109`) builds the exact `YYYY-MM` key set,
-so a read touches only the parquet files in `[since, until)` and then filters
-rows (`store.py:180-184`). A train window and eval window are thereby disjoint
-*by construction* with zero cross-listen. This is the month-sliced key design
-that makes "sliceable splits" a config/CLI problem, not a store problem.
-
-### The look-ahead trap for splits (shared with Candidate 1)
-`prepare_episode` (`data.py:547`) calls `features.fit(df)` on the **full**
-frame, then slices `df.tail(episode_bars)` (`data.py:554-557`) — normalization
-stats therefore leak the held-out future. A cleaned split must **fit on the
-train slice only**, then read/transform the eval slice separately. The seeded
-store makes that a two-line read change (read train window → fit → read eval
-window), and it doubles as part of the Candidate-1 fix.
-
----
-
-## 3. Candidate inventory (scored: depth / keyless / maintenance / store-fit / clean-split × exercise)
-
-### B1 — Binance public data archive (`data.binance.vision`) — **PRIMARY (already shipped as `kraken-deep-history`)**
-- **Maintenance:** official Binance bucket + helper repo (MIT); the archive is
-  actively corrected retroactively — there is an exhaustive `updates/`
-  changelog (e.g. 2022-08-08 kline corrections). One-time seeds can miss
-  later corrections; re-verify periodically.
-- **License:** data under Binance's public-data terms (free; redistribution
-  allowed for backup/cache); helper repo MIT.
-- **Auth:** keyless (S3-style GET, no key, no login).
-- **Rate limits:** effectively none for file GETs (CDN-backed; don't hammer). A
-  5-year 1 h seed ≈ 60 monthly ZIPs, a few hundred MB total.
-- **Output shape:** monthly (and daily) kline ZIPs per `(symbol, timeframe)`.
-  All spot intervals: `1s,1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1mo`
-  (confirmed from the helper README today). CSV row = `open_time, O, H, L, C,
-  volume, close_time, quote_vol, n_trades, taker_buy_base, taker_buy_quote,
-  ignore`; `open_time` is **milliseconds before 2025-01-01, microseconds from
-  2025-01-01** (confirmed today). Has `n_trades` (= store `count`), no `vwap`
-  (derive `quote_vol/volume`).
-- **Depth (probed live today):** `ETHUSDT-1m-2017-08` and `BTCUSDT-1m-2017-08`
-  ZIPs return HTTP 200 → **~9 years to listing**; `SOLUSDT` from 2020-08,
-  `XRPUSDT` from 2018-08, `DOGEUSDT` from 2019-07 (all 200). 1 h ≈ 744
-  bars/month → ETHUSDT ≈ 84 k bars since 2017-08; 1 m ≈ 44.6 k rows/month →
-  ≈4.5 M bars over 9 years.
-- **Reduction:** already built. `kraken-deep-history` download→unzip→parse
-  (ms/µs→epoch-s, ticker map `ETH/USD→ETHUSDT` etc.)→store schema→
-  `MarketDataStore.upsert_csv` (market-data mode) or store-shaped fallback CSVs;
-  `set_cursor` then `verify`. Tick-map is *explicit and refuse-unknown*
-  (`DOGE/USD` unmapped). Zero new adapter code in the bot.
-- **Gap-fill / continuity (observed, real):** not a filled source. A 5.75-year
-  live seed found **14 genuinely-absent 1 h bars across 7 runs in 2021/2023**
-  (upstream archive absences, verified against raw ZIPs) and **two zero-volume
-  bars** (2021-02-11, 2023-03-24). The zero-volume bars are the one hard crash:
-  `volume.pct_change()` → `inf` → PPO `NaN logits` at step 1, surfaced only at
-  multi-year depth; recorded follow-up is "treat non-finite like NaN" in both
-  observation constructors.
-- **Scores:** depth 5 · keyless 5 · maintenance 4 (retro corrections, upstream
-  gaps) · store-fit 5 (ships its own seam) · clean-split 5 (arbitrary
-  [since, until) windows, month-pruned). **Depth-per-effort: maximal — the
-  machinery exists and has simply never populated a bot-visible store.**
-
-### B2 — Binance REST `GET /api/v3/klines` (or via ccxt) — the live/forward leg
-- **Maintenance:** official binance-spot-api-docs, active.
-- **Auth:** keyless for public klines. **Rate:** public weight limits; ~1000
-  bars/call with `startTime`+`endTime` pagination (full history reachable), a
-  few thousand calls/min budget — fine as a poller, heavy as a 5-year 1 m
-  backfill (~2600 calls).
-- **Output shape:** same kline fields as B1 (12-array rows).
-- **Reduction:** the store's `update(source=...)` duck-type is the intended
-  socket — a thin `ohlc(pair, interval, since) -> (candles, last)` wrapper over
-  `fetch_ohlcv` makes the existing poller venue-agnostic. This is the natural
-  **live** leg (paper-mode tail pinning) beside the B1 backfill; it does not
-  replace B1 for deep one-shot seeding.
-- **Scores:** depth 5 · keyless 5 · maintenance 5 · store-fit 5 (drop-in update
-  source) · clean-split 5. Effort 2-3 for the wrapper if ever built; **low
-  priority while the B1 seed path is unused.**
-
-### K1 — Kraken's own REST (the status quo)
-- **Maintenance/license/auth:** Kraken public API, keyless. **Rate:** the
-  720/call cap (verified §1) plus the bot's transport has no retry/backoff
-  (Candidate 4).
-- **Role:** the store's own poller is the *correct* Kraken use — forward
-  accumulate ~720 bars per `update` every 30 s (`nix/module.nix` systemd timer
-  `OnCalendar=*-*-* *:*:30`, `StateDirectory`+`DynamicUser`, keyless). Kraken is
-  not a depth source. **Scores: depth 1** — replaced-by, not a competitor.
-
-### CB1 — Coinbase Exchange `GET /products/{product_id}/candles`
-- **Maintenance:** official Coinbase Exchange REST docs, active.
-- **Auth:** keyless public candles. **Rate:** public keyless limits; **max 300
-  candles/request** (official), `start`/`end` pagination therefore mandatory;
-  granularity restricted to `{60,300,900,3600,21600,86400}` — **no 15/30/240**
-  so it maps onto the store's interval set only partially (1,5,60,1440 exist;
-  15,30,240,10080,21600 do not).
-- **Output shape:** `[time, low, high, open, close, volume]` — no vwap, no
-  count. Official warning: "Historical rate data may be incomplete. No data is
-  published for intervals where there are no ticks" → **gap-prone** for thinner
-  products.
-- **Depth:** reachable by pagination (300/call) but poor depth-per-effort: a
-  5-year 1 h window ≈ 43.8 k bars ≈ **147 calls** (vs 1 GET/month ZIP from
-  Binance); 1 m ≈ 2.6 M bars ≈ **8760 calls**. Different venue/instrument family
-  (ETH-USD, not USD⸮ class).
-- **Reduction:** same converter shape as the seeder (a mini
-  `kraken-deep-history` for Coinbase), or a live `update(source)` wrapper using
-  start/end pagination. No count/vwap improved.
-- **Scores:** depth 3 · keyless 5 · maintenance 4 · store-fit 3 (interval gaps +
-  separate converter) · clean-split 5. *Viable only if the Coinbase venue is
-  specifically wanted; strictly worse than B1 on depth-per-effort.*
-
-### CC1 — CryptoCompare (min-api) — ruled out
-Free tier caps at ~2000 bars/call and ~1000 keyed calls/day; older than ~2
-months needs the paid Data API. That is the *same clamp* as Kraken, more effort.
-**Not a depth source.** (Depth 2 · keyless 2.)
-
-### Not shortlisted (why)
-- **Bitfinex via ccxt:** deep keyless history but a separate venue family
-  (`t:ETHUSD`); would re-build the seeder for a niche venue. Prior pass scored
-  ≈21/25 as a ccxt venue; keep as a backup only.
-- **CoinGecko / Gemini:** no per-bar OHLCV depth (CoinGecko `market_chart` ≤90
-  d coarse; Gemini candles shallow).
-- **Paid archives (CoinAPI/Polygon/Tiingo/Databento):** add normalized bars and
-  guaranteed regularity, but free B1/CB1 cover the ETH-class gap; only worth it
-  for a venue/time-gap Binance lacks. CoinAPI free ≈100 OHLCV calls/day.
-- **`kurosearch` and `researcher-python` — confirmed NOT market-data-adjacent:**
-  `kurosearch` is a Rule34 image-search app (Svelte+API, `brand/`,
-  `playwright.config.ts`); `researcher-python` aggregates academic papers over
-  OpenAIRE/SemanticScholar/arXiv/Crossref. Neither is in the data-source
-  registry. Nothing to chase.
-
-**Scores table**
-
-| Candidate | depth | keyless | maint | store-fit | clean-split | depth-per-effort |
-|---|---|---|---|---|---|---|
-| **B1 Binance archive (shipped)** | 5 | 5 | 4 | 5 | 5 | **● maximal (build it exists, seed it)** |
-| B2 Binance REST / ccxt | 5 | 5 | 5 | 5 | 5 | ○ wrapper needed; live leg |
-| K1 Kraken REST (status quo) | 1 | 5 | 4 | 5 | 5 | ✗ forward-poll only |
-| CB1 Coinbase candles | 3 | 5 | 4 | 3 | 5 | ○ 300/call, interval gaps |
-| CC1 CryptoCompare min-api | 2 | 2 | 4 | 4 | 4 | ✗ same clamp, keyed |
-
----
-
-## 4. Backfill vs continuous poller; `verify` & gap-fill semantics
-
-- **`verify` EXISTS in BOTH siblings**, with the same JSON shape and exit code
-  (0 contiguous / 1 gaps): `kraken-market-data verify` (`cli.py:147-153` →
-  `store.verify`, `store.py:337-378`) and `kraken-deep-history verify`
-  (`cli.py:170-174`, plus `FallbackStoreWriter.verify`). What it checks:
-  `expected = span//step + 1` unique bars at exact `interval` regularity,
-  reporting `missing`, `first_missing_time`, `contiguous`. NaN-`vwap` rows still
-  count as present.
-- **What `verify` does NOT do:** repair or fill. It is a read-only gate. The
-  correct composition is *seed (B1) → verify (gate) → forward-accumulate
-  (K1 poller or the bot's own fetch→upsert leg on each read)*.
-- **Gap-fill semantics for an RL frame:** missing bars are **absent rows** (no
-  row at all), not NaN columns. The feature pipeline's `ffill().fillna(0)` fills
-  *column* gaps inside an existing index, not missing timestamps — so rolling
-  windows that cross an absent hour see fewer rows and emit NaN on the following
-  bar. Two concrete consequences for clean training on a seeded store:
-  1. `verify()` the elected train/eval windows before training (cheap, already
-     built).
-  2. The one *hard crash* observed is not a missing row but a present
-     zero-volume row → `volume.pct_change()` → `inf` (2021-02-11, 2023-03-24)
-     reaching PPO as NaN logits. This is a real, previously-hit blocker at
-     multi-year depth, with a recorded upstream fix ("treat non-finite like
-     NaN" in both observation constructors).
-
----
-
-## 5. Interval choice (1 m / 5 m vs 1 h) for more bars per calendar day
-
-- **Store gate:** `OHLC_INTERVALS` above; **seeder gate:**
-  `INTERVAL_TO_TIMEFRAME` maps `1,5,15,30,60,240,1440,10080` — `21600` (Kraken's
-  15-day) deliberately unmapped (Binance has no 15-day kline). So both 1 m and
-  5 m are fully supported end-to-end.
-- **Bars/calendar-day:** 1 m=1440, 5 m=288, 15 m=96, 1 h=24, 1 d=1. The RL env
-  maps **one bar = one PPO step**, so the meaningful quantity is steps-per-day:
-  10 k timesteps ≈ **416 days of 1 h**, ≈ **35 days of 5 m**, ≈ **7 days of
-  1 m**. Deeper calendar coverage per training budget wants coarser bars;
-  finer bars buy observation density per calendar day (a cheaper
-  "microstructure proxy" than a true book/trades recorder — Candidate 5's own
-  sub-point).
-- **Feature-window coupling:** `feature_windows: [1, 4, 24]` literally means
-  "1 bar, 4 bars, 24 bars" — at 1 m that day-view is only 24 minutes until the
-  windows are re-tuned (e.g. `[60, 240, 1440]` at 1 m to restore the 1 h/4 h/1 d
-  semantics). This isn't a store question; it belongs in per-run config.
-- **Data size:** measured ~3.1 MB parquet per ~50 k 1 h bars (DEEP-TEST) →
-  5 y of 1 h ≈ 44 k bars ≈ ~3 MB; 5 y of 1 m ≈ 2.6 M bars ≈ ~150-200 MB —
-  fine on disk, but `MarketDataStore.read` *concats every month file in the
-  window* (`store.py:180`), so a full-history 1 m read is the heavy tail.
-- **Recommendation:** seed **1 h** for train/eval depth; add **1 m/5 m** only
-  for the paper/live or microstructure path, preferably as a separate
-  `(pair, interval)` sub-store so bulk reads stay month-pruned. Do not mix
-  both into one unbounded `read()` unless the window is bounded.
-
----
-
-## 6. Flake input + `PYTHONPATH` wiring (how the store becomes importable in the bot dev shell)
-
-- **Today:** `flake.nix` inputs = `nixpkgs`, `kraken-python`,
-  `kraken-market-data`. The dev shell already carries the store's runtime deps
-  (`requests`, `pyarrow` in the `python.withPackages` set, `flake.nix:62-63`)
-  and prepends the sibling on the path:
-  `export PYTHONPATH="${kraken-market-data.outPath}:$PYTHONPATH"`
-  (`flake.nix:71`). That combination — pyarrow+requests present + `market_data`
-  importable — is precisely what made `market_data_store` work in the dev shell
-  when it was wired (the RUN-LOG/VALIDATION note).
-- **The missing half:** `kraken-deep-history` is **not** a flake input and not
-  on `PYTHONPATH`. In the bot dev shell `import kraken_deep_history` fails, so
-  the seeder silently falls into **fallback-CSV** mode — which the bot cannot
-  read (`MarketDataStore.read` globs `*.parquet` → 0 bars). This is the exact
-  reason the sibling README instructs running the seed "from the bot dev shell
-  with this repo on PYTHONPATH".
-- **Concrete wiring (2 small edits):**
-  1. `inputs.kraken-deep-history.url = "git+https://github.com/Cairnstew/kraken-deep-history";`
-     (any sibling-named input works; its own flake is standalone/nixpkgs-only).
-  2. `shellHook`: `export PYTHONPATH="${kraken-market-data.outPath}:${kraken-deep-history.outPath}:$PYTHONPATH"`.
-     `outPath` is the repo root; `kraken_deep_history/` is stdlib-only and
-     importable without a build, so no packaging step is needed.
-  Then from the bot dev shell: `python .../kraken-deep-history/cli.py seed
-  --ticker ETH/USD --interval 60 --from 2017-08-01 --store <bot-visible root>`
-  produces a **market-data-mode (parquet)** store the bot reads directly.
-- **Keep `market_data_store: null` as the default**; enable per-run via a config
-  copy (the shipped `configs/deep-history.example.yaml` precedent) so each
-  registered model records the store root it saw (`models/{T}/"{m}/config.yaml`).
-
----
-
-## 7. Ranked recommendations (for the Decision phase)
-
-1. **Populate a bot-visible store (highest depth-per-effort):** wire the flake +
-   `PYTHONPATH` (§6), run the `kraken-deep-history` seed once (1 h, 2017-08 /
-   listing-date → now) into a bot-visible root, `verify` it, and point a per-run
-   config at it. This unlocks ~9 years / ~84 k bars for ETHUSD vs today's ~30 d
-   — no consumer code change required for *depth* (the seam is documented,
-   tested, and gate-passed for 20-month and 5.75-year seeds).
-2. **Surface `since`/`until` + fit-on-train-slice for clean splits:** plumb
-   `since`/`until` (ISO or epoch) from config/CLI into the four read call sites
-   (§2); change `prepare_episode` to fit normalization on the **train** slice
-   only before producing eval windows (kills the Candidate-1 look-ahead leak at
-   the same time); add an optional "contiguous window" assertion that reuses
-   `store.verify` before training on a seeded window. This is a config/CLI +
-   one-function change; the store's month pruning already makes it free.
-3. **Keep Kraken as the forward poller, not a depth source:** deploy/import the
-   store's systemd poller (or run `update` manually) so the live 30-s tail
-   appends on top of seeded depth; the B2 (Binance REST/ccxt) live wrapper is a
-   low-priority nicety while the K1 poller is unimplemented on this host.
-
-**Hand-offs to the decision phase (already-evidenced fixes, not research):**
-zero-volume-bar → `inf` crash (fix at both observation constructors);
-Binance archive retro-corrections (`updates/` changelog) → re-run `verify` /
-re-seed rare windows; `DOGE/USD` unmapped in the ticker map → 3-line extension
-to seed it; the packaged-binary `rl.export` import gap is pre-existing WIP, not
-this gap.
+**[verified]** Reproduced end-to-end with the real classes (stale 49-name
+stats, drifted 58-column compute with the 9 `_SIGNAL_COLUMNS` merged):
 
 ```
+stale npz feature_names : 49
+env.observation_space   = 49   (environment.py:194-196)
+_build_observation row  = 49   (paper_trade.py:320-323)
+--> _validate_observation raises? False  (paper_trade.py:325-338)
+--> ground-truth compute width = 58 (drifted, unseen by the guard)
+```
+
+**Consequence for the plan:** the work item is *not* "port paper_trade's
+guard to backtest" — that would port a tautology into a second place. The
+guard has to be re-anchored to an independent source of truth (the npz's
+`feature_names` vs the freshly computed columns), and then the corrected
+version replaces the tautological one at **both** call sites.
+
+The existing test gives false confidence: `test_observation_width_mismatch_raises_clear_error`
+(`tests/test_rl_paper_trade.py:241-254`) monkeypatches `compute` to return
+*one column fewer*, which makes `actual < expected` — the one direction the
+tautology does not mask. The real drift direction (`actual == expected`,
+both shrunken) is untested.
+
+### 0.3 stable-baselines3 validates the space at load, and it is also blind here
+
+**[verified]** `BaseAlgorithm.load` unconditionally calls
+`check_for_correct_spaces(env, data["observation_space"], data["action_space"])`
+(`stable_baselines3/common/base_class.py`), whose body is a full `Space` `!=`
+comparison. There is no opt-out parameter in 2.9.0 (signature:
+`path, env, device, custom_objects, print_system_info, force_reset, kwargs`).
+
+```
+LOAD env=7 {}                        -> RAISED ValueError: Observation spaces do not match: Box(-inf, inf, (5,), float32) != Box(-inf, inf, (7,), float32)
+LOAD env=7 {'check_obs_space': True}  -> RAISED (same)
+LOAD env=3 {'check_obs_space': False} -> RAISED (same)
+```
+
+So the audit's "would fail either cryptically deep in SB3 or, worse,
+silently" resolves as: **it fails clearly when widths differ, and passes
+silently when the width is right but the columns are wrong** — which is
+precisely the G2 case, because the env's space is itself derived from the
+shrunken matrix. SB3 guards the *policy↔env* contract; G2 is the
+*stats↔compute* contract. They are orthogonal and must not be conflated.
+
+---
+
+## 1. RECOMMENDED DESIGN
+
+Three layers, ordered by cost-to-value. **Layer 1 is the whole fix**; 2 and 3
+are cheap add-ons that cover the cases 1 provably cannot see.
+
+```
+Layer 1  npz feature_names  vs  freshly computed columns   -> hard fail   (~15 LOC, 1 helper)
+Layer 2  config.yaml n_features vs npz feature_names      -> pre-flight  (~8 LOC, 2 seams)
+Layer 3  feature_fingerprint (config + code constants)    -> provenance  (~10 LOC, same seam)
+```
+
+### Layer 1 — the invariant, enforced inside the pipeline (covers all 4 consumers)
+
+The check belongs in `FeaturePipeline`, not in each consumer, because
+`compute()` is the single funnel every consumer passes through
+(`features.py:264-299`): `fit` (`:207`), `transform` (`:241`), the env
+(`environment.py:179-181`), the paper trader's row rebuild
+(`paper_trade.py:320`), and export (`export.py:200`).
+
+**Add the pure comparison as a method on `NormalizationStats`**
+(next to `normalize`, `features.py:108-128`):
+
+```python
+def assert_matches_frame(self, frame: pd.DataFrame, *, context: str = "") -> None:
+    """Hard-fail when the computed frame's feature set != the fitted set."""
+```
+
+* compare `set(frame.columns)` vs `set(self.feature_names)` → **hard `ValueError`**
+* compare `list(frame.columns)` vs `self.feature_names` → **log a warning only**
+
+The asymmetry is deliberate and worth stating in the docstring: `normalize`
+builds its output by iterating `self.feature_names` (`features.py:122`), so
+if the *sets* match the row is re-ordered into the *fitted* order — i.e. the
+policy still receives its trained vector. **Set mismatch is fatal; order
+mismatch is benign-but-suspicious** (in practice order only moves when
+*code* changes, not config). Do not hard-fail on order; it buys nothing and
+would block a legitimate re-order that `normalize` already absorbs.
+
+**Call it from `FeaturePipeline.compute`**, right where
+`self._last_feature_names` is set (`features.py:298`), gated so it:
+
+* fires only when stats were **loaded** (not being fitted) — otherwise
+  `fit()` (`features.py:207` → `compute`) would compare a frame against
+  stats it is in the middle of creating;
+* runs **once per pipeline instance** (a `_stats_validated: set[str]`
+  keyed by ticker, cleared by `set_stats`/`load_normalization`
+  (`features.py:308-310, 327-336`)).
+
+Cost: negligible. It runs per window compute, and the paper trader
+recomputes the whole window per 60 s tick anyway (`AUDIT.md:183-185`).
+
+Why this seam and not `normalize()`: `normalize` is the hot path (per tick,
+per transform). Raising there would be correct but fires *late* (after the
+network fetch) and cannot name the offending config keys. Keep `normalize`
+unchanged — it is a pure z-score, and its "drop" behaviour is legitimate for
+a frame that legitimately lacks an optional column. Put the assert one level
+up, in `compute`.
+
+**Bonus coverage, free:** `export.py:202-207` builds
+`pd.DataFrame(z, columns=[f"z_{name}" for name in computed.columns])` where
+`z` came from `transform` (which follows the npz names). Under a stale npz
+the two widths disagree and pandas raises a raw
+`Shape of passed values is (n, 49), indices imply (n, 58)`. Layer 1 converts
+that accidental, cryptic crash into the same clear message. It is currently
+a de-facto width assertion that nobody wrote on purpose.
+
+### Layer 2 — `n_features` provenance in `config.yaml` (pre-flight, before any fetch)
+
+**Write seam — `train.py:238-240`.** `register_model` dumps the dict it is
+handed verbatim (`registry.py:147-150`), so adding keys to `cfg` before the
+call is free and needs no `configs/default.yaml` change:
+
+```python
+features.save_normalization(ticker_key, agent.save_dir / "normalization.npz")   # train.py:238
+cfg["n_features"]   = int(env.observation_space.shape[0])                       # new
+cfg["feature_names"] = list(features.stats_for(ticker_key).feature_names)       # new (optional)
+record = register_model(ticker_id, model_name, cfg, root=models_root)           # train.py:240
+```
+
+Use `env.observation_space.shape[0]` (`environment.py:194-196`) as the
+value, not `pipeline.n_features()` — the env's space is what the policy was
+actually trained against, and `n_features()` is stateful/pinned to the last
+compute (`AUDIT.md:162-163`; `features.py:420-433`).
+
+**Surface seam — `registry.py:69-78`.** One line in `config_summary()`:
+`"n_features": self.config.get("n_features")`. Makes `kraken-trading-bot
+models` show the width next to `feature_windows`/`feature_groups`, which is
+where an operator will look.
+
+**Check seam — both loaders, immediately after `load_normalization`:**
+
+* `backtest.py:161` (`pipeline.load_normalization(ticker_key, record.normalization_path)`)
+* `paper_trade.py:187-188` (`pipeline.load_normalization(self.ticker_key, record.normalization_path)`)
+
+```python
+expected = config.get("n_features")     # may be absent for a legacy model
+if expected is not None and int(expected) != len(stats.feature_names):
+    raise ValueError(...)
+```
+
+Placed here it fires **before** the OHLC fetch in backtest
+(`backtest.py:138-147`) and before the live fetch in paper trade
+(`paper_trade.py:190-192`), so the user gets a one-line provenance error
+instead of a network round-trip's worth of latency before the same failure.
+Layer 1 is the authority (it sees the real columns); Layer 2 is the fast,
+explicit "your config.yaml was edited after training" message that names
+the keys to fix.
+
+**Absence must not crash.** A model trained before this change has no
+`n_features`. Treat absent as *unknown provenance* → `_LOGGER.warning`, and
+let Layer 1 do the real work. Otherwise this change breaks its own
+back-compat story on a repo whose `models/` is currently empty
+(`AUDIT.md:381`) but which will hold models by the time it lands.
+
+### Layer 3 — `feature_fingerprint` (config provenance hash)
+
+Layer 1 compares **names**; Layer 2 compares **count**. Neither can see a
+change where the names and count are identical but the *values* mean
+something else — the realistic case is a signal source repointed, e.g.
+`extra_features_file` repointed at a different JSONL whose
+`sentiment_score` has different units, or `ohlcv_interval_minutes` changed
+from 60 to 240 (same column names, completely different bars). That is
+ask (b) in the brief, and it is the only layer that covers it.
+
+**Hash the effective feature-computation inputs**, canonical JSON, sorted
+keys, sha256 truncated to 16 hex chars, stored as `feature_fingerprint` in
+`config.yaml` and compared at the same Layer-2 seam:
+
+```python
+def feature_fingerprint(cfg: dict) -> str:
+    payload = {
+        "feature_windows": cfg.get("feature_windows"),
+        "feature_groups":  cfg.get("feature_groups"),
+        "rsi_period": ..., "macd_fast": ..., "macd_slow": ..., "macd_signal": ...,
+        "ohlcv_interval_minutes": cfg.get("ohlcv_interval_minutes"),
+        "extra_features_file":  cfg.get("extra_features_file"),
+        "funding_features_file": cfg.get("funding_features_file"),
+        "social_features_file":  cfg.get("social_features_file"),
+        "_SIGNAL_COLUMNS": list(_SIGNAL_COLUMNS),   # code constant, features.py:35-45
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+```
+
+The `_SIGNAL_COLUMNS` line is the important one and is *not* obvious from
+the brief: `_SIGNAL_COLUMNS` is a **module constant** (`features.py:35-45`),
+not a config key, so a config-only fingerprint is structurally blind to
+someone adding `funding_rate_prediction` to the allow-list
+(`AUDIT.md:210-214`) — a change that silently widens the vector for every
+model. Hashing the code constant into the provenance is what makes a *code*
+drift visible. That also pre-empts the "make `feature_groups` provenance
+exact" item queued at `PLAN.md §4.1.2` from a different angle.
+
+Use the same discipline as Layers 1-2: mismatch → clear error naming the
+differing keys; **absent** fingerprint (legacy model) → warning, not crash.
+
+### Error-message contract (all three layers)
+
+Match the existing, already-good wording at `paper_trade.py:326-337` — it
+already names the width, the model, and the remediation. Reuse its shape
+and add the *concrete* diff, which is what makes the error actionable:
+
+```
+Feature set mismatch for ETH_USD/ppo_01: normalization.npz was fitted on
+49 features but the current feature config computes 58.
+  missing from npz (never seen by the policy): sentiment_score, article_count, ...
+  not in the current compute: (none)
+  model config.yaml says: feature_windows=[1, 4, 24], feature_groups=[price, technical, volume, microstructure, signals]
+  retrain the model, or restore the feature config it was trained with.
+```
+
+This is the one place where borrowing a library's *behaviour* rather than
+its *code* pays: pandera's error report naming missing/extra columns
+(§2, candidate 4) is the right shape and costs nothing to imitate.
+
+### Summary — where each check goes
+
+| Layer | Check | File:line | Failure |
+|---|---|---|---|
+| 1 | fitted names vs computed columns | `features.py:298` (in `compute`, via new `NormalizationStats` method beside `:108-128`) | `ValueError` |
+| 2 | `cfg["n_features"]` vs `len(stats.feature_names)` | `backtest.py:161`, `paper_trade.py:187-188` (right after `load_normalization`) | `ValueError` before any fetch |
+| 2 | record `n_features` / `feature_names` | `train.py:238-240` (before `register_model`) | — |
+| 2 | surface in `config_summary` | `registry.py:69-78` | — |
+| 3 | `feature_fingerprint` compare | same seam as Layer 2 (`backtest.py:161`, `paper_trade.py:187-188`) | `ValueError` |
+| 3 | record `feature_fingerprint` | same seam as Layer 2 write (`train.py:238-240`) | — |
+| — | **replace** the tautological guard | `paper_trade.py:325-338` | (retarget to Layer 1's numbers) |
+
+### Tests to add (match house style)
+
+Existing style to match: module-wide **real** PPO fixture under `tmp_path`
+(`tests/test_rl_paper_trade.py:99`, `tests/test_rl_training.py:322-375`),
+`pytest.raises(ValueError, match="<stable phrase>")`
+(`tests/test_rl_paper_trade.py:253`), and the "regression contract" docstring
+form (`tests/test_rl_environment.py:298-303`).
+
+1. `test_stale_npz_width_mismatch_raises` — train, then delete 9 signal
+   names from the npz (or train signal-less, backtest signal-merged);
+   assert **both** `backtest_model` and `PaperTrader._build_observation`
+   raise. *This is the test whose absence let 0.2 through.*
+2. `test_same_count_different_names_raises` — proves set-comparison beats
+   width-comparison (**[verified]** a count-preserving swap is constructible:
+   the `signals` group contributes 0 columns on the OHLC-only path,
+   `AUDIT.md:53-55`, so group membership moves the count and back again).
+3. `test_config_n_features_mismatch_raises_before_fetch` — edit `config.yaml`
+   post-train; assert a `ValueError` and that the data fetcher was never called.
+4. `test_legacy_model_without_n_features_warns_not_crashes` — back-compat.
+5. `test_fingerprint_change_detected` — repoint `extra_features_file`.
+6. `test_order_drift_is_not_fatal` — pins the benign-order nuance so a future
+   contributor does not "fix" it into a hard failure.
+7. Existing suite stays green (106 passing at `AUDIT.md:14-15`).
+
+---
+
+## 2. LIBRARY CANDIDATES — evaluated
+
+**Selection criterion (from the brief):** closest to a single-host SB3 PPO bot
+whose model dir is 3 files (`model.zip`, `normalization.npz`, `config.yaml`;
+`registry.py:4-10`), and — the decisive score — *how cheaply it reduces to a
+safe load-time assertion*. All version/license facts fetched from the PyPI
+JSON API this pass.
+
+| # | Candidate | Version | License | Wheels for this env (py3.14.7) | Integration cost | Reduces to a load-time assertion? | Verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | **MLflow** model schema | 3.16.1 | Apache-2.0 | `py3-none-any` ✔ | **59 direct deps** (incl. `gunicorn`, `Flask`, `alembic`, `docker`, `matplotlib`, `pyarrow`, `scikit-learn`, `scipy`, `skops`) + a tracking server/store | ✗ — adopting it *is* the cost; there is no way to take `ModelSignature` without the rest | **REJECT** |
+| 2 | **ONNX** input-shape check | 1.23.1 | Apache-2.0 | 5 `cp314` wheels ✔ (+ `onnxruntime` 1.30.0, 7 `cp314` ✔) | torch→ONNX export step + a **second inference path** to keep in lockstep with SB3 | ✗ — it pins only input shape/dtype, i.e. **exactly the check already proven blind in §0.3** | **REJECT** |
+| 3 | **TF SavedModel** signature | 2.21.0 | Apache-2.0 | **0 `cp314` wheels of 16** ✗ | ~600 MB dep | n/a | **REJECT — hard blocker** |
+| 4 | **pandera** DataFrame schema | 0.33.1 | MIT | `py3-none-any` ✔ | +1 dep (`pandas`/`typing-extensions`/`multimethod`/`packaging`) into a 7-dep project; a schema object to declare *and keep in sync* — the sync burden is the invariant itself | ~ — right *shape*, wrong *weight* | **REJECT dep, ADOPT its error shape** |
+| 5 | **pydantic** typed config | 2.13.5 | MIT | ✔ | +1 dep to type one `int` in a dict `yaml.safe_load` parses in 3 places | ~ | **REJECT** |
+| 6 | **safetensors** | 0.8.0 | n/a | ✔ | n/a | n/a — serialization format, not a schema checker; npz already stores the names | **REJECT** |
+| 7 | **House pattern** (std `hashlib` + typed schema tag) | stdlib | — | — | ~15 LOC, 0 deps | ✔✔ | **RECOMMEND** |
+
+**Why 1 (MLflow) is the closest *conceptually* and still wrong here.** Its
+`ModelSignature` enforces "these input columns, these dtypes" on score/load —
+which is the genuinely correct invariant, and the same one Layer 1
+implements. But MLflow's unit of work is a *registered model in a tracking
+store* with runs, versions, stages and a lineage graph. This repo's whole
+registry is `models/{TICKER}/{NAME}/` plus a `config.yaml`
+(`registry.py:4-13`), single-host, no server, no concurrency. Pulling in 59
+direct dependencies and a web server to obtain "compare a list of strings and
+raise" is a ~2-orders-of-magnitude overshoot. It is the right answer for a
+team serving many models to many consumers; it is the wrong answer for one
+bot and one host.
+
+**Why 2 (ONNX) is the most *tempting* wrong answer and must be rejected on
+evidence, not taste.** ONNX's `onnx.checker` validates the graph's input
+shapes — which sounds like exactly G2. But the only information it pins for
+an `MlpPolicy` export is input *shape* `(49,)` + dtype, and §0.3 established
+empirically that a shape-only check passes silently during the exact drift
+G2 is about. ONNX would therefore add a torch→ONNX export, a second
+inference path that can itself drift out of lockstep with the SB3 path, and
+`onnxruntime` at runtime — in exchange for a check that is provably no
+stronger than the one SB3 already performs for free.
+
+**Why 4 (pandera) is the closest *library* fit worth naming.** It is the only
+candidate whose native unit of validation is the *ordered column set of a
+DataFrame* — precisely the object that drifts. `DataFrameSchema` + ordered
+columns + a lazy error report listing missing/extra columns is the correct
+design. It loses only on weight: the guard is a comparison between two lists
+that already exist in memory (`stats.feature_names` and
+`compute(df).columns`), evaluated **once at load**, so runtime cost is
+irrelevant and the library earns nothing. Its real contribution is the
+*error-report shape*, which §1 adopts verbatim. If the project ever grows to
+validating the raw OHLC/signal frames at ingest (G3/G4 territory — per-tick
+`merge_extra_features` merges, `data.py:166`), pandera becomes worth
+revisiting; for a load-time assert it is not.
+
+**House precedent (candidate 7), so the design is not invented here:**
+`kraken-python`'s exporter already runs exactly this pattern —
+`SCHEMA_VERSION = "kraken-extract/1"` (`kraken_api/export.py:50`) stamped
+into every record by `_envelope` (`kraken_api/export.py:251-256`,
+`{"schema": SCHEMA_VERSION, "exported_at": ..., "resources": ...}`). A
+`n_features` + `feature_names` + `feature_fingerprint` triple in
+`config.yaml` is the same discipline (typed schema, stamped at write,
+checked at read) with zero new dependencies. Reuse the idiom; do not import
+a framework for it.
+
+---
+
+## 3. REJECTED OPTIONS (design space, not libraries)
+
+- **R1 — Make `normalize()` itself raise on any dropped column.** Tempting
+  (one line, catches everything). Rejected as the *primary* fix: it is the
+  per-tick hot path, it fires after the data fetch, and it cannot name the
+  offending config keys. `normalize` legitimately drops an absent optional
+  column. Keep Layer 1 in `compute` as the authority.
+- **R2 — Assert unconditionally inside `compute()`.** Would fire during
+  `fit()` (`features.py:207` → `compute`) while the stats are still being
+  created. Must be gated on "stats were loaded, not fitted" plus a
+  once-per-ticker flag.
+- **R3 — Width (`n_features`) comparison alone.** Insufficient.
+  **[verified]** same-count-different-columns is constructible: on the
+  OHLC-only path the `signals` group emits nothing (`AUDIT.md:53-55`),
+  so group membership changes the count and back. Names are the invariant;
+  width is only a fast pre-check. (Layer 2 is deliberately the *pre-flight*,
+  Layer 1 the *authority* — the ordering matters.)
+- **R4 — Treat SB3's `check_for_correct_spaces` as the fix.** Rejected, and
+  this is the one most likely to be got wrong: **[verified]** it raises
+  clearly on `(5,)` vs `(7,)` but *passes* on the real drift case
+  `(49,)` vs `(49,)`. It is a genuine, valuable, orthogonal guard — keep
+  relying on it, but it is not G2 and must not be cited as if it were.
+- **R5 — Re-fit stats on load when widths disagree (auto-heal).** Rejected:
+  it silently in-sample-normalizes at inference, which is exactly the
+  anti-pattern `features.py:229-232` documents ("fine for exploratory use but
+  not for evaluation"), and it destroys the train/infer identity contract
+  that candidate 1 established and that
+  `tests/test_rl_environment.py:298-364` pins (env obs == `transform`).
+- **R6 — Persist the fitted frame / the raw window, replay it at load.**
+  Rejected: G1 is the gap that owns recording the training window
+  (`AUDIT.md:118-147`); don't smuggle it in here, and don't make a load path
+  depend on a store that is `null` in every config today (`AUDIT.md:104`).
+- **R7 — Compare the env's `feature_names()` accessor
+  (`environment.py:355-357`) to the npz.** Rejected: `self._feature_names` is
+  set from the **pre-normalize** compute (`environment.py:180`), so it *is*
+  the drifted ground truth — which makes it a *better* signal than the
+  observation space, but it is a symptom of Layer 1 and unnecessary once
+  Layer 1 exists in `compute` (same information, later).
+
+---
+
+## 4. Bottom line
+
+G2 is **cheaper than the audit estimates** (the npz already carries
+`feature_names`; no format change, no retrain, `models/` is empty) and
+**slightly larger in one respect** (the existing `paper_trade` guard is
+tautological against this threat, so it must be re-anchored, not copied).
+The fix is one pure helper plus a one-time assertion in `FeaturePipeline.compute`,
+which buys Layer 1 coverage of *all four* consumers — train, backtest, paper,
+export — from a single seam, and converts export's accidental cryptic crash
+into a clear message as a side effect. Layers 2-3 (`n_features` +
+`feature_fingerprint` in `config.yaml`) are ~18 more lines at the two
+`load_normalization` call sites and cover the two cases names and counts
+provably cannot see.
+
+Every heavyweight candidate is rejected on measured grounds: TF is
+uninstallable on this interpreter (0 `cp314` wheels), MLflow costs 59 direct
+deps + a server, and ONNX pins precisely the shape-only information that was
+empirically shown to be blind to this drift. The house pattern
+(`kraken-extract/1` in the sibling repo) plus stdlib `hashlib` is the
+right-weight answer, and the cheapest possible reduction to a safe load-time
+assertion.
+
 RESEARCH COMPLETE
-```

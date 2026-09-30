@@ -1,255 +1,453 @@
-# RESEARCH-1 — Candidate 1: normalization.npz never shapes the observation (IMPROVE-EXISTING, data-quality)
+# RESEARCH-1 — G1: training windows un-recorded + shipped store seam un-applied
 
-Researcher: researcher-1. Gap: **Candidate 1** from AUDIT.md (2026-09-30).
-Sub-problem in scope: `prepare_episode` fits stats on the full frame before
-slicing (`data.py:534`) — the look-ahead trap.
+Researcher: researcher1, team `audit-pipeline`. Pass of 2026-09-30 (this file
+**overwrites** the prior-pass RESEARCH-1.md, which was about the normalization
+candidate — different gap, different numbering; AUDIT.md §5 flags the
+`.data-audit/` files as this pass's handoff artifacts).
 
-Method: this is an IMPROVE-EXISTING item, so I surveyed **approaches/patterns/
-reference implementations** for observation normalization in RL pipelines and
-look-ahead-safe stat fitting, and grounded everything in the actual repo code
-on disk (read: `features.py`, `environment.py`, `data.py`, `export.py`,
-`backtest.py`, `paper_trade.py`, `train.py`, `registry.py`, `agent.py`,
-`tests/test_rl_export.py`; reproduced the red test in the dev shell). No code
-was written.
+Gap in scope: **AUDIT.md §3-G1 / §4 #1** — "Training windows are not recorded;
+the shipped depth machinery is un-applied" (IMPROVE-EXISTING, data-quality).
 
----
-
-## 0. Ground truth: why the red test fails (reproduced)
-
-`tests/test_rl_export.py::test_build_export_frame_normalized_block_is_z_scored`
-fails on the current tree. Reproduction in `nix develop`:
-
-- `transform(episode)` computes z from the **raw `compute()` frame** (leading
-  NaN warmup rows present), normalized by stats that `prepare_episode` fitted
-  on the **full pre-slice frame**, then `ffill().fillna(0)`. So:
-  - warmup row 0 → `z_return_1[0] = 0.0` (raw NaN → ffill has nothing before it → 0),
-  - and the mean/std are derived from the raw column's `skipna` mean, while the
-  test re-derives mean/std from the **ffilled observed column** — a different
-  number.
-- The assertion `z == (observed − mean)/std` fails at row 0 (`0.0` vs `0.16146`)
-  and is systematically offset on every other row (e.g. `0.4760` vs `0.4766`).
-
-So the mismatch is *exactly* AUDIT's Candidate 1: stats are fitted on the raw
-NaN-warmup frame while the observation (and the test's re-derivation) is the
-ffilled frame. Three concrete defects in the repo, in severity order:
-
-1. **The transform is never applied to the observation.** The policy trains and
-   infers on `_raw_feature_array()` (`environment.py:445-448` = compute + ffill
-   + fillna(0)). `transform()` is reachable only from WIP `export.py:195`.
-   `normalization.npz` is saved (`train.py:238`), loaded (`backtest.py:161`,
-   `paper_trade.py:188`) and then **ignored for the obs vector**. Dollar-scale
-   `sma_24/ema_24/bb_upper_*/bb_lower_*/atr_*/obv*` sit beside unit-scale
-   `return_*/price_ratio_sma_*/bb_pctb_*` in a single `Box`.
-2. **Fit-frame ≠ observation-frame** (the red test). `fit()` stores mean/std of
-   the raw compute output; the observation is the ffilled matrix.
-3. **Look-ahead in fit ordering.** `prepare_episode` calls `features.fit(df)` on
-   the full frame, *then* slices the trailing episode (`data.py:547,557`). Any
-   bar in the fetched frame outside the trailing slice leaks into the stats.
-
-Reference-format note for these three: the normalization stack is *already*
-in-repo and complete (`NormalizationStats` + `fit/transform/fit_transform` +
-npz save/load + per-ticker keying + std-floor guard). The gap is **wiring and
-ordering**, not a missing library. Net dependency surface for the recommended
-fix: **zero new packages**.
+**Read-only pass.** No code changed, nothing committed. Everything below is
+grounded in files on disk: read `kraken_trading_bot/rl/{data,train,backtest,
+paper_trade,export,registry,features,environment}.py`,
+`configs/default.yaml`, `configs/deep-history.example.yaml`,
+`tests/test_rl_data_store.py`, `flake.nix`, plus the sibling repos
+`~/Projects/kraken-market-data` (README, INTEGRATION.md, `market_data/cli.py`,
+`market_data/store.py`, `nix/module.nix`, `flake.nix`) and
+`~/Projects/kraken-deep-history` (README, INTEGRATION.md,
+`kraken_deep_history/cli.py`, `flake.nix`).
 
 ---
 
-## 1. Approach A — Apply the fitted transform on the observation path (recommended)
+## 0. TL;DR
 
-Reference pattern: **Stable-Baselines3 `VecNormalize`** — the canonical RL
-answer to "policy trains on raw features of wildly different scales, and eval
-must see the same scale." Its reference elements that matter here:
+The whole gap is **three small edits plus a one-time seed**:
 
-- running mean/std stored **next to the policy**, loaded at eval, frozen with
-  `training=False` so statistics never drift or leak during evaluation;
-- a small epsilon on the std and an optional clipping range;
-- obs = affine `(x − mean)/std`, so it is losslessly invertible.
+1. **One config block** — `data_window: {since, until}` in
+   `configs/default.yaml` next to `market_data_store` (default.yaml:78-97),
+   read by the same four callers that already read `market_data_store`.
+2. **Four one-line call-site changes** — each caller passes
+   `since=cfg.get("since"), until=cfg.get("until")` (or the nested
+   `data_window.*`) into the `read_ohlc_dataframe` call it *already makes*.
+   The parameter exists (`data.py:329-341`) and is already forwarded to
+   `store.read` (`data.py:454`); only the config→caller hop is missing. The
+   explicit todo sits at `data.py:396-401`.
+3. **Provenance** — `train_ticker` writes `cfg` verbatim into
+   `models/{T}/{N}/config.yaml` via `register_model` (`train.py:241`,
+   `registry.py:145-152`). Add a `data_window:` block to `cfg` **after** the
+   frame is read, carrying the *actual* window bounds + `n_bars` + an optional
+   content hash. No registry schema change; every consumer
+   (backtest/paper/export) already reloads `record.config`.
+4. **One-time seed** — `kraken-deep-history seed` into a user-owned store
+   root, in the bot's dev shell (market-data mode), ~8 commands in §5.
 
-The bot already has the durable half (npz persisted per model, loaded by
-backtest/paper). It is missing the application half. The mapping to this code:
-
-- `environment.py`: build the obs matrix by **normalizing the already-computed
-  `_features` frame** with the ticker's `NormalizationStats` (mean/std from the
-  ffilled frame — inflate `_raw_feature_array`, don't re-call `compute`). The
-  std-floor guard (`NormalizationStats.normalize`, `features.py:127`) already
-  handles constant columns; `z` of a zero-std column is `0`.
-- `paper_trade.py:_build_observation` (`paper_trade.py:300-319`): apply the same
-  transform to the live window's last row, so live inference scale == training
-  scale. This is the exact pattern VecNormalize's eval-with-loaded-stats is for.
-- `backtest.py`: already loads npz; once the env applies stats, backtest is
-  automatically on the same scale. No backtest change needed.
-- obs-space width is unchanged (affine per-feature), so `model.zip` still loads;
-  only the *scale* changes. **`models/` is empty on disk** (AUDIT §"models/ is
-  empty"), so there are no existing policies to migrate.
-- **Cost to reduce to what the RL pipeline consumes:** trivially per-ticker,
-  per-timestamp scalar — mean/std per (ticker, feature) is already exactly the
-  `NormalizationStats` dict shape; each observation row applies it column-wise.
-
-**Cost:** ~20-30 lines across `features.py` (fit/transform convention),
-`environment.py` (obs path), `paper_trade.py` (inference row), plus the export
-docstring flip (§4). No new dependency. Downside: any *existing* trained model
-must be retrained (obs scale changes); with an empty `models/` that is moot.
+Scheduler: **`systemd.user` timer**, not the sibling's NixOS module *as it
+ships today* — the module's `ExecStart` is verifiably broken
+(`kraken-market-data market update` → `invalid choice: 'market'`) and its
+`DynamicUser` + `StateDirectory` ownership fights a `~/Projects` store root
+the bot config already points at. Details + evidence in §6.
 
 ---
 
-## 2. Approach B — Fix fit-frame + fit-ordering only (minimal green test)
+## 1. What the seam already does (so the wiring is trivial)
 
-Pattern source: **`sklearn` `StandardScaler` fit/transform split** and
-**walk-forward/scikit `TimeSeriesSplit`** — "fit the scaler on the training
-block only; transform test with the frozen fit." The Bot already implements the
-train/eval distinction via *persistence*; it applies it nowhere and fits on the
-wrong frame. Two ordering fixes, in `features.py` + `data.py`:
+`read_ohlc_dataframe(pair, interval, *, pages, manager, since, until, ...,
+market_data_store, market_data_source)` (`data.py:329-341`):
 
-1. **Fit on the ffilled observation frame, not the raw NaN frame.** Make `fit()`
-   (and `transform()`) operate on `compute → ffill → fillna(0)`, i.e. exactly
-   the matrix `_raw_feature_array` produces. Then `z_* = (observed − mean)/std`
-   is an exact affine image of the observation by construction, and the red test
-   passes *as written* (it re-derives mean/std from the ffilled observed block).
-2. **Fit on the training slice only.** In `prepare_episode`, move `features.fit`
-   after the slicing decision and fit on the returned `window` (`data.py:547-559`),
-   so the fork of the fetched frame that is never traded on never feeds the stats.
-   This is the look-ahead fix. With `episode_bars=None` (no slice) nothing
-   changes; with a slice, stats now cover exactly what the episode covers.
-   Backtest/paper continue to load the persisted npz and never refit — so the
-   only stat-fitting sites are train and export, both now slice-consistent.
+- `market_data_store is None` → pass-through to `fetch_ohlc_dataframe`
+  (`data.py:402-412`), byte-identical to today. `since` is forwarded as the
+  *first page cursor* (`data.py:314` → `_page_candles(..., since)`,
+  `data.py:218-259`).
+- store set → `_resolve_store` (`data.py:463-501`) → **fetch → upsert → read**
+  (`data.py:437-445`): pages Kraken with `pages` (bounded append leg), upserts,
+  then `store.read(pair, interval, since=since, until=until)` (`data.py:454`) — so `pages`
+  bounds only the *append*, while the *depth served* is the whole store.
+  `since` inclusive / `until` exclusive, on bar-bucket starts
+  (`store.py:147-185`).
+- Provenance of the seam is already asserted by tests:
+  `tests/test_rl_data_store.py:170-181` proves the `since`/`until` window, and
+  `:148-168` proves fetch→upsert→read ordering.
 
-**Cost:** ~10-15 lines, both files, plus one or two test adjustments. Zero new
-dependencies (all patterns already present in-tree). Closes defects 2+3 but
-**leaves defect 1** (policy still trains on raw, heteroscaled obs) — the
-conditioning win is deferred. This is the "cheapest green" option if the team
-wants CI green before touching the observation.
+So the missing hop is exactly what `data.py:396-401` says: *"honour
+`since`/`until` from config"*.
 
 ---
 
-## 3. Approach C — Robust / quantile scaling for heavy-tailed price features
+## 2. Config keys
 
-Reference implementations: `sklearn.preprocessing.RobustScaler` (median / IQR),
-`QuantileTransformer(output_distribution='normal')`, `PowerTransformer`
-(Box-Cox/Yeo-Johnson). These genuinely address the heavy tails in dollar and
-volume features (`article_count`, `stt_mention_count`, `open_interest` dwarf the
-returns).
+Add immediately after `market_data_store: null`
+(`configs/default.yaml:97`), same block in
+`configs/deep-history.example.yaml`:
 
-**The blocker:** the red test's contract is **linear** — `z = (observed − mean)/
-std`, "a faithful render of normalization.npz." RobustScaler is linear
-(median/IQR) and could satisfy a *renamed* test but not this one; Quantile and
-Power transforms are **nonlinear**, so the `z_*` block can never be expressed as
-`(x − mean)/std` and the npz format (`means`/`stds` arrays, `features.py:76-83`)
-would have to change shape (per-feature quantile maps). That is a larger format +
-test rewrite than Candidate 1 needs, for an incremental-stability gain on a
-handful of columns.
+```yaml
+# --- Training window (optional; requires market_data_store) -------------
+# Bounds for the OHLCV window this model is trained/evaluated on.
+# `since`/`until` are epoch seconds (or an ISO date — the store CLI accepts
+# both; keep epoch seconds in YAML so the recorded provenance is unambiguous).
+# `since` is INCLUSIVE, `until` is EXCLUSIVE, both on bar-bucket starts.
+# Leave both null for "the whole store" (deep-history default) or "whatever
+# the live paged fetch returns" (no store). Set `until` to freeze a window for
+# a reproducible retrain.
+data_window:
+  since: null          # e.g. 1514764800  (2018-01-01T00:00:00Z)
+  until: null          # e.g. 1751328000  (2025-07-01T00:00:00Z)
+```
 
-**Recommendation:** keep mean/std z-scoring as the baseline (matches the npz
-layout and the red test). Treat robust/quantile scaling as a *follow-up
-hardening* for the heavy-tailed signal columns, gated on the linear format being
-settled first. Median/IQR also does nothing for the look-ahead trap — any fit
-statistic is leakable the same way.
+Recommended accessor shape (one helper, four call sites, avoids two
+spellings floating around):
 
----
+```python
+def window_bounds(cfg: dict) -> tuple[int | None, int | None]:
+    """Read data_window.since/until, tolerating flat top-level keys."""
+    w = cfg.get("data_window") or {}
+    return (w.get("since"), w.get("until"))
+```
 
-## 4. The fit-frame question (raw NaN vs ffilled), and the export contract
+Tolerating flat `since:`/`until:` too is a two-line courtesy and matches how
+`extra_features_file` etc. are flat; pick **one** and document it — nested
+`data_window` is preferred because it is the block that gets *written back*
+into `config.yaml` as provenance (§4) and cannot collide with SB3/reward keys.
 
-The red test pins the convention: **fit on the ffilled observation frame.** That
-is also the semantically right target because the env hands the policy rows of
-that ffilled matrix; `z_*` must be an affine image of what the policy sees or the
-"normalized block" describes a vector nothing consumes.
-
-One statistical caveat worth the architect knowing: the ffilled frame's warmup
-rows (pre-`_first_valid_index`) carry copies of the first valid value into
-`mean`/`std`. The env never *shows* those warmup rows to the policy (`reset()`
-starts at `_start_index`), so they are a tiny dilution of the stats, not a leak —
-~30 of ~4320 rows on a 6-page fetch. The cheaper alternative ("fit on the valid
-region only") would require editing the red test to mask warmup rows; not worth
-it since the ffilled convention is what the test already encodes and what
-guarantees `z == affine(obs)`.
-
-**Export semantics flip if Approach A lands:** `export.py:24-32` currently
-documents the raw `features` block as "the agent's observation vector." Once the
-env applies stats, that block is the *pre-transform* features and the `z_*`
-block is the observation. The fix changes the docstring and the `--normalized`
-flag's meaning (it stops being opt-in "for inspection" and becomes the live obs).
-`attrs["stages"]` keys can stay.
+`market_data_store` itself needs no new key — it exists at
+`configs/default.yaml:97` and in every caller already.
 
 ---
 
-## 5. Deleting the npz machinery — concrete "what breaks" map
+## 3. Caller changes (exact sites)
 
-If the team instead decides the normalization stack is worthless (not
-recommended — it is the audit's #1 observation-impacting code fix), here is the
-full blast radius, because the machinery is load-bearing beyond the z-columns:
+All four sites already call `read_ohlc_dataframe` and already pass
+`market_data_store=`; the change is adding two kwargs.
 
-| Call site | What breaks if `normalization.npz` write+read is removed |
-|---|---|
-| `backtest.py:155-161` | The `record.normalization_path is not None` guard is what decides *whether to build a config FeaturePipeline at all*. Without it, `pipeline=None` → env falls back to the **builtin 8-feature** obs (`_BUILTIN_FEATURES`) while `model.zip` was trained on **49** → SB3 `PPO.load` obs-space mismatch. Backtest must build the pipeline unconditionally from config. |
-| `paper_trade.py:187-188` | Same guard → same obs-width mismatch on live inference. |
-| `cli.py:428` | `record.is_trained()` requires `normalization_path is not None` (registry.py:82) → an npz-less model is reported "not trained" and `paper-trade` refuses to run. |
-| `registry.py:82` `is_trained()` | Semantics of "trained" collapse to "model.zip exists," or every gated command changes. |
-| `train.py:238` | Removed call; fine by itself. |
-| `export.py:195` + `test_rl_export.py:133-161` | The `--normalized` block has nothing to emit → the red test must be **deleted**, which removes the only guard the audit uses to detect this class of bug. |
-| Also affected | `tests/test_rl_environment.py:217-240` (npz roundtrip), `test_rl_training.py:275` (asserts npz after train), `test_rl_paper_trade.py:99` (fixture fabricates npz), `test_rl_cli.py:53-63,224` (mock npz in a trained fixture), README/configs/.gitignore artifact docs. |
+| file:line (current) | call | change |
+|---|---|---|
+| `kraken_trading_bot/rl/train.py:185-194` | `read_ohlc_dataframe(pair, interval=…, pages=pages, manager=manager, …, market_data_store=cfg.get("market_data_store"))` | add `since=_since, until=_until` from `window_bounds(cfg)` |
+| `kraken_trading_bot/rl/backtest.py:138-147` | same shape, `record.config` | add `since=…/until=…` from `record.config` — **this is what makes a backtest replay the model's recorded window instead of "whatever is newest"** |
+| `kraken_trading_bot/rl/paper_trade.py:289-298` (`PaperTrader._fetch_data`) | `pages=_FETCH_PAGES` (2) | **do not** forward `since` — paper wants the fresh tail. It reads the model config, so it must *ignore* `data_window.since` here, or a 2018 window starves live trading. Add a comment saying so. (Optionally honour `until` as a "paper must not see past this" cap; default off.) |
+| `kraken_trading_bot/rl/export.py:166-176` | `read_ohlc_dataframe(…)` | add `since/until` from `cfg` — export should dump exactly the frame training saw, so an exported CSV is comparable to the policy |
 
-Net: deleting is **mechanically possible but reverts the conditioning outcome the
-audit ranks first, forces obs-width logic changes in backtest/paper/CLI, and
-deletes the one regression test that catches this bug class.** The cheap,
-correct branch is fixing the wiring — not removing it.
+Two behavioural notes the implementer must not miss:
 
----
-
-## 6. Sibling repo / half-implementations
-
-- `kraken-python`: pure REST transport + paper account. Grep for
-  `zscore/normalize/scaler/standardize` finds only `watch.py`'s dict-shaped
-  ticker "normalized" — **nothing RL- or feature-related to reuse**. No
-  half-implementation exists there.
-- The bot's own `rl/` *does* contain a complete, unused half-implementation:
-  `NormalizationStats.fit/transform/fit_transform` + npz persistence are all
-  written and unit-tested (`test_normalization_stats_roundtrip`,
-  `test_normalization_stats_isolated_per_ticker`). The unfinished parts are
-  exactly the two seams this research names: (a) apply on the observation, (b)
-  fit on the right frame/slice. Confirmatory evidence: `features.fit_transform`
-  has **no callers** anywhere in the repo (grep).
+- **`since` also moves the *fetch* cursor.** In the store branch,
+  `_page_candles(pair, interval, pages, source, since)` (`data.py:437`) starts
+  paging from `since`, and `fetch_ohlc_dataframe` passes `since` the same way
+  (`data.py:314`). With Kraken, `since` in the distant past returns the *first*
+  720 bars after it, not recent ones (`store.py`/sibling README: "caps every
+  response at ~720 recent bars *regardless* of `since`" — Kraken's behaviour
+  here is that `since` selects the start of a ≤720-bar window). That is
+  harmless (it upserts old Kraken-native bars, and the read leg still returns
+  the full window) but it makes each fetch leg wasteful. The clean fix is to
+  let the read-leg window and the fetch-leg cursor be separate: keep `since`
+  on the read and pass `since=None` to `_page_candles` when a store is
+  configured. If that is judged too invasive for the slice, note it as a
+  follow-up — correctness is unaffected.
+- **The effective window ≠ the requested window.** `prepare_episode`
+  (`data.py:505-561`) slices the trailing `episode_bars` *after* the read, so
+  the frame the environment actually trades is `df.tail(episode_bars)`.
+  Provenance must record the **post-slice** bounds, not the request (§4).
 
 ---
 
-## 7. Reference implementations surveyed (maintenance/license/effort)
+## 4. Provenance: make a trained model reconstructible
 
-| Ref | Role here | Maintenance / license | Effort to consume |
-|---|---|---|---|
-| **SB3 `VecNormalize`** (already a dependency via `stable_baselines3` PPO) | Canonical save-stats-at-train / freeze-at-eval observer normalizer. MIT. Actively maintained. | Pattern-only, ~20-30 lines in env+paper. Do **not** literally wrap in VecEnv (that would add a `make_vec_env` + `vecnormalize.pkl` layer the export CSV cannot mirror). |
-| **gymnasium `NormalizeObservation`/`NormalizeReward`** | Online *running* stats wrapper. MIT, maintained. | Pattern to **avoid copying**: running stats introduce a train/eval freeze distinction the bot lacks; batch-fit-on-train-slice + persisted npz is deterministic and already the bot's shape. |
-| **PopArt** (Niculescu-Mizil & Caruana 2005; adopted in Tensorforce) | Value/target normalizer that rescales the value function online. | **Not applicable** — normalizes *return targets*, not features; reward is already scale-engineered (`pnl_scale=1e-4`). Listed for completeness only. |
-| **`sklearn` StandardScaler / TimeSeriesSplit** | "Fit on train fold only, transform test" walk-forward pattern. BSD-3, maintained. | The exact leak-free idiom for `prepare_episode` (slice first, then fit). Zero new dependency (bot already uses sklearn? — check; nothing new required regardless). |
-| **`sklearn` RobustScaler / QuantileTransformer / PowerTransformer** | Heavy-tail alternatives to mean/std. BSD-3. | Follow-up hardening only; nonlinear variants break the npz format and the red test's linear contract. |
-| **mlfinlab / Lopez de Prado purged splits** | Purging/embargo for cross-validation leakage. | Overkill here: single train window + persisted stats, no overlapping-label CV. The pattern to lift is only "never fit on the held-out tail." |
+`train_ticker` persists `cfg` verbatim (`train.py:241` →
+`register_model` → `registry.py:145-152` `yaml.safe_dump`). So provenance is
+"put a block in `cfg` after the frame exists, before `register_model`" — no
+registry change, and backtest/paper/export already reload `record.config`
+(`backtest.py:134`, `paper_trade.py:295`, `registry.scan_model`).
 
-## 8. Scoring (cheapness of the red-test fix × look-ahead closure)
+Insert between `prepare_episode` and the `register_model` call
+(`train.py:241`):
 
-| Option | Red test → green | Look-ahead closed | Conditioning win | New deps | Effort |
-|---|---|---|---|---|---|
-| **A. Apply transform on obs + fit on ffilled + fit on slice (full)** | ✅ (fits contract; z == affine of obs, now the real obs) | ✅ | ✅ recipes: put the persisted stats on all three obs paths (train env, backtest env, paper inference) and keep export/npz as the faithful render. | none | ~1-1.5 d |
-| **B. Fit-frame + fit-ordering only** | ✅ as-written | ✅ | ❌ (policy still consumes raw scale) | none | ~0.5 d |
-| C. Robust/quantile scaling first | ❌ breaks contract/npz format | neut | would need format change | needs decision | follow-up |
-| D. Delete npz machinery | ❌ must delete the test | ✅ (no stats to leak) | ❌ (reverts the #1 fix) | none | ~1 d but reverts value |
-| E. VecNormalize wrapper (literal) | ❌ disjoint from export CSV | ❌ (needs train/eval freeze) | ✅ | none (in stack) | — |
+```python
+    # provenance: the window this policy was actually fitted on
+    win = episode_df.index  # UTC DatetimeIndex == bar-bucket starts
+    cfg["data_window"] = {
+        "since": cfg.get("data_window", {}).get("since"),
+        "until": cfg.get("data_window", {}).get("until"),
+        "actual_start": int(win[0].timestamp()),
+        "actual_end": int(win[-1].timestamp()) + interval * 60,  # end-exclusive
+        "n_bars": int(len(win)),
+        "interval_minutes": interval,
+        "store": cfg.get("market_data_store"),
+        "source": "store" if cfg.get("market_data_store") else "kraken_rest_live",
+        "data_hash": _frame_hash(episode_df),   # optional, see below
+    }
+```
+
+Field rationale:
+
+- `actual_start` / `actual_end` / `n_bars` — **the** answer to "what bars did
+  this model see". `actual_end` is made end-exclusive so it round-trips
+  straight back into `read_ohlc_dataframe(until=…)`.
+- `interval_minutes` — without it the bounds are meaningless.
+- `source` — `store` vs live. A live-fetch model is *not* reproducible even
+  with bounds, and the field should say so.
+- `store` — the store root, so a replay resolves to the same bytes.
+- `data_hash` — cheap, deterministic, stdlib-only:
+
+```python
+import hashlib
+def _frame_hash(df) -> str:
+    h = hashlib.sha256()
+    h.update(pd.util.hash_pandas_object(df[["time","open","high","low","close","volume"]],
+                                        index=False).values.tobytes())
+    return h.hexdigest()[:16]
+```
+
+`pd.util.hash_pandas_object` is already available (pandas is a hard dep) and
+is stable for a fixed dtypes/column set — which is why the column allow-list
+is explicit. **Caveat to state in the docstring**: it is a *change-detector*,
+not a provenance identity — re-reading the same store into a different month
+slice with a different float parse would change it. That is precisely the
+property wanted: "the fitted stats came from these exact values".
+
+Follow-on the audit already flagged (out of this slice's scope, listed so the
+implementer does not conflate): `n_features` pin (PLAN.md §4.1.1) and the
+`normalization.npz` width guard — that is **G2**, a separate candidate.
 
 ---
 
-## 9. Recommendations (top 3, for the Decision phase)
+## 5. Seed-and-refresh procedure (exact commands)
 
-1. **Do Approach A (full wiring).** Make `features.fit`/`transform` operate on
-   the **ffilled observation frame**, have `prepare_episode` **slice first then
-   fit on the slice**, and apply the ticker's fitted stats on the observation in
-   `environment._observe`/`_raw_feature_array` and
-   `paper_trade._build_observation`. Zero new dependencies (SB3 already present);
-   the red test passes as-written and becomes a true contract (z_* == the
-   policy's observation); `models/` being empty means no retrain burden. This is
-   the audit's Candidate-1 fix in full.
-2. **If scope is clamped to CI-green only, do Approach B** (fit-frame + slice
-   ordering, ~0.5 d). Green test, look-ahead closed; the observation-application
-   is left as an explicit follow-up so the conditioning win is not silently lost.
-3. **Do not delete the npz stack.** Deleting breaks `is_trained()`, the
-   backtest/paper obs-width guard, and the CLI gate, and removes the one
-   regression test for this bug class — while forfeiting the audit's
-   highest-ranked fix. Keep the linear mean/std npz format; defer robust/quantile
-   scaling of the heavy-tailed signal columns to a later pass.
+Prerequisites: the store root the bot config points at must be
+**market-data mode** (parquet + `_meta.json`), i.e. `market_data` *and*
+pyarrow importable — `kraken-deep-history` README §"Market-data mode is the
+bot-facing mode" is explicit that fallback-CSV mode yields **0 bars** to the
+bot. The bot's own dev shell satisfies this (`flake.nix:58-64` puts pandas,
+pyarrow, requests on PATH and `market_data` on `PYTHONPATH`).
 
-RESEARCH COMPLETE
+### 5a. One-time seed (years of history, Binance archive, keyless)
+
+```bash
+# Dry run first — prints the monthly ZIP URLs, no network.
+nix develop ~/Projects/kraken-trading-bot --command bash -c \
+  'PYTHONPATH=$HOME/Projects/kraken-deep-history:$PYTHONPATH \
+   python ~/Projects/kraken-deep-history/cli.py plan \
+     --ticker ETH/USD --interval 60 --from 2018-01-01'
+
+# Seed. --store is the root the bot's config will name.
+nix develop ~/Projects/kraken-trading-bot --command bash -c \
+  'PYTHONPATH=$HOME/Projects/kraken-deep-history:$PYTHONPATH \
+   python ~/Projects/kraken-deep-history/cli.py seed \
+     --ticker ETH/USD --interval 60 --from 2018-01-01 \
+     --store $HOME/Projects/kraken-market-data/store'
+
+# Prove it landed in *market-data* mode: report.store_mode must be
+# "market-data" (not "fallback-csv"), and files must be *.parquet.
+ls $HOME/Projects/kraken-market-data/store/ETH_USD/60/ | head
+ls $HOME/Projects/kraken-market-data/store/_meta.json
+
+# Gap-scan + per-source summary (exit 1 = holes).
+nix develop ~/Projects/kraken-trading-bot --command bash -c \
+  'PYTHONPATH=$HOME/Projects/kraken-deep-history:$PYTHONPATH \
+   python ~/Projects/kraken-deep-history/cli.py verify \
+     --ticker ETH/USD --interval 60 --store $HOME/Projects/kraken-market-data/store'
+nix develop ~/Projects/kraken-trading-bot --command bash -c \
+  'python ~/Projects/kraken-market-data/cli.py stats --store $HOME/Projects/kraken-market-data/store'
+```
+
+Mapped tickers (seeder refuses unknowns — `kraken_deep_history/utils.py`
+`TICKER_SYMBOL_MAP`): `ETH/USD`, `BTC/USD`, `SOL/USD`, `XRP/USD` (*USDT spot
+family). `DOGE/USD` is **not** mapped. Intervals: 1/5/15/30/60/240/1440/10080.
+
+### 5b. Forward refresh (only if you want bars *newer* than the last seed)
+
+```bash
+cd ~/Projects/kraken-market-data
+nix develop --command python cli.py update --pair ETH/USD --interval 60 \
+  --store ~/Projects/kraken-market-data/store
+```
+
+`update` is the since-cursor poller: appends incremental bars and persists the
+cursor to `_meta.json` (`store.py:257-296`, `market_data/cli.py:63-68`). It
+also honours `--min-interval` (default env/`0.5`s) and exponential backoff —
+this is the *good* transport; the bot's `kraken-python` transport is the
+un-backed-off one (AUDIT G3). A few hourly runs close the gap; a timer makes it
+automatic (§6).
+
+Note: with a store configured, `paper_trade` already appends on every tick
+(`data.py:437-445`), so the forward-refresh timer is only needed when
+paper-trading is *not* running.
+
+### 5c. Turn it on for a model
+
+```bash
+cp configs/deep-history.example.yaml models/ETH_USD/ppo_eth_01/config.yaml
+# then edit: market_data_store: ~/Projects/kraken-market-data/store
+#            data_window: {since: 1514764800, until: null}
+```
+
+Verify the depth actually changed before trusting it:
+
+```bash
+python -c "
+from kraken_trading_bot.rl.data import read_ohlc_dataframe
+df = read_ohlc_dataframe('ETH/USD', 60, pages=6,
+                         market_data_store='$HOME/Projects/kraken-market-data/store')
+print(len(df), df.index[0], df.index[-1])"
+```
+
+Expect tens of thousands of bars, not 4320. If it prints ~720 or 0, the store
+is in fallback-CSV mode or the root is wrong.
+
+---
+
+## 6. Scheduler recommendation — `systemd.user` timer (ONE)
+
+**Recommend: a `systemd.user` timer** (in the user's nixos-config, `linger`
+enabled) running §5b's `update` command against the `~/Projects` store root.
+
+Why not the sibling's NixOS module (`services.kraken-market-data`,
+`kraken-market-data/nix/module.nix`), which is otherwise the obvious answer —
+two verified blockers:
+
+1. **Its `ExecStart` is broken.** `nix/module.nix` builds
+   `${cfg.package}/bin/kraken-market-data market update --pair … --interval … --store …`,
+   but `market_data/cli.py:61-101` registers the subcommands *directly*
+   (`update`, `backfill`, `verify`, `stats`, `list`, `extract`, `version`) — there
+   is no `market` group. Verified by running it:
+   ```
+   $ python cli.py market update --pair ETH/USD --interval 60 --store /tmp/x
+   kraken-market-data: error: argument command: invalid choice: 'market'
+     (choose from 'update', 'backfill', 'verify', 'stats', 'list', 'extract', 'version')
+   ```
+   The unit fails at every fire; `nix/checks.nix` asserts unit *shape*, not that
+   the packaged CLI parses that argv, so `nix flake check` stays green.
+2. **Ownership mismatch.** The module hard-codes
+   `DynamicUser = true` + `StateDirectory = "kraken-market-data"`
+   (`nix/module.nix` `serviceConfig`), i.e. a dynamically-uid-owned
+   `/var/lib/kraken-market-data`. The bot runs as a normal user and reads a
+   `~/Projects/kraken-market-data/store` root today (that is what every config
+   comment and `configs/deep-history.example.yaml:12-14` point at). System-level
+   state means either `User =`/`DynamicUser = false` + group permissions, or the
+   bot config moves to `/var/lib` — extra moving parts for zero benefit at this
+   scale.
+
+Why `systemd.user` wins:
+
+- Same properties that make the module attractive, without either blocker:
+  `Persistent = true` (catches up after suspend), declarative
+  `OnCalendar`, per-pair services if wanted, journald receives the store's
+  structured JSON logs (`market_data/logging_config.py`).
+- The store root stays user-owned, so the bot reads it with no permission
+  story and no `/var/lib` migration.
+- Zero edits to the sibling repo — which matters because this slice is scoped
+  to the bot.
+- `loginctl enable-linger $USER` is the only extra step versus a system unit.
+
+Sketch (user-level, `~/.config/systemd/user/kraken-market-data.service` +
+`.timer`; `OnCalendar=*-*-* *:10,40:00` — hourly is plenty at 1 h bars; the
+module's every-30-min default is tuned for sub-hour bars):
+
+```ini
+# .timer
+[Timer]
+OnCalendar=*-*-* *:10,40:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+
+# .service
+[Service]
+Type=oneshot
+ExecStart=/home/seanc/Projects/kraken-market-data/.venv/bin/python \
+  /home/seanc/Projects/kraken-market-data/cli.py update \
+  --pair ETH/USD --interval 60 --store /home/seanc/Projects/kraken-market-data/store
+```
+
+Using the checked-out `.venv` (the sibling has one) avoids a `nix develop`
+eval/build check on every fire; the store's flake also works
+(`nix develop --command python cli.py update …`) if a hermetic path is
+preferred.
+
+**Rejected alternatives for the scheduler:**
+
+- **Plain cron** — same command, but no `Persistent` catch-up, coarser logging,
+  and it will not be picked up by the host config's rebuilds. Strictly worse
+  than `systemd.user` here.
+- **`nix develop --command …` on a timer** — correct but re-enters the flake
+  eval/store-path machinery every fire for a command whose deps are already
+  realised in a local venv.
+- **The NixOS module (fixed)** — the right *eventual* home (system-level state,
+  `DynamicUser` for a keyless poller, per-(pair, interval) units). Worth a
+  two-line upstream fix (`market_data/cli.py` — add a `market` alias group, or
+  fix `ExecStart`) plus an ownership story, but it belongs to the sibling repo
+  and to a later pass, not to G1.
+- **No timer at all** — legitimately correct for the *first* model: a seeded
+  store plus a fixed `data_window.since`/`until` makes training reproducible
+  without any scheduler. The timer only buys *fresh* bars. If the slice is
+  time-boxed, ship the config+provenance wiring and the one-time seed, and file
+  the timer as the operational follow-up.
+
+---
+
+## 7. Library / pattern survey (the "research-grade data" part of G1)
+
+Scored on **reduction cost**: how much code stands between the candidate and
+the thing the RL pipeline consumes — a pandas frame of per-(ticker,
+timestamp) bars with columns `time, open, high, low, close, vwap, volume,
+count`, UTC `DatetimeIndex`, sliced by `since`/`until`.
+
+| candidate | version / last release | license | auth | rate limits | output shape | reduction to per-ticker bars | verdict |
+|---|---|---|---|---|---|---|---|
+| **duckdb** | 1.5.6 (PyPI 2026-09-28); nixpkgs-unstable 1.5.5 | MIT | none | n/a (local files) | SQL over `read_parquet('store/*/*/*.parquet')` | **High for inspection, zero for training reads** — one query replaces the month-glob loop in `store.py:147-185`, ideal for `verify`/gap-scan and window previews at store scale | **Optional, defer.** The sibling README already names it as the deliberately-not-v1 verification layer. Do not put it on the training read path |
+| **stable-baselines3** | 2.9.0 (2026-06-15) | MIT | none | n/a | — | **None.** Already a dependency (`flake.nix:59`); `sb3.common.buffers.ReplayBuffer` is an in-memory transition buffer, not a pinned dataset. SB3 ships no dataset-freezing/snapshot helper — there is nothing here to borrow | **No-op.** Explicitly recorded so nobody re-surveys it: SB3 cannot supply G1's pinning |
+| **pyarrow** (+ `pandas.util.hash_pandas_object`) | pyarrow 25.0.1 (2026-08-10) | Apache-2.0 | none | n/a | `pyarrow.dataset`, `ParquetFile` metadata | **Already available** (transitive via the store; `flake.nix:61-64`) | **Adopt the idea, not a new dep.** `ParquetFile` metadata is already what `store.stats` uses (`store.py:380-410`); `pd.util.hash_pandas_object` gives the provenance hash in §4 at zero cost |
+| **ccxt** | 4.5.84 (2026-09-24, very active) | MIT | keyless for public OHLCV (optional key for higher tiers) | exchange-specific (Binance ~1200 req/min by weight; Kraken tier-based, both documented) | uniform `OHLCV` list → maps to `Candle` → `store.update(..., source=…)` duck-type (`kraken-market-data/README.md` §Extending) | **High syntactically, but it does not lift the ceiling.** Kraken's REST OHLC caps at ~720 bars regardless of `since`; a uniform client does not change the venue's REST semantics. It buys *multi-venue* (a Binance-native live leg alongside the seeded archive) | **Reject for G1.** Real value is the G4/G7 multi-venue question; note it there |
+| **d3rlpy** | active (Apache-2.0) | Apache-2.0 | none (pip) | n/a | D4RL/MDP-style offline datasets, its own learners | **Low.** It replaces the SB3 PPO agent, the registry, and the whole `RLAgent` surface — a stack replacement to solve a bookkeeping gap | **Reject** |
+| **HF `datasets` / `ml-datasets`** | active | Apache-2.0 | none for public data (token only for gated/hub pushes) | n/a | Arrow-backed `Dataset` keyed by `(ticker, time)` | **Medium technically, wrong shape operationally.** It wants a hub/dataset-builder identity and a cache dir for what is already a local month-sliced parquet tree | **Reject** |
+| **dvc / lakeFS / git-annex** | active / active | Apache-2.0 / Apache-2.0 / GPL-2.0 | none (git remote optional) | n/a | content-addressed dataset versions | **Low.** Git-based multi-GB versioning for a store whose entire footprint is a few hundred MB of parquet | **Reject — but borrow the one idea:** the reason G1 hurts is *unrecorded identity*, which a 20-line `hashlib` block fixes |
+| **zarr / h5py** | active | MIT / BSD-3 | none | n/a | chunked arrays | **Low.** Replaces a working parquet format with another one; the store's month-sliced layout is already the right shape | **Reject** |
+| **Nix-native precedent (no library)** | — | — | — | — | `nix hash path` / `nix-store --query --hash` | — | Worth a nod: the store root *can* be content-hashed with Nix tooling already present, which is the strongest form of "the bytes a model was fitted on" |
+
+**Net survey conclusion:** the research-grade reliability piece of G1 does not
+need a library. The store *is* the pinned dataset (immutable month-sliced
+parquet + a cursor sidecar); what is missing is a *recorded pointer* to a
+window of it (bounds + count + content hash) and a way to *choose* the window
+(config `since`/`until`). Both are stdlib+pandas. Every library that would
+"help" either re-implements the store, replaces the agent, or solves a
+distributed-data problem this single-host store does not have. The one
+first-class *pattern* worth adopting from outside is the offline-RL
+dataset-manifest convention — a small JSON/YAML sidecar next to the dataset
+naming the window, its size, and a checksum — which `models/{T}/{N}/config.yaml`
+already has a home for.
+
+---
+
+## 8. Short "rejected" list
+
+- **ccxt / Binance-REST as the depth source** — does not lift Kraken's
+  ~720-bar REST ceiling; only adds venue breadth (G4/G7 material).
+- **d3rlpy / any offline-RL stack** — replaces `RLAgent` + SB3 + the registry to
+  close a bookkeeping gap.
+- **HF `datasets`** — hub-shaped identity for a local-file problem.
+- **dvc / lakeFS / git-annex** — multi-GB dataset versioning; the win is a hash,
+  not a system.
+- **zarr / h5py / polars** — re-plumbing a working parquet store.
+- **The sibling NixOS module as the scheduler** — verifiably broken `ExecStart`
+  (`invalid choice: 'market'`) + `DynamicUser`/`StateDirectory` vs a
+  `~/Projects` store root. Fix upstream, migrate later; mechanical once the
+  ExecStart line is fixed.
+- **Plain cron** — dominated by `systemd.user` on `Persistent` + logs.
+- **Walking the store window with duckdb in the training path** — the month-glob
+  read is already O(months-in-window); duckdb is for inspection.
+
+---
+
+## 9. Verification hooks for whoever implements this
+
+- `tests/test_rl_data_store.py:170-181` already pins `since`/`until`
+  behaviour against a `FakeStore`; extend it to drive the **config** path —
+  assert `data_window.since` in a config dict reaches `store.read`, and that
+  `train_ticker` writes `data_window.actual_start`/`actual_end`/`n_bars` into
+  the produced `models/.../config.yaml`.
+- A regression that `paper_trade` **ignores** `data_window.since` (§3) — the
+  failure mode is silent (no fresh bars → no trades).
+- An `export-data` equivalence check: `export.py`'s frame must equal the frame
+  `train.py` read for the same config + window (both call `read_ohlc_dataframe`
+  with the same args once the seam is wired).
+- End-to-end acceptance: `read_ohlc_dataframe` with the store returns
+  materially more than `6 × 720 = 4320` bars for a mapped ticker.
+
+## RESEARCH-1 COMPLETE
