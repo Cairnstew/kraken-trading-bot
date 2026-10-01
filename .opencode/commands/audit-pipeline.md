@@ -426,6 +426,13 @@ real Kraken data, 2026-09-28); adapt the commands to the chosen outcome.
    - Store-backed train + backtest complete without error (no feature-width
      mismatch, no `NotEnoughDataError`) and the store **persists**: `stats`
      after the run shows bars ≥ seeded, `verify` still contiguous.
+   - **Magnitude evidence is mandatory** (applies to every outcome type, and
+     is the clause that catches silent defects): record **bars replayed** and
+     **trades taken**, and assert the new columns are present **by name** in
+     the observation (export CSV / trained `normalization.npz` `feature_names`
+     / the train log's feature count). A run that reports no error but replays
+     ~1 bar of 721 with 0 trades has silently failed — "completes without
+     error" is NOT sufficient. See the 2026-10-01 entry for the mechanism.
    - Store-backed backtest is **equivalent** to the baseline within training
      stochasticity (same window → |store − baseline| return within ~5 pts /
      shares the same sign; do NOT gate on exact equality — PPO with a seed is
@@ -693,6 +700,94 @@ inventory only.
     pass, an export-route Leg B is a faster consumed-proof than a live train.
   - .data-audit/ tracking note fixed in the command: artifacts ARE committed as a docs commit per
     convention; "do not commit it" was stale for two passes.
+- 2026-10-01 (later) — IMPROVE-EXISTING pass (Gap 1, activate six already-stored columns), started
+  from Phases 1–3 artifacts left UNCOMMITTED by an interrupted run and re-verified at HEAD before
+  reuse. Gate NEEDS_FIX then PASS; 6 commits pushed (`ca360a8..70e062a`), 143 -> 147 tests.
+  Lessons:
+  - **The pass's own dense fixtures hid a silent defect; the gate caught what the suite could not.**
+    143 green tests, then the gate found a one-record funding file left `spread` NaN on 720/721
+    rows (the seam zero-fills `bid`, and the micro builder does `(ask-bid)/bid.replace(0,nan)`), so
+    `_first_valid_index()` pushed the start index to 720 and backtest replayed **1 bar / 0 trades**
+    — no exception, and the width guard PASSED because it checks width, not NaN. Every fixture
+    populated funding on EVERY row, so `spread` was never NaN: the tests encoded the unproblematic
+    case, which is exactly the case the shipped hourly-timer activation does NOT produce.
+    Guidance fix applied: Phase 6 §6 now has a mandatory **magnitude clause** (bars replayed,
+    trades taken, new columns present BY NAME) and the Guardrails no longer treat "completes without
+    error" as sufficient. A run can complete cleanly and still be a fail.
+  - The fix needed **provenance, not a NaN-pattern heuristic**: with one record on the last bar,
+    `spread` is NaN on rows 0..719, byte-identical to a 720-bar rolling window's warm-up, so warm-up
+    NaN and absence NaN are not separable from the pattern and a "leading prefix" test cannot work.
+    Declaring which columns are exogenous (point-in-time by definition, no look-back, never
+    warming up) generalises to any future sparse exogenous column. Rejected and why, all worth
+    keeping: computing `spread` only where observed = fabricating 0.0; selecting the start index
+    from the filled matrix = `ffill()` is a no-op (a bar is warm for a column exactly when that
+    column has a value) and `fillna(0)` collapses the index to 0 and trains on zero-filled garbage —
+    a WORSE silent defect; changing the seam's zero-fill does not fix it and the zero is the
+    load-bearing absence sentinel shared with `signal_observed`.
+  - **A duplicated rule is how two consumers drifted**: `export.py::_warmup_mask` was a restatement
+    of `TradingEnvironment._first_valid_index` ("Mirrors ..."), which is why export claimed 720
+    warm-up rows while the environment traded 1 bar. Collapse duplicated rules into one function
+    when a defect shows the same invariant enforced twice. `proposal:` grep for "Mirrors" /
+    "see also" comments between env/export/train code paths — each is a candidate rule that can
+    drift silently.
+  - **Require the reviewer to prove a regression test is non-vacuous, as a gate criterion.** The
+    sharpest evidence was reverting ONLY the source change (not the test) in a /tmp COPY and
+    watching the new test fail with the original symptom
+    (`assert 1 > (0.9 * 721)`). Make this an explicit step for every Phase 7 fix: a test that would
+    pass without its fix proves nothing.
+  - **`git diff <commit>` ignores UNTRACKED files** — a builder's NEW files (here `systemd/*`)
+    looked deleted after `team_merge` and I nearly reported a false merge failure. The only
+    reliable equality check is per-file content: `git show <commit>:<path> | diff -q - <path>`
+    for every path in the commit. Also: a `reviewer`/`qa` teammate writing artifacts directly into
+    the lead's tree AND committing them is fine — `team_merge` refuses with "local changes to the
+    same files", and that refusal is not an error: compare per-file, then commit the lead's copy.
+  - **The harness can reassign a teammate's worktree path while its branch survives** (the builder's
+    path was replaced mid-run; `team_merge` then said "No branch to merge"). Take the commit by
+    BRANCH ref (`git checkout <commit> -- <path>` for a single file, or `git merge`) instead. The
+    branch is the reliable handle, never the directory — reinforces the 2026-09-30 entry.
+  - **`team_status` counts the stall notice itself as a "nudge"** (showed "nudged 5m ago" for
+    teammates I had never messaged, with a nudge time EARLIER than the working time). The
+    low-output-token "appears stalled" notice is therefore pure noise — it fired 5 times this run,
+    every one false, typically within a minute of spawn. Ignore it entirely; nudge on elapsed time.
+  - **DECISION figures can be a fixture artifact, not a production truth.** DECISION's gate "55" was
+    the width of a synthetic test frame carrying exactly the six new columns. Because every builder
+    is presence-gated the real width is dynamic: 49 (no vwap/count, no funding) / 52 (vwap/count, no
+    funding) / 60 (funding present) — 52->60 is +8, not +6, because turning on
+    `funding_features_file` also switches on the columns already on the allow-list
+    (`funding_rate`, `basis`, `open_interest`) plus the freshness pair. Ask the architect for the
+    width **per configuration**, and have the README state the range rather than one number.
+  - I repeated the `depends_on` mistake from the 2026-10-01 entry verbatim: wrote placeholder
+    strings (`__SCAFFOLD__`) into `depends_on` instead of the IDs from the same `team_tasks_add`
+    response, and two tasks showed `blocked` for the whole run with no board-edit API. Cost was low
+    only because the documented fallback is to track the chain by spawn order — but this is now the
+    SECOND time, so: compose the `depends_on` list from the literal response of the SAME call, and
+    re-read it before sending. If the board is already poisoned, ignore it and do not retry.
+  - **Teammates must not delete files in the lead's main checkout.** The builder deleted
+    `models/{ETH,SOL,XRP}_USD/` (correctly untracked scratch, per DECISION §2.2) but did it in MAIN,
+    not its worktree, and admitted one accidental edit there. Ask builders to report what they
+    touched outside the worktree instead of tidying; the lead owns MAIN's state.
+  - **Cost reality for an in-repo IMPROVE-EXISTING pass: no new repo, no `gh repo create`, no flake
+    input to wire, no NixOS module to add** (Phase 4B skips all of it, and the shipped timer became
+    a plain `systemd/user` unit because `nix/module.nix` is a NixOS module and `systemd.user.*` is a
+    home-manager option that would not evaluate there). The whole pass is a handful of RL commits in
+    one repo. So don't estimate this as a "multi-repo loop".
+  - **What the fix did NOT do, and PLAN.md must say so:** it restored the trading WINDOW, it did not
+    enrich the SIGNAL — bars carrying a funding reading stay 1/721 before and after. Signal QUALITY
+    is Gap-2 work (accumulate coverage by running the timer, then re-derive `signal_max_age_hours`
+    from measured cadence). Also flagged: the live Kraken OHLC endpoint carrying `vwap`/`count` is
+    the only reason 52/60 are reachable at all, so that provenance is now the durability risk for
+    this pass's gains.
+  - Efficiency, measured: this session cost ~15.9M tokens (input 12.1M / output 1.6M / reasoning 2.1M,
+    cache read 1.26M) across ~104 tool calls. Most avoidable cost is the repeated `nix develop`
+    rebuild of the dev shell — 5 invocations at 17–28s each, once per phase-level verification.
+    proposal: batch the lead's own verification (pytest + flake check) into a SINGLE `nix develop`
+    call per checkpoint instead of one per phase, and let the reviewer own the heavy end-to-end runs.
+  - proposal: the three `.data-audit/RESEARCH-*.md` files plus the assembled `RESEARCH.md` are ~93KB
+    of markdown and are read by every downstream phase from the MAIN checkout via absolute path (the
+    worktrees do not have them, since the artifact dir is uncommitted until run end). Consider
+    committing the artifact dir EARLY (or having the lead copy artifacts into each worktree at spawn)
+    so teammates can `git show` them instead of being handed absolute paths — this also removes a
+    class of "the artifact I was told to read is not in my worktree" failures.
 ---
 
 ## Guardrails
@@ -716,9 +811,14 @@ inventory only.
   unmaintained), stop and redo the earlier phase rather than pushing on.
 - Do not poll teammates or sleep while waiting — see "Waiting on teammates".
 - **The integration test is mandatory, not optional.** A pass is not "scaffolded and unit-tested";
-  it is "the bot trained and backtested reading through the new source, equivalent to baseline,
-  with persistence observed" (Phase 6 gate). If the gate fails, Phase 7 must fix it before the
-  run is reported as done.
+  it is "the bot trained and backtested reading through the pass's outcome, proving the bot
+  actually CONSUMES it" (Phase 6 gate). For a `NEW-DATA-SOURCE` that means the source reaching
+  the observation and, if store-backed, persistence observed; for an `IMPROVE-EXISTING` it means
+  the proof that the bot's behaviour/observation actually changed. In every case the gate must
+  include **evidence of magnitude, not just absence of error**: bars replayed, trades taken, and
+  the new columns present BY NAME. A run that completes with no exception while silently
+  collapsing to ~1 bar / 0 trades is a FAIL — see the 2026-10-01 entry. If the gate fails, Phase 7
+  must fix it before the run is reported as done.
 - **Two repos, one loop.** Development continues in both the sub-project and `kraken-trading-bot`
   after scaffold; every dev slice ends with both repos' tests green and, when `gh` is ready, both
   pushed. Do not leave a dev slice half-pushed.
