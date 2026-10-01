@@ -1,0 +1,222 @@
+# Worked example: a model-evaluation matrix.
+#
+# Copy this, edit it, and run:
+#
+#   just matrix-plan  configs/matrix.example.yaml
+#   just matrix-run   configs/matrix.example.yaml
+#   just matrix-report configs/matrix.example.yaml
+#
+# ── What a matrix is FOR ─────────────────────────────────────────────────
+#
+# Every axis below exists to answer ONE stated question. An axis with no
+# question behind it is a cell you pay to train for nothing. Read the
+# `question:` header of each axis before adding another one.
+#
+# ── What this example is for ────────────────────────────────────────────
+#
+# question: "Is the signal worth trading at all, once costs are real and
+#           the result survives being run more than once?"
+#
+# It does NOT answer "which algorithm is better" — only PPO exists
+# (rl/agent.py is a thin SB3 PPO wrapper). `algo` is a documented FUTURE
+# axis; adding it to this file today would produce 3x the cells and the
+# same answer.
+
+name: example-signal-worth
+description: "Example matrix: is the signal worth trading at all?"
+
+# ── Run plumbing ────────────────────────────────────────────────────────
+run:
+  # The base training config every cell starts from. Each cell gets its own
+  # COPY of this file with its axis values deep-merged in, so one cell's
+  # overrides can never leak into the next.
+  base_config: configs/default.yaml
+
+  # Results: one JSONL line per cell, appended and fsync'd as it completes.
+  # A crash loses at most the cell in flight; re-running skips what is
+  # already there.
+  results: /tmp/ktb-matrix/example/cells.jsonl
+
+  # Models under test. Scratch space — NEVER commit anything under
+  # models/. The harness points both train and backtest at this root.
+  models_root: /tmp/ktb-matrix/example/models
+
+  # ── Degenerate-cell guard ─────────────────────────────────────────────
+  # A cell that completes with no error can still be worthless. A cell is
+  # marked INVALID (and excluded from every aggregate) when:
+  #   * n_bars is below min_bar_ratio of the window it requested. The
+  #     window bounds are a CLIP on the read, so too few --pages yields a
+  #     short window that only n_bars reveals.
+  #   * num_trades is 0
+  #   * any metric is NaN/inf
+  #   * a contract field is MISSING or null (null means pre-provenance
+  #     UNKNOWN, never 0)
+  #   * the JSON could not be parsed, or the process exited non-zero
+  #     (including ActionSpaceMismatchError, and a pinned window that left
+  #     no tradable bar)
+  #
+  # The measured failure this exists for: a run replaying 1 bar of 721
+  # with 0 trades, silently, while the width guard reported PASS. Such a
+  # cell reads as "0% return" if you tabulate it.
+  #
+  # min_bar_ratio: the cell must replay at least this fraction of the
+  # window it pinned. Not applied when no window is pinned: the report
+  # then falls back to the largest n_bars its sibling cells saw, which is
+  # the only honest denominator available.
+  min_bar_ratio: 0.5
+
+  # A cell with zero trades has no behaviour to summarise. One trade is
+  # the floor; raise it if you want statistical weight.
+  min_trades: 1
+
+  # Per-cell subprocess timeout, seconds. Training is the slow leg.
+  timeout: 3600
+
+  # Runtime ESTIMATES for `plan`'s projection only — not measurements.
+  # A real PPO run is slower; treat the projection as a lower bound.
+  train_seconds: 300
+  backtest_seconds: 30
+
+# ── Axes ─────────────────────────────────────────────────────────────────
+#
+# Reserved axis names become CLI flags; everything else is deep-merged
+# into the per-cell config. Reserved: ticker, seed, pages, timesteps.
+
+axes:
+
+  # ── Which market? ─────────────────────────────────────────────────────
+  # question: "does the signal survive across assets, or did it work on
+  #            one?"
+  # Two tickers minimum. One ticker is one asset's story, not evidence of
+  # a generalisable signal. The report will say so if you drop to one.
+  ticker: [ETH_USD, SOL_USD]
+
+  # ── How many times? ───────────────────────────────────────────────────
+  # question: "is this result reproducible, or am I reading noise?"
+  # THE axis most naive harnesses omit. PPO on an IDENTICAL config has
+  # been measured replaying 576 trades in one run and 374 in another —
+  # a 1.5x swing from nothing but the seed. A single run per
+  # configuration is an anecdote. Three is the floor; five+ before
+  # calling any difference real.
+  seed: [42, 43, 44]
+
+  # ── How much data? ────────────────────────────────────────────────────
+  # question: "is the model learning from a window it can actually trade?"
+  #
+  # CRITICAL: `--pages` bounds only the LIVE fetch, and the window bounds
+  # are a CLIP on that fetch — they are NOT pushed into the read (the
+  # push-down is still a follow-up). So too few pages yields a SILENTLY
+  # SHORT window, visible only in n_bars: a 900-bar frame kept just 804
+  # against until=2025-08-01. Size pages so the fetch comfortably REACHES
+  # `until`; the harness marks a cell INVALID when n_bars falls below
+  # `min_bar_ratio` of the requested span, but over-fetch rather than
+  # under-fetch and eat that.
+  #
+  # Note also that Kraken's REST ceiling is ~720 candles per pair/interval
+  # and does NOT scale with pages — `--pages 2` has been measured
+  # returning 721 bars, not 1440. So `pages` alone buys you no depth. For
+  # real history, seed the local market_data_store instead (see
+  # configs/deep-history.example.yaml) and let the pinned window read
+  # from it.
+  pages: [2]
+
+  # ── How long to train? ────────────────────────────────────────────────
+  # question: "does more training help, or does it just cost more?"
+  # A single value means this axis contributes nothing — drop it rather
+  # than multiply the cell count for no information.
+  timesteps: [3000]
+
+  # ── Which action space? ───────────────────────────────────────────────
+  # question: "does the discrete action space (buy/hold/sell) beat the
+  #            continuous one?"
+  # Both spaces exist TODAY (action_space: continuous|discrete), so this
+  # is a live axis. Note: changing it changes the observation width the
+  # policy was trained on, so a model must be retrained per level —
+  # which the harness does automatically (each cell gets its own model
+  # name derived from its cell id).
+  action_space: [discrete]
+
+  # ── What does it cost to trade? ───────────────────────────────────────
+  # question: "does the signal survive real execution costs?"
+  # This is the axis that decides tradeability. A frictionless backtest
+  # books every fill at the mid, so any strategy that trades at all looks
+  # profitable — a frictionless Sharpe is not a Sharpe. The second level
+  # is roughly Kraken's retail taker fee (0.26%) plus half a typical
+  # spread (0.05%) as slippage; adjust to your own venue and size.
+  #
+  # Omit this axis and `plan` emits a BLOCKER: the run then measures how
+  # good the fills would have to be, not whether the model trades.
+  friction:
+    - {fee_rate: 0.0, slippage: 0.0}       # ceiling, for reference only
+    - {fee_rate: 0.0026, slippage: 0.0005} # realistic: 26bp + 5bp
+
+# ── Which bars? ───────────────────────────────────────────────────────
+  # question: "are all cells replaying the SAME bars, so are they even
+  #            comparable?"
+  # THE most important axis in the file. Without it, train and backtest
+  # each fetch FRESH data and two fetches have been measured to disagree
+  # 16% on a fitted feature std — so cells differ because they saw
+  # different bars, not because of the thing you are testing.
+  #
+  #   since/until   pin the bar window explicitly (ISO-8601). BOTH must be
+  #                 set: a key present but null counts as UNSET. The
+  #                 harness derives the expected bar count from the span,
+  #                 which is what makes the min_bar_ratio guard meaningful.
+  #
+  #   eval_split    holdout fraction. The FIRST (1 - eval_split) of the
+  #                 window trains; the remainder is the out-of-sample
+  #                 segment. Never gate a decision on the in-sample part:
+  #                 that is the number the model was fitted to produce.
+  #
+  # *** eval_split IS INERT UNLESS THE WINDOW IS PINNED. *** With since and
+  # until null the run trains and backtests on 100% of the frame, so a row
+  # that "sets eval_split" is still fully IN-SAMPLE and its return
+  # describes the fit rather than a prediction. `plan` emits a BLOCKER for
+  # that, and `report` prints in-sample cells in their own section —
+  # excluded from every aggregate, never averaged with holdout cells.
+  #
+  # Note the split ROUNDS (round(n*split), clamped to [1, n-1]), so do not
+  # predict the split boundary with floor().
+  .data_window:
+    - since: "2026-09-01T00:00:00Z"
+      until: "2026-09-20T00:00:00Z"
+      eval_split: 0.7
+
+# ── Axes a BACKTEST config cannot express ───────────────────────────────
+#
+# `backtest --config` honours EXACTLY SIX keys: fee_rate, slippage,
+# action_space, initial_balance, market_data_store, data_window. Anything
+# else — reward, feature_windows, feature_groups, allow_short,
+# ohlcv_interval_minutes, the *_features_file keys, signal_* — is read
+# from the MODEL's own training config, because a mismatch there is
+# silent-corruption class.
+#
+# So an axis over any of those CANNOT be expressed to a backtest. The
+# harness handles this explicitly rather than pretending: it writes the
+# full merge to a per-cell TRAIN config and retrains every level, and
+# emits a `train_only_axis` NOTE. Two examples:
+#
+#   .reward:
+#     - {mode: "pnl", drawdown_penalty: 0.0}
+#     - {mode: "sharpe", risk_adjusted: 1.0}
+#
+#   feature_windows:
+#     - [1, 4, 24]
+#     - [1, 6, 24]
+#
+# Each such level costs a full training run. That is the point: a "cheap"
+# backtest-only variation of the reward would measure nothing, because the
+# backtest would re-read the reward the model was actually trained with.
+#
+# `ohlcv_interval_minutes` is train-side only for the same reason — a
+# policy trained on one bar interval cannot be replayed on another.
+
+# ── Derived, not written here ────────────────────────────────────────────
+#
+# cells = 2 tickers x 3 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 2 friction levels x 1 data_window
+#       = 12 cells  (~66 min at the estimates above)
+#
+# Per-config groups: 4 (2 tickers x 2 friction levels), each backed by 3
+# seeds. That is the resolution the report is actually read at: the
+# friction comparison has 3 seeds behind every median.

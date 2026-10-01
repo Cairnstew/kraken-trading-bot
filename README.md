@@ -118,6 +118,42 @@ kraken-trading-bot models --ticker ETH_USD --json
 kraken-trading-bot paper-trade --ticker ETH_USD --model ppo_eth_01 --iterations 100
 ```
 
+### Model evaluation matrix
+
+A single backtest run is not a measurement. PPO on an **identical config**
+has been measured replaying **576 trades in one run and 374 in another**,
+and `train`/`backtest` each fetch fresh data — two fetches have disagreed
+**16% on a fitted feature std**, so cells that look identical may not be.
+
+`tools/model_matrix.py` runs a YAML matrix spec (tickers × seeds × friction
+× …) and refuses to report comparisons it cannot support:
+
+```bash
+just matrix-plan    configs/matrix.example.yaml   # expand cells, WARN on validity gaps
+just matrix-run     configs/matrix.example.yaml   # execute, resumable JSONL (one line per cell)
+just matrix-report  configs/matrix.example.yaml   # median + IQR per axis, invalid cells listed
+```
+
+Start from `configs/matrix.example.yaml`, whose comments explain what
+question each axis answers. Three behaviours worth knowing:
+
+- **Multi-seed cells are reduced by median, never averaged.** The report
+  prints `median [q1, q3]` so the spread stays visible.
+- **Degenerate cells are INVALID, not zero.** A run can exit 0 having
+  replayed **1 bar of 721 with 0 trades** — the width guard passes and it
+  looks like a "0% return" result. Such cells are listed with their reason
+  and excluded from every aggregate.
+- **`plan` blocks what cannot be compared**: no pinned `data_window`
+  (cells replayed different bars), fewer than 3 seeds, or an entirely
+  frictionless matrix (**a frictionless Sharpe is not a Sharpe**).
+
+The headline metric is `excess_return` — the return over `buy_hold_return`
+— because a raw return has no reference point. Scratch models and results
+go under `/tmp`; nothing under `models/` is ever written by the harness.
+
+Full checklist, axis-selection guide, and current limits (PPO only, no
+walk-forward re-fitting): `.opencode/skills/model-matrix/SKILL.md`.
+
 ### Python API
 
 ```python

@@ -6,6 +6,7 @@
 #   just bench SOL_USD ppo_sol_01 50000   train + backtest + show performance
 #   just export-data --ticker SOL_USD      dump the data pipeline frame to CSV
 #   just paper --ticker ETH_USD --model ppo_eth_01 --iterations 10
+#   just matrix-plan                       expand a model-evaluation matrix
 #   just test               run the pytest suite
 #   just funding-pull       pull one Kraken funding snapshot (keyless)
 #   just funding-timer      enable the hourly systemd.user funding timer
@@ -155,6 +156,26 @@ funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   mkdir -p "$root/$(dirname {{output}})"
   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
     pull --pair {{pair}} --output "$root/{{output}}" --append
+
+# ── Model evaluation matrix ─────────────────────────────────────────────
+# Three stages over a YAML matrix spec: expand+warn, execute (resumable
+# JSONL, one line per cell), aggregate (median + IQR, invalid cells listed
+# and excluded). Start from configs/matrix.example.yaml.
+# Read .opencode/skills/model-matrix/SKILL.md before trusting a number.
+
+# Expand the design, count cells, warn when it cannot support a comparison
+# e.g. just matrix-plan configs/matrix.example.yaml
+matrix-plan spec="configs/matrix.example.yaml":
+  {{dev}} 'python tools/model_matrix.py plan {{spec}}'
+
+# Execute the cells. Resumable: re-running skips cells already recorded.
+# Extra args pass through, e.g. --force / --limit 4 / --dry-run
+matrix-run spec="configs/matrix.example.yaml" *ARGS="":
+  {{dev}} 'python tools/model_matrix.py run {{spec}} {{ARGS}}'
+
+# Aggregate into per-axis medians + IQRs, listing invalid cells
+matrix-report spec="configs/matrix.example.yaml" *ARGS="":
+  {{dev}} 'python tools/model_matrix.py report {{spec}} {{ARGS}}'
 
 # ── Tests / checks ───────────────────────────────────────────────────────
 
