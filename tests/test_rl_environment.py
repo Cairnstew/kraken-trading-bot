@@ -15,7 +15,12 @@ from kraken_trading_bot.rl import (
     normalize_ticker_id,
     prepare_episode,
 )
-from kraken_trading_bot.rl.data import add_derived_ohlcv_features
+import json
+
+from kraken_trading_bot.rl.data import (
+    add_derived_ohlcv_features,
+    merge_extra_features,
+)
 from kraken_trading_bot.rl.features import (
     FeatureWidthMismatchError,
     check_feature_width,
@@ -567,3 +572,184 @@ def test_width_guard_is_not_defeated_by_normalize_dropping_columns():
         check_feature_width(
             stats.feature_names, list(widened.columns), context="unit"
         )
+
+
+# ---------------------------------------------------------------------------
+# Sparse exogenous coverage must not silently consume the episode
+# ---------------------------------------------------------------------------
+#
+# Regression for the silent truncation a Phase 6 gate measured and
+# `.data-audit/VALIDATION.md` §2.4 recorded.  Every fixture above
+# populates the funding inputs on *every* row, so `spread` is never NaN and
+# the defect is invisible to the rest of the suite — the dense shape
+# happens to be the unproblematic one.  These tests build the *sparse*
+# shape instead: a funding file covering one hour of a 721-bar window,
+# which is what `kraken-funding-rates pull --append` produces on its first
+# pull, and what the shipped hourly timer produces for as long as the file
+# is shorter than the training window.
+
+_SPARSELY_COVERED_BARS = 721
+# The indicator warm-up boundary on these frames: the longest OHLCV window
+# is 24 bars and the 20-bar rolling z-scores need 19.  Pinned so a change
+# to the warm-up rule itself has to be deliberate.
+_WARMUP_BARS = 24
+# Widths at the shipped defaults, measured by `export-data`/the train log.
+_NULL_FUNDING_WIDTH = 52  # vwap/count present, no funding file
+_FUNDING_WIDTH = 60  # +8: the funding allow-list, the freshness pair and spread
+
+
+def _funding_ready_ohlcv(n: int = _SPARSELY_COVERED_BARS, seed: int = 5):
+    """The shipped null-funding frame: ``vwap``/``count`` present, no funding.
+
+    Deliberately *not* ``_widened_ohlcv`` — that fixture hand-places
+    ``bid``/``ask``/``funding_rate_prediction``/``vol24h`` on every row, which
+    is the dense case this regression exists to contrast against.  The
+    index is tz-aware because the merge seam parses record timestamps as
+    UTC and only aligns on a matching index.
+    """
+    rng = np.random.default_rng(seed)
+    df = _synthetic_ohlcv(n=n, seed=seed)
+    df["vwap"] = df["close"] * (1.0 - rng.uniform(0.0, 0.002, n))
+    df["count"] = rng.integers(5, 80, n).astype(float)
+    df.index = df.index.tz_localize("UTC")
+    return add_derived_ohlcv_features(df)
+
+
+def _one_record_funding_file(tmp_path, index: pd.DatetimeIndex):
+    """A funding JSONL with a SINGLE record, on the window's last bar."""
+    path = tmp_path / "eth_usd_funding.jsonl"
+    record = {
+        "symbol": "PF_ETHUSD",
+        # The sibling writes `spot_pair`, not `ticker`, so this file cannot
+        # satisfy `signal_require_ticker: true` — reproduced, not worked
+        # around, so the merge is the WARNING path a real user hits.
+        "spot_pair": "ETH/USD",
+        "timestamp": index[-1].strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "funding_rate": 0.025276074734625897,
+        "funding_rate_prediction": -0.0024999392825,
+        "mark_price": 2685.01548089456,
+        "index_price": 2684.89,
+        "basis": 4.673595363684979e-05,
+        "open_interest": 26523.041,
+        "bid": 2685.1,
+        "ask": 2685.2,
+        "vol24h": 37891.356,
+    }
+    path.write_text(json.dumps(record) + "\n")
+    return path
+
+
+def _funding_backed_env(tmp_path, n: int = _SPARSELY_COVERED_BARS):
+    """The gate scenario: one funding record over an ``n``-bar window."""
+    df = _funding_ready_ohlcv(n=n)
+    merged = merge_extra_features(
+        df,
+        extra_features_file=str(_one_record_funding_file(tmp_path, df.index)),
+        ticker="ETH/USD",
+        max_age_hours=12,  # the value `configs/default.yaml` ships
+        require_ticker=False,
+    )
+    env = TradingEnvironment(
+        "ETH_USD", merged, feature_pipeline=FeaturePipeline(), action_space="discrete"
+    )
+    return env
+
+
+def _null_funding_env(n: int = _SPARSELY_COVERED_BARS):
+    df = _funding_ready_ohlcv(n=n)
+    return TradingEnvironment(
+        "ETH_USD", df, feature_pipeline=FeaturePipeline(), action_space="discrete"
+    )
+
+
+def test_sparse_funding_coverage_does_not_consume_the_window(tmp_path):
+    """One funding record must not collapse a 721-bar episode to one bar.
+
+    The measured failure: `spread` is NaN on every bar the funding file
+    does not cover (the seam leaves a zero `bid` behind for absence, and the
+    micro builder correctly refuses to divide by it), and gating the
+    environment's start index on *every* column therefore pushed it from 24
+    to 720.  A trained policy was then replayed for a single bar — no
+    exception, no warning, and the width guard still passing, because the
+    model really was 60-wide against a 60-wide frame.
+
+    Absence in a point-in-time exogenous column is not warm-up, so it must
+    not decide how much of the window the agent gets to trade.
+    """
+    env = _funding_backed_env(tmp_path)
+    assert env.n_bars == _SPARSELY_COVERED_BARS
+    assert env._features.shape[1] == _FUNDING_WIDTH
+
+    # Preconditions, so this cannot quietly stop being the sparse shape.
+    # `spread` unknown on all but one bar is the defect's trigger; the
+    # freshness pair is what records that the source had nothing there.
+    spread = env._features["spread"]
+    assert spread.notna().sum() == 1
+    assert spread.isna().sum() == _SPARSELY_COVERED_BARS - 1
+    assert env._features["signal_observed"].sum() == 1.0
+    assert env._features["signal_age_hours"].max() == 0.0
+    assert {"signal_observed", "signal_age_hours"}.issubset(env._features.columns)
+
+    # THE ASSERTION.  The environment replays the window; a sparsely covered
+    # exogenous source does not silently consume it.
+    replayable = env.n_bars - env._start_index
+    assert replayable > 0.9 * env.n_bars, (
+        f"a one-record funding file left only {replayable} of {env.n_bars} "
+        f"bars tradable (start index {env._start_index})"
+    )
+
+    # ...and it is a real episode, not just an index: the environment steps
+    # that many times before truncating.
+    env.reset()
+    steps = 0
+    while env._step_idx < env.n_bars:
+        env.step(1)  # hold
+        steps += 1
+    assert steps > 0.9 * env.n_bars
+
+
+def test_null_funding_start_index_is_unchanged():
+    """The fix must not have traded this bug for the warm-up semantic.
+
+    With no funding file no exogenous column reaches the frame at all, so
+    the rule reduces to the original one and the start index is the pure
+    indicator warm-up boundary.  Pinning the exact value is what stops a
+    future "fix" from quietly re-skipping warm-up bars.
+    """
+    baseline = _null_funding_env()
+    # Precondition: this leg really is the null-funding baseline.
+    assert baseline._features.shape[1] == _NULL_FUNDING_WIDTH
+    assert not {"spread", "funding_rate", "signal_observed"} & set(
+        baseline._features.columns
+    )
+    assert baseline._start_index == _WARMUP_BARS
+    assert baseline.n_bars - baseline._start_index > 0.9 * baseline.n_bars
+
+
+def test_sparse_and_null_funding_share_the_warmup_boundary(tmp_path):
+    """Attaching a sparsely-covered exogenous source must not move the line.
+
+    The two legs differ by the eight funding columns and nothing else about
+    tradability: absence in those columns is not warm-up, in either
+    direction, so both report the same 24-bar indicator boundary.
+    """
+    assert _funding_backed_env(tmp_path)._start_index == _WARMUP_BARS
+    assert _null_funding_env()._start_index == _WARMUP_BARS
+
+
+def test_presence_gating_survives_the_warmup_fix():
+    """No vwap/count and no funding file still computes at 49.
+
+    The warm-up fix widens nothing and requires nothing: with no exogenous
+    column on the frame the rule reduces to the original one, and the
+    presence-gated derivations stay absent.
+    """
+    plain = _synthetic_ohlcv(n=_SPARSELY_COVERED_BARS, seed=5)
+    env = TradingEnvironment(
+        "ETH_USD", plain, feature_pipeline=FeaturePipeline(), action_space="discrete"
+    )
+    assert env._features.shape[1] == 49
+    assert "spread" not in env._features.columns
+    assert "vwap_dev" not in env._features.columns
+    assert env._start_index == _WARMUP_BARS
+    assert env.n_bars - env._start_index > 0.9 * env.n_bars

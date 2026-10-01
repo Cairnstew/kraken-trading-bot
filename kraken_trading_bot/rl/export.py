@@ -60,7 +60,7 @@ import numpy as np
 import pandas as pd
 
 from .data import _OHLCV_COLUMNS, prepare_episode, read_ohlc_dataframe
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import FeaturePipeline, first_tradable_index, normalize_ticker_id
 from .train import build_train_config
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,16 +108,15 @@ def _timestamp_strings(df: pd.DataFrame) -> np.ndarray:
 def _warmup_mask(features: pd.DataFrame) -> np.ndarray:
     """Rows the environment will not trade on, positionally.
 
-    Mirrors ``TradingEnvironment._first_valid_index``: the first row
-    whose features are *all* non-NaN, i.e. the indicator look-back
-    region. Positional (rather than ``idxmax``) so it is correct on a
-    DatetimeIndex too, which is what this module exports.
+    Delegates to the environment's own boundary function
+    (:func:`~kraken_trading_bot.rl.features.first_tradable_index`) rather
+    than restating the rule, so the exported ``warmup`` flag cannot claim
+    a different tradable region than
+    :class:`~kraken_trading_bot.rl.environment.TradingEnvironment` uses.
+    That is the indicator look-back region only: absence in a point-in-time
+    exogenous column is not a warm-up bar.
     """
-    valid = features.notna().to_numpy().all(axis=1)
-    if not valid.any():
-        first = 0
-    else:
-        first = int(np.argmax(valid))
+    first = first_tradable_index(features)
     return np.arange(len(features)) < first
 
 

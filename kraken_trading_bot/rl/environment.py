@@ -26,7 +26,12 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 
-from .features import FeaturePipeline, NormalizationStats, normalize_ticker_id
+from .features import (
+    FeaturePipeline,
+    NormalizationStats,
+    first_tradable_index,
+    normalize_ticker_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -438,9 +443,16 @@ class TradingEnvironment(gym.Env):
         return float(self.data["close"].iloc[idx])
 
     def _first_valid_index(self) -> int:
-        valid = self._features.notna().all(axis=1)
-        first = valid.idxmax() if valid.any() else 0
-        return max(int(first), 0)
+        """First bar tradable on this frame — the warm-up boundary.
+
+        Delegates to :func:`~kraken_trading_bot.rl.features.first_tradable_index`
+        so the environment and the ``export-data`` warm-up flag cannot
+        drift apart: only an OHLCV look-back window can make a bar
+        not-yet-computable, while a NaN in a point-in-time exogenous
+        column is absence (see that function for why gating on it
+        truncated a sparsely-covered funding source to one bar).
+        """
+        return first_tradable_index(self._features)
 
     def _raw_feature_array(self) -> np.ndarray:
         """Pipeline features forward-filled, zero-filled, then z-scored.
@@ -452,6 +464,13 @@ class TradingEnvironment(gym.Env):
         std-floor guard inside ``NormalizationStats.normalize`` keeps
         constant columns at zero instead of raising.  Obs width is
         unchanged (affine per-feature), so ``model.zip`` still loads.
+
+        This is also what makes an absent exogenous reading safe to
+        observe rather than a bar to skip: the fill is the pre-existing
+        contract for every feature column, the freshness pair
+        (``signal_observed`` / ``signal_age_hours``) is itself part of the
+        observation, and the merge seam zero-fills its sibling signal
+        value columns the same way.
         """
         filled = self._features.ffill().fillna(0.0)
         stats = (

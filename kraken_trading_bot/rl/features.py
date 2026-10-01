@@ -100,6 +100,63 @@ _SIGNAL_FRESHNESS_COLUMNS = ("signal_age_hours", "signal_observed")
 # Net accounting is therefore +1 for the funding bid/ask pair, not +3.
 _SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread")
 
+# Every observation column whose value comes from an exogenous file
+# rather than from a look-back window over the OHLCV frame.
+#
+# The distinction matters because the two kinds of NaN mean opposite
+# things.  A NaN in an OHLCV-derived column is *warm-up*: the rolling
+# window has not filled yet, so the bar is genuinely not computable and
+# the environment skips it.  A NaN in one of the columns below is
+# *absence*: the exogenous source settles on its own cadence (funding
+# ~8-hourly) or was simply not reading on this bar, so the spread really
+# is unknown here and there is nothing to warm up.  ``spread`` is the
+# case that proves it — ``_add_microstructure_features`` divides by
+# ``bid``, and the merge seam's absence fill leaves a zero bid behind,
+# which that builder deliberately turns into NaN rather than inventing a
+# spread.  That NaN is correct information, not a not-yet-ready bar.
+#
+# The two are not distinguishable from the NaN *pattern*: with a single
+# funding record the last bar is the only valid one, which is
+# byte-identical to a 720-bar rolling window.  So the distinction is
+# declared here, by provenance, and consumed by
+# :func:`first_tradable_index`.
+POINT_IN_TIME_EXOGENOUS_COLUMNS = frozenset(_SIGNAL_COLUMNS) | frozenset(
+    _SIGNAL_BUILDER_INPUT_COLUMNS
+)
+
+
+def first_tradable_index(features: pd.DataFrame) -> int:
+    """First row of a raw feature frame the environment may trade on.
+
+    This is the *indicator warm-up* boundary and nothing else: the first
+    row on which no OHLCV-derived column is still waiting for its
+    look-back window.  Positional, so it is correct on any index.
+
+    Point-in-time exogenous columns (``POINT_IN_TIME_EXOGENOUS_COLUMNS``)
+    are deliberately excluded from the test.  Their NaN means "no reading
+    on this bar", which :meth:`TradingEnvironment._raw_feature_array`
+    already resolves with its documented ``ffill().fillna(0.0)`` policy —
+    the same policy the merge seam's zero-filled sibling signal columns
+    (``funding_rate``, ``basis``, …) have always travelled through, and the
+    reason ``signal_observed`` exists to keep the zero unambiguous.
+    Gating on them made a sparsely-covered exogenous source silently
+    truncate the episode to the bars it happened to cover: a one-record
+    funding file moved the start index from 24 to 720 of 721 and left a
+    trained policy replayed for a single bar, with no error and a width
+    guard that still passed.
+
+    Returns ``0`` when no row is fully warm (there is nothing to skip).
+    """
+    windowed = [
+        col for col in features.columns if col not in POINT_IN_TIME_EXOGENOUS_COLUMNS
+    ]
+    if not windowed:
+        return 0
+    valid = features[windowed].notna().to_numpy().all(axis=1)
+    if not valid.any():
+        return 0
+    return max(int(np.argmax(valid)), 0)
+
 
 @dataclass
 class NormalizationStats:
