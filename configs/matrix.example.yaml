@@ -163,10 +163,21 @@ axes:
   #                 harness derives the expected bar count from the span,
   #                 which is what makes the min_bar_ratio guard meaningful.
   #
-  #   eval_split    holdout fraction. The FIRST (1 - eval_split) of the
-  #                 window trains; the remainder is the out-of-sample
-  #                 segment. Never gate a decision on the in-sample part:
-  #                 that is the number the model was fitted to produce.
+  #   eval_split    TRAIN fraction of the pinned window, in (0, 1]. It is
+  #                 the fraction used for TRAINING, not the holdout: with
+  #                 eval_split 0.7 the leading 70% trains and the trailing
+  #                 30% is the out-of-sample segment. Never gate a decision
+  #                 on the in-sample part: that is the number the model
+  #                 was fitted to produce.
+  #
+  #                 eval_split: 1.0 means NO split — a pinned window is
+  #                 then replayed in full and the result is IN-SAMPLE.
+  #
+  #                 Because the backtest only ever replays the eval slice,
+  #                 a healthy cell returns roughly (1 - eval_split) x the
+  #                 span, minus the feature warm-up. That is the number the
+  #                 min_bar_ratio width guard is measured against — see
+  #                 the eval-slice note in .opencode/skills/model-matrix.
   #
   # *** eval_split IS INERT UNLESS THE WINDOW IS PINNED. *** With since and
   # until null the run trains and backtests on 100% of the frame, so a row

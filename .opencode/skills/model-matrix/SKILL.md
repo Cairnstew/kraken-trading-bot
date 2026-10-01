@@ -227,10 +227,18 @@ the fills have to be?" — not "does this model trade?". `plan` blocks the
 run as a comparison when every cell is frictionless; `report` refuses to
 describe such a matrix as supporting any tradeable claim.
 
-Worked example from the synthetic run in this repo's own verification:
-SOL_USD showed **+16.21% median excess frictionless** and **−1.55% with
-realistic costs** — a sign flip. A frictionless matrix would have shipped
-that as a winner.
+Worked example from a **synthetic** (fake-CLI) run, kept for the shape and
+not the numbers: SOL_USD showed **+16.21% median excess frictionless** and
+**−1.55% with realistic costs** — a sign flip. A frictionless matrix
+would have shipped that as a winner.
+
+> Do not quote those figures as a result. They came from a synthesised
+> CLI, not from Kraken. The first real-CLI run (2026-10-01) put the
+> frictionless-vs-frictioned gap at well under one percentage point,
+> because those models traded 39–176 times over ~178 bars — so costs bite
+> in proportion to turnover, and a high-turnover policy pays most. The
+> sign-flip above is a property of that synthetic policy's turnover, not
+> a general law.
 
 ---
 
@@ -294,7 +302,7 @@ clothes. A harness that averages it in is worse than no harness.
 | any metric is NaN/inf | the number is not a number |
 | a contract field is **missing**, or `n_bars` is **null** | absent/null means UNKNOWN, never 0 |
 | JSON unparseable, or the process exited non-zero | it failed |
-| `ActionSpaceMismatchError` | the model's recorded `action_space` disagrees with the run's |
+| an **action-space mismatch** — the model's recorded `action_space` disagrees with the run's | a policy bound to the wrong space emits actions it never learned to emit |
 | a pinned window left **no tradable bar** | the eval slice is shorter than the warm-up; it *raises* rather than returning `n_bars: 0` |
 | the `--config` path does not exist | deliberately raises, so nobody silently falls back to a zero-cost model config |
 
@@ -319,6 +327,16 @@ Three subtleties the harness handles deliberately:
   healthy cells as truncated. With no window pinned, the report falls back
   to each ticker's largest observed `n_bars` — the only honest
   denominator available — and says the check was peer-relative.
+- **With an active `eval_split`, the denominator is the window's EVAL
+  SLICE, not the whole span** — because `n_bars` counts bars a backtest
+  *replayed*, and training has already taken the leading `eval_split`.
+  Measured against the real CLI on 2026-10-01: a 672-bar window logged
+  `-> 202 replayable bars`, 178 were replayed after feature warm-up, and
+  denominating by 672 demanded 336 — so **every** out-of-sample cell was
+  INVALID and a correct matrix reported zero usable cells. Expect a
+  healthy cell to sit near `(1 - eval_split) × span`, minus warm-up.
+  `eval_split: 1.0` is the RL side's *no-split* switch, so it keeps the
+  full span.
 - **`--pages` must be sized to REACH `until`.** The window bounds are a
   **clip on the read, not a push-down** (the push-down is still a
   follow-up), so too few pages yields a *silently short* window that only
@@ -358,10 +376,22 @@ numbers can mean.
    it prevents silently falling back to a zero-cost model config. The
    harness surfaces it as a cell error (`config_not_found`) and does not
    retry around it.
-5. **Per-bar Sharpe is not annualised Sharpe.** `sharpe` is computed over
+6. **Per-bar Sharpe is not annualised Sharpe.** `sharpe` is computed over
    per-bar equity returns and scaled by `sqrt(n_bars)`. It is a
    cross-cell comparator, not a number to compare against published
    annualised Sharpe figures.
+7. **The test suite is not a composition test.** The harness's own tests
+   drive a *synthesised* fake CLI, deliberately, so they stay green while
+   the RL side moves. That fake cannot express a whole class of
+   disagreement — it returns one fixed `n_bars` for every spec, which is a
+   physically impossible bar count for a split window. Two real bugs were
+   found on the first real-CLI run (2026-10-01) and were invisible to all
+   89 of those tests: the width denominator, and the failure classifier
+   matching Python exception names the real CLI never prints.
+   `tests/test_matrix_rl_contract.py` now imports the real modules to
+   close that gap, but it is new and much smaller than the fake — treat
+   "the suite is green" as *not* evidence that the harness and the binary
+   agree.
 
 ---
 
