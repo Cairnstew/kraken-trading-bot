@@ -802,6 +802,71 @@ inventory only.
     committing the artifact dir EARLY (or having the lead copy artifacts into each worktree at spawn)
     so teammates can `git show` them instead of being handed absolute paths — this also removes a
     class of "the artifact I was told to read is not in my worktree" failures.
+
+## Matrix-harness pass (2026-10-01, follow-on to the Gap 1 pass)
+
+Not a data-pipeline audit phase — a separate build the user asked for after the audit landed: a
+benchmark tool + skill to evaluate whether the pipeline produces tradeable models. Kept here
+because the lessons generalise to any future pass that spawns builders.
+
+- 2026-10-01 (matrix-harness) — added `tools/model_matrix.py` (`plan`/`run`/`report`), the
+  `model-matrix` skill, `backtest --config/--json` + `train --json`, `BacktestResult.buy_hold_return`
+  /`excess_return`/`n_bars`/friction echo, and `data_window {since,until,eval_split}`. Two builders
+  in parallel against ONE written interface contract, split by file ownership (RL code vs
+  tools/skills). 314 tests green. Lessons:
+  - **Write the interface contract down, then let builders work in parallel against it.** The two
+    slices never touched a shared file and composed with only a README conflict. The RL builder's
+    DEVIATION NOTES were the valuable part — its "eval_split is INERT unless the window is pinned"
+    would otherwise have made every unpinned matrix cell a silent in-sample result. Route deviation
+    notes to the other builder IMMEDIATELY rather than waiting for its final report.
+  - **A dimension that the eval path cannot express must be represented, not silently dropped.**
+    `--config` supplies exactly six keys; `reward`, `feature_groups`, `feature_windows` and the
+    signal-file keys come from the MODEL's config by design. So a reward/feature axis is a TRAIN
+    side change and needs a retrain per level. The harness materialises two configs per cell for
+    this reason. A matrix that applies one config to both sides will silently ignore half its axes.
+  - **`configs/default.yaml` shipped `ticker: "ETH/USD"`, which BEAT the per-cell ticker.** Every
+    cell would have trained and backtested ETH and the cross-sectional axis was a lie. Any harness
+    that sets a config field must confirm the field it is varying wins precedence over the shipped
+    default. Same class as the config comment naming a `cli.py` that does not exist (the earlier
+    pass): **the shipped defaults are a live source of silent lies — audit them when a tool starts
+    writing into them.**
+  - **`team_merge` reported "no commits and no uncommitted changes" for a branch that HAD a commit**
+    (`94d03e2`), the second time this has happened. It resolves by worktree path/registration, not by
+    branch. Do not conclude a builder's work is lost: `git cat-file -t <sha>` in its worktree, then
+    take it by ref (`git checkout <sha> -- <paths>`, or `git merge --ff-only` when it branches from
+    your HEAD). Also: when a builder branches from your HEAD, check
+    `git merge-base --is-ancestor HEAD <sha>` — a clean `--ff-only` beats a per-file checkout, and it
+    is the only way to avoid a README/justfile conflict between two parallel slices.
+  - **`git diff <commit>` ignores UNTRACKED files.** A builder's new files looked deleted after a
+    merge. Only a per-file content comparison is trustworthy:
+    `git show <sha>:<path> | diff -q - <path>` for each path in the commit.
+  - **BUSY-TIME LIMIT: two teammates were aborted mid-task this run** (`harness` at ~95% done,
+    `matrix-verify` after 3 commits). Both had large single briefs. Keep a builder/qa brief to ONE
+    deliverable; split "build the tool" from "verify it end to end" from "run the evaluation". When a
+    teammate IS aborted, inspect the worktree before re-spawning: this time the work was intact and
+    uncommitted, and resuming the same session was far cheaper than a fresh agent re-reading ~3,700
+    lines. Tell them to COMMIT FIRST if they may be near the limit.
+  - **Cross-slice test rot is guaranteed when slices build against a moving base.** A harness test
+    asserted `configs/default.yaml` had no `data_window` — true when written, false the moment the
+    parallel RL slice landed it. Fix: such a test must use a SYNTHETIC config fixture, never the
+    shipped file, so it tests the behaviour instead of today's contents.
+  - **Verify the tool against the real binary, not only a fake CLI.** The harness's 89 tests all ran
+    against a synthetic fake. Driving the real `backtest --json` found two bugs the fake could not:
+    the width-guard denominator was the whole span instead of the eval slice, and real CLI refusals
+    were not classified. Any tool that shells out needs at least one test against the real command.
+  - **Effectiveness result (honest, real keyless Kraken data, 18 cells, all out-of-sample, pinned
+    window, 3 tickers x 3 seeds x {frictionless, 0.26% fee + 0.05% slippage}, 178-bar eval slices):**
+    overall median excess return **+0.82%** over buy-and-hold, positive in 12/18 cells, but
+    BTC_USD had **0/6 positive Sharpe** (median -0.58) and SOL_USD was negative on excess both ways.
+    **No evidence of a tradeable edge.** The decisive methodological finding is not the return but
+    the NOISE: within-config seed spread (e.g. BTC frictionless 0.3/1.0/2.7pp) is LARGER than the
+    between-config effect being measured (friction costs ~0.25-0.8pp). At 3 seeds and 178-bar eval
+    slices, no effect in this pipeline is resolvable. Raise seeds/window/budget before believing
+    any cell; the matrix already reports this as its "what this sample supports" section.
+  - proposal: the harness can now emit a POWER/precision section that estimates how many seeds and
+    how long an eval window are needed to resolve an effect of a given size from the observed
+    within-config spread. That turns "3 seeds, trust me" into a computed requirement, and it is the
+    natural next slice for anyone who wants a real verdict from this pipeline.
 ---
 
 ## Guardrails
