@@ -872,6 +872,17 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
     nobody silently falls back to a zero-cost model config); that plus the
     domain refusals below are failures to be surfaced, never retried
     around.
+
+    Matching is on the message the real ``kraken-trading-bot`` CLI
+    actually prints, not on the Python exception class name. Found on
+    2026-10-01 against the real binary: ``cmd_backtest`` catches
+    ``Exception`` and prints ``Error backtesting <t>/<m>: {e}``, so the
+    class name never reaches stdout or stderr. Against the real CLI both
+    refusals degraded to a bare ``process_failed`` — the exact opaque
+    ``rc=1`` this function exists to avoid — because the synthetic fake
+    had been feeding text containing ``FileNotFoundError`` and
+    ``ActionSpaceMismatchError``. Both spellings are accepted here so a
+    future traceback (or an uncaught raise) still classifies.
     """
     reasons: list[str] = []
     rc = (record.get("returncodes") or {}).get("backtest")
@@ -888,16 +899,24 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
     )
     if status == "error" or rc not in (None, 0):
         reasons.append("process_failed")
-    if "FileNotFoundError" in text or "config" in text.lower() and "No such file" in text:
+    # Real CLI text: "Backtest config not found: <path>". Traceback text
+    # would carry the class name instead.
+    if (
+        "FileNotFoundError" in text
+        or "config not found" in text.lower()
+        or "No such file or directory" in text
+    ):
         reasons.append("config_not_found")
-    if "ActionSpaceMismatchError" in text:
+    # Real CLI text: "Action-space mismatch (<t>/<m> backtest): the model
+    # was trained as 'continuous' but ...".
+    if "ActionSpaceMismatchError" in text or "action-space mismatch" in text.lower():
         # The model's recorded action_space disagrees with the run's. An
         # UNRECORDED action_space (pre-provenance) is unproven, not a
         # mismatch, and the RL side treats it as such.
         reasons.append("action_space_mismatch")
     if "NotEnoughDataError" in text or (
         "ValueError" in text and "tradable bar" in text
-    ):
+    ) or "no tradable bar" in text.lower():
         # A pinned window left no tradable bar (eval slice shorter than
         # the warm-up). It RAISES rather than returning n_bars: 0.
         reasons.append("no_tradable_bar")

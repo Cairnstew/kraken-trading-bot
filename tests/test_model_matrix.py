@@ -1404,6 +1404,88 @@ def test_healthy_record_produces_no_failure_reasons():
     assert classify_process_failure(_record()) == []
 
 
+# ── Real CLI refusals, verbatim ────────────────────────────────────────
+#
+# Captured 2026-10-01 by running the real kraken-trading-bot binary. The
+# point of these is the MESSAGE: cmd_backtest catches Exception and prints
+# "Error backtesting <t>/<m>: {e}", so the Python class name never
+# reaches stdout/stderr. Matching only on the class name silently
+# degraded every real refusal to a bare process_failed -- the opaque rc=1
+# classify_process_failure exists to prevent.
+
+REAL_ACTION_SPACE_MISMATCH = [
+    "2026-10-01 13:36:46 [WARNING] kraken_trading_bot.rl.data: Extra features "
+    "file not found: ... -- skipping signal merge",
+    "2026-10-01 13:36:46 [ERROR] kraken_trading_bot.cli: Backtesting "
+    "ETH_USD/mv_probe failed: Action-space mismatch (ETH_USD/mv_probe "
+    "backtest): the model was trained as 'continuous' but this backtest "
+    "would replay it as 'discrete'. A policy bound to the wrong action "
+    "space emits actions it never learned to emit, so its return is "
+    "meaningless.",
+    "Error backtesting ETH_USD/mv_probe: Action-space mismatch "
+    "(ETH_USD/mv_probe backtest): the model was trained as 'continuous' "
+    "but this backtest would replay it as 'discrete'.",
+]
+
+REAL_CONFIG_NOT_FOUND = [
+    "2026-10-01 13:36:00 [ERROR] kraken_trading_bot.cli: Backtesting "
+    "ETH_USD/mv_probe failed: Backtest config not found: /tmp/mv/NOPE.yaml. "
+    "Pass --config with an existing YAML file (e.g. configs/default.yaml), "
+    "or omit it to replay with the model's own config.",
+    "Error backtesting ETH_USD/mv_probe: Backtest config not found: "
+    "/tmp/mv/NOPE.yaml. Pass --config with an existing YAML file (e.g. "
+    "configs/default.yaml), or omit it to replay with the model's own "
+    "training config.",
+]
+
+
+def _real_errored(stderr_tail):
+    record = {
+        "cell_id": "abc123",
+        "status": "error",
+        "params": {"ticker": "ETH_USD"},
+        "returncodes": {"train": 0, "backtest": 1},
+        "error": "train rc=0, backtest rc=1; " + stderr_tail[-1][:400],
+        "stderr_tail": stderr_tail,
+        "backtest": None,
+    }
+    return record
+
+
+def test_real_action_space_mismatch_is_classified_not_just_process_failed():
+    reasons = classify_process_failure(
+        _real_errored(REAL_ACTION_SPACE_MISMATCH)
+    )
+    assert "action_space_mismatch" in reasons
+    assert "process_failed" in reasons
+
+
+def test_real_config_not_found_is_classified_not_just_process_failed():
+    reasons = classify_process_failure(_real_errored(REAL_CONFIG_NOT_FOUND))
+    assert "config_not_found" in reasons
+    assert "process_failed" in reasons
+
+
+def test_real_refusals_reach_assess_cell_as_specific_reasons():
+    """The reason must survive into the INVALID block the user reads."""
+    assert "action_space_mismatch" in assess_cell(
+        _real_errored(REAL_ACTION_SPACE_MISMATCH)
+    )
+    assert "config_not_found" in assess_cell(
+        _real_errored(REAL_CONFIG_NOT_FOUND)
+    )
+
+
+def test_traceback_spelling_still_classifies():
+    """An uncaught raise would carry the class name instead."""
+    assert "action_space_mismatch" in classify_process_failure(
+        _real_errored(["ActionSpaceMismatchError: trained continuous"])
+    )
+    assert "config_not_found" in classify_process_failure(
+        _real_errored(["FileNotFoundError: no such config"])
+    )
+
+
 # ── --pages sizing and equity-curve trimming ───────────────────────────
 
 
