@@ -209,6 +209,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="models",
         help="Model registry root (default: models).",
     )
+    train_parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit a single JSON object on stdout (ticker_id, model_name, "
+            "n_features, n_bars, timesteps, seed, model_path) and nothing "
+            "else; logs stay on stderr."
+        ),
+    )
 
     # ── backtest command ──────────────────────────────────────────────────
     backtest_parser = sub.add_parser(
@@ -236,6 +245,27 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Seed for the deterministic replay (default: 42).",
+    )
+    backtest_parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "YAML run config (default: none — the model's own config only). "
+            "Supplies fee_rate, slippage, action_space, initial_balance, "
+            "market_data_store and data_window. Without it a backtest "
+            "replays frictionless whenever the model was trained "
+            "frictionless."
+        ),
+    )
+    backtest_parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit the full BacktestResult as a single JSON object on "
+            "stdout and nothing else; logs stay on stderr. Includes "
+            "buy_hold_return, excess_return, buy_hold_max_drawdown, "
+            "n_bars, fee_rate and slippage."
+        ),
     )
     backtest_parser.add_argument(
         "--models-root",
@@ -448,6 +478,8 @@ def cmd_paper_trade(args: argparse.Namespace) -> int:
 
 def cmd_train(args: argparse.Namespace) -> int:
     """Train a PPO RL model for one ticker and register it."""
+    import json
+
     from kraken_trading_bot.rl.train import train_ticker
 
     # Only flags the user actually set become config overrides, so the
@@ -484,6 +516,30 @@ def cmd_train(args: argparse.Namespace) -> int:
         return 1
 
     summary = record.config_summary()
+    # `n_bars` is the window provenance written by train_ticker: the bars
+    # this run actually trained on. None for an artifact trained before
+    # that key existed.
+    n_bars = record.config.get("n_bars")
+    if args.json:
+        # stdout is a single JSON object and nothing else, so a caller can
+        # parse it without stripping anything. Logs went to stderr.
+        print(
+            json.dumps(
+                {
+                    "ticker_id": record.ticker_id,
+                    "model_name": record.model_name,
+                    "n_features": summary.get("n_features"),
+                    "n_bars": None if n_bars is None else int(n_bars),
+                    "timesteps": int(args.timesteps),
+                    "seed": args.seed,
+                    "model_path": (
+                        str(record.model_path) if record.model_path else None
+                    ),
+                }
+            )
+        )
+        return 0
+
     print(f"Trained model {record.ticker_id}/{record.model_name}")
     print(f"  Model path:      {record.model_path}")
     print(f"  Normalization:   {record.normalization_path}")
@@ -497,12 +553,18 @@ def cmd_train(args: argparse.Namespace) -> int:
     # The observation width, so a later `models` listing can show whether
     # this artifact predates a pipeline widening.
     print(f"  Obs features:    {summary.get('n_features')}")
+    if n_bars is not None:
+        # The magnitude of the training window: a 12-bar artifact and a
+        # 3000-bar one produce returns of the same shape.
+        print(f"  Training bars:   {int(n_bars)}")
     print(f"  Trained:         {record.is_trained()}")
     return 0
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
     """Replay a trained RL model on fresh OHLC data and print metrics."""
+    import json
+
     from kraken_trading_bot.rl.backtest import backtest_model
 
     try:
@@ -512,6 +574,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
             pages=args.pages,
             seed=args.seed,
             models_root=args.models_root,
+            config_path=args.config,
         )
     except Exception as e:
         _LOGGER.error(
@@ -521,13 +584,33 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         return 1
 
     d = result.to_dict()
+    if args.json:
+        # One JSON object on stdout and nothing else: the module logs to
+        # stderr, so a caller can pipe this straight into a parser.
+        print(json.dumps(d))
+        return 0
+
     print(f"Backtest {d['ticker_id']}/{d['model_name']}")
     print(f"  Total return:   {d['total_return'] * 100.0:.2f}%")
+    # The reference point. A strategy return on its own cannot distinguish
+    # a working model from a lucky one on a rising asset.
+    print(f"  Buy & hold:     {d['buy_hold_return'] * 100.0:.2f}%")
+    print(f"  Excess return:  {d['excess_return'] * 100.0:.2f}%")
     print(f"  Sharpe:         {d['sharpe']:.3f}")
     print(f"  Max drawdown:   {d['max_drawdown'] * 100.0:.2f}%")
+    print(f"  Buy&hold maxdd: {d['buy_hold_max_drawdown'] * 100.0:.2f}%")
     print(f"  Trades:         {d['num_trades']}")
     print(f"  Win rate:       {d['win_rate'] * 100.0:.2f}%")
     print(f"  Final equity:   {d['final_equity']:,.2f}")
+    # Magnitude guard: how much data these numbers actually describe.
+    print(f"  Bars replayed:  {d['n_bars']}")
+    # Echo the costs that were actually applied, so this output cannot be
+    # read as a frictionless result when it was one.
+    print(
+        f"  Fee / slippage: {d['fee_rate'] * 100.0:.4f}% / "
+        f"{d['slippage'] * 100.0:.4f}%"
+    )
+    print(f"  Action space:   {d['action_space']}")
     return 0
 
 

@@ -94,6 +94,14 @@ kraken-trading-bot train --ticker ETH_USD --model ppo_eth_01 \
 # Backtest a trained model on fresh OHLC data
 kraken-trading-bot backtest --ticker ETH_USD --model ppo_eth_01
 
+# Evaluate under a config: real execution costs, a pinned data window, and
+# the out-of-sample tail of it. Without --config the replay is frictionless
+# whenever the model was trained frictionless — the result echoes back the
+# fee_rate/slippage it actually applied, so that is visible rather than
+# assumed.
+kraken-trading-bot backtest --ticker ETH_USD --model ppo_eth_01 \
+  --config configs/default.yaml --json
+
 # Dump the data-pipeline stages for inspection (no model needed)
 kraken-trading-bot export-data --ticker ETH_USD --output exports/ETH_USD.csv
 

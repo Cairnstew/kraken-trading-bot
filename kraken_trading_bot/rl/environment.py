@@ -356,6 +356,19 @@ class TradingEnvironment(gym.Env):
         return self._trades
 
     @property
+    def start_index(self) -> int:
+        """First bar index this episode trades on (the warm-up boundary).
+
+        The realized bar range of a replay is
+        ``[start_index, start_index + steps)``, so a caller measuring
+        "which bars did this run actually use" — the backtest's
+        buy-and-hold benchmark is exactly that — needs this rather than
+        the frame length.  Read-only: it reports the boundary
+        :meth:`_first_valid_index` chose and cannot move it.
+        """
+        return int(self._start_index)
+
+    @property
     def feature_names(self) -> list[str]:
         """Names of the columns in the observation vector."""
         return list(self._feature_names)

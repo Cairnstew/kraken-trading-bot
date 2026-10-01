@@ -141,6 +141,48 @@ signal_require_ticker: true
 # mapped yet). Consumer contract: `kraken-deep-history/INTEGRATION.md`.
 market_data_store: null
 
+# --- Data window (pinning + train/eval split) ---------------------------
+# WHY THIS EXISTS. `train` and `backtest` each fetched their own FRESH
+# trailing window. Two fetches of the same pair have been measured to
+# disagree by 16% on the fitted std of `rsi_24`, so a comparison across
+# runs was comparing *data*, not configs. Pinning one window makes both
+# legs see the same bars, so a difference between two runs is a difference
+# between their configs.
+#
+#   since      ISO-8601 INCLUSIVE lower bound, or null.
+#   until      ISO-8601 EXCLUSIVE upper bound, or null.
+#              Half-open on purpose: it joins end-to-end without
+#              double-counting the bar that bounds both sides.
+#   eval_split fraction of the pinned window used for TRAINING; the
+#              remainder is the out-of-sample eval slice. 1.0 = no split.
+#
+# Semantics, precisely:
+#   * Both null (the default below) -> behaviour is EXACTLY as before:
+#     a fresh trailing fetch of the whole frame, and `eval_split` is not
+#     applied at all. Honouring a 0.7 split against an open-ended window
+#     would silently train on 70% of the bars of every existing run.
+#   * Either bound set -> `train` clips to [since, until) and keeps the
+#     leading `eval_split` fraction; `backtest` clips to the same window
+#     and replays only the bars AFTER that split. The two are disjoint,
+#     so the backtest is genuinely out-of-sample.
+#
+# A BACKTEST ON TRAINING BARS IS IN-SAMPLE. With `eval_split: 1.0`, or
+# with the whole window replayed, a reported return describes bars the
+# model's normalization stats were fitted on and its policy saw. That is
+# the mistake this block exists to make hard to commit by accident, and
+# it is why the default is a real split rather than 1.0.
+#
+# `n_bars` on the backtest result reports the bars ACTUALLY replayed: a
+# run can finish with no error while replaying a handful of bars of a much
+# larger frame, so check it before trusting any return next to it.
+# Boundaries are applied as a clip on the fetched frame, not pushed into
+# the read, so a pinned window still needs `--pages` large enough to cover
+# it (and `eval_split` large enough to leave a tradable eval slice).
+data_window:
+  since: null
+  until: null
+  eval_split: 0.7
+
 # --- Model metadata -----------------------------------------------------
 # Directory layout: models/{ticker_id}/{model_name}/
 #   model.zip, normalization.npz, config.yaml

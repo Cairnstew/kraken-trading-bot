@@ -34,7 +34,7 @@ with reinforcement learning:
 from __future__ import annotations
 
 from .agent import RLAgent
-from .backtest import BacktestResult, backtest_model
+from .backtest import ActionSpaceMismatchError, BacktestResult, backtest_model
 from .data import (
     NotEnoughDataError,
     SignalTickerMismatchError,
@@ -42,6 +42,13 @@ from .data import (
     fetch_ohlc_dataframe,
     prepare_episode,
     read_ohlc_dataframe,
+)
+from .data_window import (
+    DataWindow,
+    clip_to_window,
+    evaluation_frame,
+    resolve_data_window,
+    training_frame,
 )
 from .environment import RewardSpec, TradingEnvironment
 from .export import build_export_frame, default_export_path, write_export_csv
@@ -72,6 +79,11 @@ __all__ = [
     "fetch_ohlc_dataframe",
     "read_ohlc_dataframe",
     "prepare_episode",
+    "DataWindow",
+    "resolve_data_window",
+    "clip_to_window",
+    "training_frame",
+    "evaluation_frame",
     "load_train_config",
     "resolve_default_config_path",
     "build_train_config",
@@ -80,6 +92,7 @@ __all__ = [
     "build_export_frame",
     "default_export_path",
     "write_export_csv",
+    "ActionSpaceMismatchError",
     "BacktestResult",
     "backtest_model",
     "PaperSignal",

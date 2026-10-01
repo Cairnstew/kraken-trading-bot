@@ -18,6 +18,7 @@ import yaml
 
 from .agent import RLAgent
 from .data import prepare_episode, read_ohlc_dataframe
+from .data_window import resolve_data_window, training_frame
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
 from .registry import ModelRecord, register_model
@@ -147,13 +148,20 @@ def train_ticker(
     3. Fetch OHLC history with client-side pagination (read through the
        local ``market_data_store`` when ``configs/default.yaml`` sets one;
        otherwise the live fetch, unchanged).
+    3b. Clip to the pinned ``data_window`` (when the config sets one) and
+       keep the leading ``eval_split`` fraction — the bars a matching
+       ``backtest`` will replay out-of-sample.  With an unpinned window
+       this is a no-op and the whole frame is used, exactly as before.
     4. Fit a :class:`FeaturePipeline` from the config on the fetched
        data.
     5. Build a :class:`TradingEnvironment` from the config (fee,
        slippage, reward spec, action space).
     6. Train the :class:`RLAgent` and save ``model.zip``.
     7. Save ``normalization.npz`` and ``config.yaml`` next to the
-       policy and register the model.
+       policy and register the model.  ``config.yaml`` also carries the
+       ``data_window`` it was trained on and the resulting ``n_bars``, so
+       a later backtest (or a matrix report) can read the window back
+       instead of re-deriving it.
     8. Return the :class:`ModelRecord`.
 
     Args:
@@ -194,6 +202,20 @@ def train_ticker(
         signal_require_ticker=cfg.get("signal_require_ticker", True),
         market_data_store=cfg.get("market_data_store"),
     )
+
+    # Pinned window + train/eval split.  `training_frame` returns the very
+    # same object when the window is unpinned, so the default path reads
+    # the whole freshly-fetched frame exactly as it always has.
+    window = resolve_data_window(cfg)
+    df = training_frame(df, window)
+    if window.is_pinned:
+        _LOGGER.info(
+            "Training window %s -> %d bars (the remaining %d%% is held out "
+            "for the out-of-sample backtest)",
+            window.describe(),
+            len(df),
+            int(round((1.0 - window.eval_split) * 100)),
+        )
 
     features = FeaturePipeline(
         windows=cfg.get("feature_windows", [1, 4, 24]),
@@ -242,6 +264,17 @@ def train_ticker(
     # `registry.ModelRecord.is_stale_width` reports on.
     n_features = int(env.observation_space.shape[0])
     cfg["n_features"] = n_features
+
+    # Window provenance, recorded alongside the width.  `n_bars` is the
+    # magnitude guard for a report: a model trained on 12 bars and a model
+    # trained on 3 000 produce returns of the same shape and none of the
+    # same meaning, and the number that says which one this is was not
+    # recoverable from the artifact.  `data_window` is already in `cfg`
+    # (it came from the YAML), so it lands in config.yaml by itself and
+    # a matching `backtest --config` can read back what it was trained
+    # on rather than assuming.
+    cfg["n_bars"] = int(len(episode_df))
+    cfg.setdefault("train_timesteps", int(total_timesteps))
 
     # Persist the per-ticker normalization next to the policy.
     ticker_key = normalize_ticker_id(ticker_id)
