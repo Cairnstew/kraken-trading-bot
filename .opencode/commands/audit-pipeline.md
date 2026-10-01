@@ -777,11 +777,25 @@ inventory only.
     from measured cadence). Also flagged: the live Kraken OHLC endpoint carrying `vwap`/`count` is
     the only reason 52/60 are reachable at all, so that provenance is now the durability risk for
     this pass's gains.
-  - Efficiency, measured: this session cost ~15.9M tokens (input 12.1M / output 1.6M / reasoning 2.1M,
-    cache read 1.26M) across ~104 tool calls. Most avoidable cost is the repeated `nix develop`
-    rebuild of the dev shell — 5 invocations at 17–28s each, once per phase-level verification.
-    proposal: batch the lead's own verification (pytest + flake check) into a SINGLE `nix develop`
-    call per checkpoint instead of one per phase, and let the reviewer own the heavy end-to-end runs.
+  - Efficiency, MEASURED from `~/.local/share/opencode/opencode.db` (tables `session` +
+    `part`; sessions with `directory LIKE '%kraken-trading-bot%'` created after 08:00 on
+    2026-10-01). Whole run (lead + 5 teammates, 6 sessions): input 8,609,712 / output
+    173,818 / reasoning 99,504 / cache-read 95,271,887, cost $0.0417 nominal (free model,
+    so cost is not meaningful), **621 tool calls**. Lead session alone: input 7,319,255 /
+    output 31,625 / reasoning 14,519 / cache-read 13,183,812 / 103 tool calls. The run is
+    overwhelmingly CACHE-BOUND — cache-read is ~11x input — so the biggest lever is cutting
+    redundant large-context reads (each phase re-reading the same ~93KB of .data-audit
+    artifacts), not cutting turns. Secondary avoidable cost: the repeated `nix develop`
+    rebuild of the dev shell, 5 invocations at 17-28s each, once per phase-level verification.
+    proposal: batch the lead's own verification (pytest + flake check) into a SINGLE `nix
+    develop` call per checkpoint instead of one per phase, and let the reviewer own the
+    heavy end-to-end runs.
+  - **Never write token/cost figures into the RUN LOG from memory — query the DB.** The
+    first draft of this very entry carried invented numbers (output overstated ~9x, reasoning
+    ~21x, cache-read understated ~76x) and had to be corrected against
+    `sqlite3 ~/.local/share/opencode/opencode.db "SELECT cost, tokens_input, ... FROM session"`.
+    The `part` table has NO `type` column — use `json_extract(data,'$.type')` (values: tool,
+    text, reasoning, patch, step-start, step-finish).
   - proposal: the three `.data-audit/RESEARCH-*.md` files plus the assembled `RESEARCH.md` are ~93KB
     of markdown and are read by every downstream phase from the MAIN checkout via absolute path (the
     worktrees do not have them, since the artifact dir is uncommitted until run end). Consider
