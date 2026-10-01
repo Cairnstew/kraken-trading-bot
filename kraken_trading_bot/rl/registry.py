@@ -62,9 +62,11 @@ class ModelRecord:
         """A short, serializable summary of the training config.
 
         Returns:
-            Dict with ticker, model_name, action_space, reward mode and
-            feature window settings — the keys most useful for
-            comparing models.
+            Dict with ticker, model_name, action_space, reward mode,
+            feature window settings and the recorded ``n_features`` — the
+            keys most useful for comparing models.  ``n_features`` is
+            ``None`` for artifacts trained before width provenance was
+            recorded.
         """
         return {
             "ticker": self.config.get("ticker"),
@@ -75,7 +77,42 @@ class ModelRecord:
             else None,
             "feature_windows": self.config.get("feature_windows"),
             "feature_groups": self.config.get("feature_groups"),
+            "n_features": self.n_features,
         }
+
+    @property
+    def n_features(self) -> int | None:
+        """Observation width the model was trained at, or None if unrecorded.
+
+        Written into ``config.yaml`` by ``train.train_ticker`` since the
+        49 -> 55 widening.  ``None`` means the artifact predates width
+        provenance (it was trained before ``n_features`` was recorded),
+        which is itself the condition :meth:`is_stale_width` reports.
+        """
+        value = self.config.get("n_features")
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def is_stale_width(self, live_width: int) -> bool:
+        """True when the recorded width disagrees with the live pipeline.
+
+        Args:
+            live_width: Observation width the live
+                :class:`~kraken_trading_bot.rl.features.FeaturePipeline`
+                produces for this ticker's inputs.
+
+        Returns:
+            ``True`` when a width is recorded and it differs from
+            ``live_width``, or when no width was recorded at all (a
+            pre-provenance artifact is untrustworthy rather than known
+            good).  ``False`` only on an exact match.
+        """
+        recorded = self.n_features
+        return recorded is None or recorded != int(live_width)
 
     def is_trained(self) -> bool:
         """True when the model policy and normalization are both on disk."""

@@ -36,7 +36,10 @@ import yaml
 from kraken_api.models import Candle
 
 from kraken_trading_bot.rl import SignalTickerMismatchError, read_ohlc_dataframe
-from kraken_trading_bot.rl.data import merge_extra_features
+from kraken_trading_bot.rl.data import (
+    add_derived_ohlcv_features,
+    merge_extra_features,
+)
 from kraken_trading_bot.rl.export import build_export_frame
 from kraken_trading_bot.rl.features import FeaturePipeline
 
@@ -540,4 +543,192 @@ def test_paper_trade_deliberately_passes_no_since() -> None:
         and node.func.id == "read_ohlc_dataframe"
     ]
     assert calls, "paper_trade no longer calls read_ohlc_dataframe"
-    assert "since" not in {kw.arg for kw in calls[0].keywords if kw.arg}
+    assert "since" not in {kw.arg for kw in calls[0].keywords if kw.arg}# ---------------------------------------------------------------------------
+# 4. Gap-1 widening: the activated columns reach the observation
+# ---------------------------------------------------------------------------
+def test_funding_signal_columns_round_trip_through_merge(tmp_path) -> None:
+    """Every new ``_SIGNAL_COLUMNS`` member survives the merge allow-list.
+
+    The allow-list is ``_SIGNAL_COLUMNS`` minus the freshness pair, so a
+    name absent from that tuple is dropped by the seam *before* the
+    feature pipeline ever sees the frame.  These three were exactly that:
+    emitted by the sibling into every funding JSONL record, then
+    discarded.
+    """
+    from kraken_trading_bot.rl.features import _SIGNAL_COLUMNS
+
+    frame = pd.DataFrame(
+        {
+            "open": 2000.0,
+            "high": 2001.0,
+            "low": 1999.0,
+            "close": 2000.0,
+            "vwap": 2000.5,
+            "volume": 10.0,
+            "count": 7,
+        },
+        index=pd.date_range(
+            "2026-08-01T12:00:00Z", periods=6, freq="h"
+        ),
+    )
+    signals = _write_signals(
+        tmp_path / "funding.jsonl",
+        [
+            {
+                "ticker": _PAIR,
+                "timestamp": "2026-08-01T12:00:00Z",
+                "funding_rate": 0.0001,
+                "basis": 0.0002,
+                "open_interest": 1000.0,
+                # The two newly-whitelisted funding columns:
+                "funding_rate_prediction": 0.0003,
+                "vol24h": 42000.5,
+                # And the builder inputs for `spread`.
+                "bid": 2000.0,
+                "ask": 2000.4,
+            }
+        ],
+    )
+
+    merged = merge_extra_features(frame, str(signals), ticker=_PAIR)
+
+    for name in ("funding_rate_prediction", "vol24h", "bid", "ask"):
+        assert name in _SIGNAL_COLUMNS, f"{name} must be on the allow-list"
+        assert name in merged.columns, f"{name} was dropped at the seam"
+    assert merged["funding_rate_prediction"].iloc[0] == pytest.approx(0.0003)
+    assert merged["vol24h"].iloc[0] == pytest.approx(42000.5)
+    assert merged["bid"].iloc[0] == pytest.approx(2000.0)
+
+
+def test_bid_ask_reach_the_observation_as_spread_only(tmp_path) -> None:
+    """Clean +1 accounting: `spread` yes, raw dollar `bid`/`ask` no.
+
+    Whitelisting the funding bid/ask *naively* would put two more
+    dollar-scale columns in the observation (net +3 for one ratio).  They
+    are builder inputs: `_add_microstructure_features` owns `spread`.
+    """
+    frame = pd.DataFrame(
+        {
+            "open": 2000.0,
+            "high": 2001.0,
+            "low": 1999.0,
+            "close": 2000.0,
+            "vwap": 2000.5,
+            "volume": 10.0,
+            "count": 7,
+        },
+        index=pd.date_range(
+            "2026-08-01T12:00:00Z", periods=6, freq="h"
+        ),
+    )
+    signals = _write_signals(
+        tmp_path / "funding.jsonl",
+        [
+            {
+                "ticker": _PAIR,
+                "timestamp": "2026-08-01T12:00:00Z",
+                "bid": 2000.0,
+                "ask": 2000.4,
+            }
+        ],
+    )
+    merged = merge_extra_features(frame, str(signals), ticker=_PAIR)
+    assert {"bid", "ask"}.issubset(merged.columns)  # builder inputs present
+
+    pipeline = FeaturePipeline(
+        windows=[1, 4], feature_groups=["microstructure", "signals"]
+    )
+    computed = pipeline.compute(merged)
+
+    assert "spread" in computed.columns
+    assert "bid" not in computed.columns
+    assert "ask" not in computed.columns
+    # (ask - bid) / bid
+    assert computed["spread"].iloc[0] == pytest.approx(0.4 / 2000.0)
+
+
+def test_all_six_activated_columns_reach_the_observation(tmp_path) -> None:
+    """End-to-end: the six names land in the fitted observation width.
+
+    Asserts on ``stats.feature_names``, i.e. on what the policy is
+    actually fitted and observed on, not on an intermediate frame.
+    """
+    n = 120
+    idx = pd.date_range("2026-08-01T00:00:00Z", periods=n, freq="h")
+    rng = np.random.default_rng(11)
+    close = 2000.0 + np.cumsum(rng.normal(0.0, 0.7, n))
+    frame = pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "vwap": close - 0.5,
+            "volume": rng.uniform(10.0, 50.0, n),
+            "count": rng.integers(5, 50, n).astype(float),
+        },
+        index=idx,
+    )
+    signals = _write_signals(
+        tmp_path / "funding.jsonl",
+        [
+            {
+                "ticker": _PAIR,
+                "timestamp": "2026-08-01T12:00:00Z",
+                "funding_rate_prediction": 0.0003,
+                "vol24h": 42000.5,
+                "bid": 2000.0,
+                "ask": 2000.4,
+            }
+        ],
+    )
+    # The read seam derives the three OHLCV-only scalars first, then the
+    # signal merge adds the funding columns — the real order every
+    # consumer goes through.
+    merged = merge_extra_features(
+        add_derived_ohlcv_features(frame), str(signals), ticker=_PAIR
+    )
+
+    pipeline = FeaturePipeline(windows=[1, 4, 24])
+    pipeline.fit(merged, ticker_id=_TICKER_ID)
+    stats = pipeline.stats_for(_TICKER_ID)
+    assert stats is not None
+
+    for name in (
+        "vwap_dev",
+        "trade_count_zscore_20",
+        "volume_per_trade",
+        "funding_rate_prediction",
+        "vol24h",
+        "spread",
+    ):
+        assert name in stats.feature_names, f"{name} missing from the observation"
+    # Clean accounting: the builder inputs stay out.
+    for name in ("bid", "ask"):
+        assert name not in stats.feature_names
+
+
+def test_config_points_at_a_real_funding_file_with_a_12h_bound() -> None:
+    """The activation that keeps the three funding columns non-silent.
+
+    A ``null`` ``funding_features_file`` means ``funding_rate_prediction``,
+    ``vol24h`` and ``spread`` exist in code and produce zero in
+    production.  The bound matters for the same reason: funding settles
+    ~8-hourly, so the null->1h default would mark most bars unobserved.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    default_cfg = yaml.safe_load(
+        (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
+    )
+    funding = default_cfg["funding_features_file"]
+    assert funding, "funding_features_file must name a real path"
+    assert str(funding).endswith(".jsonl")
+    assert default_cfg["signal_max_age_hours"] == 12
+
+    deep_cfg = yaml.safe_load(
+        (repo / "configs" / "deep-history.example.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert deep_cfg["funding_features_file"], "example config must agree"
+    assert deep_cfg["signal_max_age_hours"] == 12

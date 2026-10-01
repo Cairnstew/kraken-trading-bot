@@ -76,9 +76,16 @@ def test_build_export_frame_stage_column_order(manager):
     assert stages["ohlcv"] == [
         "time", "open", "high", "low", "close", "vwap", "volume", "count",
     ]
-    assert stages["signals"] == []  # no exogenous signals configured
+    # No *file*-backed signals configured, so the `signals` stage is empty.
+    # The three scalars the read seam derives from the frame's own
+    # vwap/count columns are NOT listed here: the signals feature group
+    # passes them through, so they appear once, in `features`.
+    assert stages["signals"] == []
     assert stages["normalized"] == []
-    assert len(stages["features"]) == 49  # default windows/groups
+    # 49 base + the three vwap/count-derived scalars (Gap-1 widening).
+    assert len(stages["features"]) == 52
+    for name in ("vwap_dev", "trade_count_zscore_20", "volume_per_trade"):
+        assert name in stages["features"]
 
     assert list(frame.columns) == [
         "timestamp",

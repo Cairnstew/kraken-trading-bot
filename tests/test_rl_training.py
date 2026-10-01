@@ -33,10 +33,19 @@ from kraken_trading_bot.rl import (
     register_model,
     train_ticker,
 )
+from kraken_trading_bot.rl.features import FeatureWidthMismatchError
 
 
 def _synthetic_ohlcv(n: int = 300, base: float = 2000.0, seed: int = 42) -> pd.DataFrame:
-    """Deterministic OHLCV fixture (random-walk close prices)."""
+    """Deterministic OHLCV fixture (random-walk close prices).
+
+    Carries ``vwap`` and ``count`` as well, because that is what a real
+    frame holds: the read seam (``data.read_ohlc_dataframe``) derives
+    ``vwap_dev``/``trade_count_zscore_20``/``volume_per_trade`` from them
+    (Gap-1 widening, 49 -> 52 features here), so a hand-built frame
+    without them would compute at the narrower width and trip the width
+    guard.  Use ``add_derived_ohlcv_features`` to stand in for the seam.
+    """
     rng = np.random.default_rng(seed)
     close = base * np.exp(np.cumsum(rng.normal(0.00005, 0.01, n)))
     open_ = np.concatenate([[close[0]], close[:-1]])
@@ -50,7 +59,9 @@ def _synthetic_ohlcv(n: int = 300, base: float = 2000.0, seed: int = 42) -> pd.D
             "high": high,
             "low": low,
             "close": close,
+            "vwap": (high + low + close) / 3.0,
             "volume": volume,
+            "count": rng.integers(10, 100, n),
         },
         index=idx,
     )
@@ -416,3 +427,104 @@ def test_load_train_config_empty_when_no_candidate_exists(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
 
     assert train_module.load_train_config() == {}
+
+
+# ---------------------------------------------------------------------------
+# Gap-1 widening: n_features provenance, written and surfaced
+# ---------------------------------------------------------------------------
+def test_train_ticker_records_n_features_in_config(tmp_path):
+    """Width provenance lands in config.yaml, so a stale artifact is detectable.
+
+    The six on-disk 49-wide artifacts are exactly what this makes visible:
+    a model with no ``n_features`` key cannot be compared against the live
+    pipeline's width at all.
+    """
+    base = int(pd.Timestamp("2024-01-01T00:00:00Z").timestamp())
+    n = 120
+    closes = 2000.0 * np.exp(
+        np.cumsum(np.random.default_rng(0).normal(0.0, 0.01, n))
+    )
+    candles = [_candle(base + i * 3600, float(closes[i]), "150.0", 5) for i in range(n)]
+
+    class OneShotManager:
+        def ohlc(self, pair, interval=60, since=None):
+            return candles, 0
+
+    record = train_ticker(
+        "ETH/USD",
+        "ppo_width",
+        manager=OneShotManager(),
+        pages=2,
+        total_timesteps=150,
+        seed=7,
+        models_root=tmp_path,
+    )
+
+    cfg = yaml.safe_load(record.config_path.read_text(encoding="utf-8"))
+    assert cfg["n_features"] == 52  # 49 base + the three vwap/count scalars
+
+    # Surfaced by the registry summary, and not stale against the live width.
+    assert record.config_summary()["n_features"] == 52
+    assert record.n_features == 52
+    assert record.is_stale_width(52) is False
+    assert record.is_stale_width(49) is True
+
+
+def test_registry_reports_a_pre_provenance_artifact_as_stale(tmp_path):
+    """A config without ``n_features`` is untrustworthy, not known-good."""
+    record = register_model(
+        "ETH/USD", "ppo_legacy", {"ticker": "ETH/USD"}, root=tmp_path
+    )
+    assert record.n_features is None
+    assert record.config_summary()["n_features"] is None
+    # Unknown width counts as stale: it can never be shown to match.
+    assert record.is_stale_width(52) is True
+
+
+def test_backtest_refuses_a_stale_width(tmp_path, monkeypatch):
+    """backtest_model now has a guard (it previously had none at all).
+
+    The mismatch is a widened *live* pipeline against the model's own
+    52-feature npz, which is the direction that used to surface late and
+    silently -- ``normalize`` dropped the extra column and the policy ran
+    happily.
+    """
+    import kraken_trading_bot.rl.backtest as bt_mod
+
+    base = int(pd.Timestamp("2024-01-01T00:00:00Z").timestamp())
+    n = 200
+    closes = 2000.0 * np.exp(np.cumsum(np.random.default_rng(1).normal(0.0, 0.01, n)))
+    candles = [_candle(base + i * 3600, float(closes[i]), "150.0", 5) for i in range(n)]
+
+    class OneShotManager:
+        def ohlc(self, pair, interval=60, since=None):
+            return candles, 0
+
+    train = train_ticker(
+        "ETH/USD",
+        "ppo_stale",
+        manager=OneShotManager(),
+        pages=2,
+        total_timesteps=150,
+        seed=5,
+        models_root=tmp_path,
+    )
+    assert train.is_trained()
+
+    # Simulate a *widened* pipeline: a feature the model never saw.
+    real_compute = FeaturePipeline.compute
+
+    def widened(self, df):
+        out = real_compute(self, df)
+        out["a_feature_from_the_future"] = 1.0
+        return out
+
+    monkeypatch.setattr(FeaturePipeline, "compute", widened)
+
+    with pytest.raises(FeatureWidthMismatchError, match="a_feature_from_the_future"):
+        bt_mod.backtest_model(
+            "ETH/USD",
+            "ppo_stale",
+            data=_synthetic_ohlcv(150, seed=3),
+            models_root=tmp_path,
+        )

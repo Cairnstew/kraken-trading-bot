@@ -57,6 +57,10 @@ _LOGGER = logging.getLogger(__name__)
 
 _OHLCV_COLUMNS = ("time", "open", "high", "low", "close", "vwap", "volume", "count")
 
+# Rolling window, in bars, of the trade-count activity z-score derived at
+# the read seam from the ``count`` column every OHLCV frame already carries.
+_TRADE_COUNT_ZSCORE_WINDOW = 20
+
 # Columns expected in signal JSONL records from sibling projects; the
 # canonical definition lives in ``features._SIGNAL_COLUMNS`` (imported
 # here so the merge seam and the observation allow-list share one source).
@@ -620,6 +624,70 @@ def _combine_freshness(
         df[_SIGNAL_AGE_COLUMN] = new_age
 
 
+def add_derived_ohlcv_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive the OHLCV-only scalars the observation was missing.
+
+    Every OHLCV frame this module produces already carries ``vwap`` and
+    ``count`` — the live path parses them in :func:`candles_to_dataframe`
+    and the market-data store persists them — but no feature builder ever
+    read either, so both were parsed, stored, exported and then dropped on
+    the floor.  This function derives three columns from them and the
+    ``signals`` feature group passes them through:
+
+    * ``vwap_dev`` = ``close / vwap - 1`` — the signed deviation of the
+      bar close from the volume-weighted average price (buy pressure when
+      positive).  The standard intraday "VWAP dev" feature.
+    * ``trade_count_zscore_20`` — a 20-bar rolling z-score of the bar's
+      trade-execution count, i.e. an *activity surprise*: a big move with
+      an unusual number of prints is a participation event, which the
+      ``volume`` group cannot express (one huge print and a thousand tiny
+      prints look identical there).
+    * ``volume_per_trade`` = ``volume / count`` — the bar-scale analogue
+      of a tick-level mean trade size, i.e. a persistent fill-composition
+      reading (institutional-size vs retail-size prints).
+
+    **Presence-gated, not required-column**, exactly like the
+    microstructure builder in ``features.py``: a frame from a source that
+    does not carry ``vwap``/``count`` still computes, at the narrower
+    width.  Nothing here raises or warns when the inputs are absent —
+    silently narrower is the honest answer, and the width guard
+    (``features.check_feature_width``) is what makes a *mismatch* loud.
+
+    The three columns are written on a **copy** of ``df`` (leaving the
+    caller's frame untouched) and only for the inputs actually present, so
+    a frame with ``vwap`` but no ``count`` still gains ``vwap_dev``.
+
+    Args:
+        df: Frame indexed by UTC ``DatetimeIndex``, sorted oldest first.
+
+    Returns:
+        A new frame with whichever derived columns the inputs support.
+    """
+    out = df.copy()
+
+    if "close" in df.columns and "vwap" in df.columns:
+        close = df["close"].astype(float)
+        vwap = df["vwap"].astype(float)
+        # A zero/NaN VWAP (empty field on the wire) yields NaN here, which
+        # the observation's ffill/fillna handles like every other warmup
+        # row rather than poisoning the z-scoring with an infinity.
+        out["vwap_dev"] = close / vwap.replace(0.0, np.nan) - 1.0
+
+    if "count" in df.columns:
+        count = df["count"].astype(float)
+        roll = count.rolling(_TRADE_COUNT_ZSCORE_WINDOW)
+        # ddof=0 matches the volume z-score's own convention, and the
+        # zero-std guard keeps a constant-count window at 0.0.
+        out["trade_count_zscore_20"] = (count - roll.mean()) / roll.std(
+            ddof=0
+        ).replace(0.0, 1.0)
+        if "volume" in df.columns:
+            volume = df["volume"].astype(float)
+            out["volume_per_trade"] = volume / count.replace(0.0, np.nan)
+
+    return out
+
+
 def candles_to_dataframe(candles: Sequence[Any]) -> pd.DataFrame:
     """Convert a list of :class:`kraken_api.models.Candle` to a DataFrame.
 
@@ -776,6 +844,12 @@ def fetch_ohlc_dataframe(
     # The exchange may return overlapping boundary candles across pages;
     # keep the first occurrence per timestamp.
     df = df[~df.index.duplicated(keep="first")].sort_index()
+    # OHLCV-derived scalars (vwap_dev, trade_count_zscore_20,
+    # volume_per_trade) are derived here, on the assembled frame rather
+    # than per page, so the rolling window sees real consecutive bars
+    # across page boundaries.  Presence-gated: a source without vwap/count
+    # simply comes back at the narrower width.
+    df = add_derived_ohlcv_features(df)
     for signal_file in (extra_features_file, funding_features_file, social_features_file):
         df = merge_extra_features(
             df,
@@ -929,6 +1003,9 @@ def read_ohlc_dataframe(
     df = store.read(pair, interval, since=since, until=until)
     if isinstance(df, pd.DataFrame) and df.empty:
         raise NotEnoughDataError(1, 0, what="OHLC candles")
+    # Same derivation as the live leg above, so the store and the direct
+    # fetch produce the identical column set — the two must never drift.
+    df = add_derived_ohlcv_features(df)
     for signal_file in (extra_features_file, funding_features_file, social_features_file):
         df = merge_extra_features(
             df,
@@ -1057,6 +1134,7 @@ __all__ = [
     "NotEnoughDataError",
     "SignalTickerMismatchError",
     "candles_to_dataframe",
+    "add_derived_ohlcv_features",
     "merge_extra_features",
     "fetch_ohlc_dataframe",
     "read_ohlc_dataframe",

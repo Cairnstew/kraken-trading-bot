@@ -494,6 +494,9 @@ def cmd_train(args: argparse.Namespace) -> int:
         f"reward={summary.get('reward_mode')}, "
         f"windows={summary.get('feature_windows')}"
     )
+    # The observation width, so a later `models` listing can show whether
+    # this artifact predates a pipeline widening.
+    print(f"  Obs features:    {summary.get('n_features')}")
     print(f"  Trained:         {record.is_trained()}")
     return 0
 
@@ -574,7 +577,10 @@ def cmd_models(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=False))
         return 0
 
-    header = f"{'Ticker':<10} {'Model':<16} {'Created':<19} {'Trained':<8} {'Action':<12} {'Reward':<12}"
+    header = (
+        f"{'Ticker':<10} {'Model':<16} {'Created':<19} {'Trained':<8} "
+        f"{'Action':<12} {'Reward':<12} {'Width':>5}"
+    )
     print(header)
     print("-" * len(header))
     for ticker in sorted(grouped):
@@ -585,11 +591,16 @@ def cmd_models(args: argparse.Namespace) -> int:
                 else "-"
             )
             summary = record.config_summary()
+            # "-" means the artifact predates width provenance, i.e. it
+            # cannot be shown to match the live pipeline (see
+            # ModelRecord.is_stale_width).
+            width = summary.get("n_features")
             print(
                 f"{ticker:<10} {record.model_name:<16} {created:<19} "
                 f"{'yes' if record.is_trained() else 'no':<8} "
                 f"{str(summary.get('action_space') or '-'):<12} "
-                f"{str(summary.get('reward_mode') or '-'):<12}"
+                f"{str(summary.get('reward_mode') or '-'):<12} "
+                f"{'?' if width is None else width:>5}"
             )
     return 0
 

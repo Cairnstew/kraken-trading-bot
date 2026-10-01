@@ -22,8 +22,20 @@ import pandas as pd
 import pytest
 from kraken_api.models import Candle
 
-from kraken_trading_bot.rl import SignalTickerMismatchError, fetch_ohlc_dataframe, read_ohlc_dataframe
-from kraken_trading_bot.rl.data import merge_extra_features
+import numpy as np
+
+from kraken_trading_bot.rl import (
+    FeaturePipeline,
+    SignalTickerMismatchError,
+    fetch_ohlc_dataframe,
+    prepare_episode,
+    read_ohlc_dataframe,
+)
+from kraken_trading_bot.rl.data import (
+    add_derived_ohlcv_features,
+    candles_to_dataframe,
+    merge_extra_features,
+)
 
 # 2026-08-01 12:00 UTC, the same anchor the sibling store's fixtures use.
 _BASE = 1785585600
@@ -126,9 +138,18 @@ class FakeStore:
         return df[self._COLUMNS]
 
 
+# The exact read contract: the eight OHLCV columns plus the three
+# scalars derived from vwap/count at the read seam (Gap 1 widening).  The
+# derived names are the last three, in derivation order.
+_DERIVED_OHLCV_COLUMNS = ["vwap_dev", "trade_count_zscore_20", "volume_per_trade"]
+_OHLCV_READ_CONTRACT = [
+    "time", "open", "high", "low", "close", "vwap", "volume", "count"
+] + _DERIVED_OHLCV_COLUMNS
+
+
 def _assert_shape(df: pd.DataFrame) -> None:
     """The pipeline's exact read contract (UTC DatetimeIndex named time)."""
-    assert list(df.columns) == ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
+    assert list(df.columns) == _OHLCV_READ_CONTRACT
     assert df.index.name == "time"
     assert pd.api.types.is_datetime64_any_dtype(df.index) and df.index.tz is not None
     assert df["time"].dtype.kind in "iu"
@@ -582,3 +603,151 @@ def test_read_ohlc_dataframe_absence_is_distinguishable_from_zero(tmp_path) -> N
     assert list(df["fng_index"]) == [0.0, 0.0, 0.0, 0.0]
     assert list(df["signal_observed"]) == [False, True, True, False]
     assert list(df["signal_age_hours"]) == [-1.0, 0.0, 1.0, -1.0]
+
+
+# ---------------------------------------------------------------------------
+# Gap-1 widening: the store leg derives the same columns as the live leg
+# ---------------------------------------------------------------------------
+def _moving_candles(n: int = 120, seed: int = 17) -> list[Candle]:
+    """Wandering OHLCV bars with a real vwap and a varying count.
+
+    Both matter: a flat frame makes ``vwap_dev`` identically 0 and a
+    constant count makes the trade-count z-score identically 0, which would
+    let a broken derivation pass unnoticed.
+    """
+    rng = np.random.default_rng(seed)
+    out: list[Candle] = []
+    for i in range(n):
+        close = 2000.0 + i * 1.5 + float(rng.normal(0.0, 3.0))
+        vwap = close - float(rng.uniform(0.0, 1.5))
+        out.append(
+            Candle(
+                pair="ETH/USD",
+                time=_BASE + i * _HOUR,
+                open=f"{close:.4f}",
+                high=f"{close + 2.0:.4f}",
+                low=f"{close - 2.0:.4f}",
+                close=f"{close:.4f}",
+                vwap=f"{vwap:.4f}",
+                volume=f"{10.0 + (i % 7):.2f}",
+                count=8 + (i % 11),
+            )
+        )
+    return out
+
+
+def test_store_read_leg_derives_the_ohlcv_scalars() -> None:
+    """The market-data store read carries the derived columns too.
+
+    The store persists ``vwap`` and ``count`` (the sibling's
+    ``_OHLCV_COLUMNS`` matches ours), so the store leg must derive the
+    same three scalars as the live leg -- otherwise the two paths drift
+    and a store-backed model trains at a different width than a
+    fetch-backed one.
+    """
+    candles = _moving_candles()
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=FakeSource(candles),
+        market_data_store=FakeStore(candles),
+    )
+
+    _assert_shape(df)
+    for name in _DERIVED_OHLCV_COLUMNS:
+        assert name in df.columns
+        # Finite from the 20-bar warmup onward (the first rows are NaN by
+        # construction, exactly like every other rolling indicator).
+        tail = df[name].iloc[20:].to_numpy(dtype=float)
+        assert np.isfinite(tail).all()
+        assert np.unique(tail).size > 1, f"{name} is constant, not derived"
+
+    expected = add_derived_ohlcv_features(candles_to_dataframe(candles))
+    for name in _DERIVED_OHLCV_COLUMNS:
+        np.testing.assert_allclose(
+            df[name].to_numpy(dtype=float),
+            expected[name].to_numpy(dtype=float),
+            rtol=1e-12,
+            equal_nan=True,
+        )
+
+
+def test_store_and_live_legs_derive_identical_columns() -> None:
+    """Byte-identical derived columns from both read paths.
+
+    ``read_ohlc_dataframe`` with a store and ``fetch_ohlc_dataframe`` must
+    not be able to drift: the derivation sits in both return paths, and
+    this pins that they agree.
+    """
+    candles = _moving_candles(60)
+
+    via_store = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=FakeSource(candles),
+        market_data_store=FakeStore(candles),
+    )
+    via_live = fetch_ohlc_dataframe(
+        "ETH/USD", 60, pages=1, manager=FakeSource(candles)
+    )
+
+    assert list(via_store.columns) == list(via_live.columns)
+    for name in _DERIVED_OHLCV_COLUMNS:
+        np.testing.assert_allclose(
+            via_store[name].to_numpy(dtype=float),
+            via_live[name].to_numpy(dtype=float),
+            rtol=1e-12,
+            equal_nan=True,
+        )
+
+
+def test_derived_columns_survive_prepare_episode() -> None:
+    """The derived columns reach the frame the environment is built from."""
+    candles = _moving_candles()
+    df = read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=FakeSource(candles),
+        market_data_store=FakeStore(candles),
+    )
+
+    pipe = FeaturePipeline(windows=[1, 4, 24])
+    episode = prepare_episode(df, pipe, ticker_id="ETH_USD", episode_bars=60)
+
+    for name in _DERIVED_OHLCV_COLUMNS:
+        assert name in episode.columns
+
+    stats = pipe.stats_for("ETH_USD")
+    assert stats is not None
+    for name in _DERIVED_OHLCV_COLUMNS:
+        assert name in stats.feature_names
+
+
+def test_missing_vwap_count_still_reads_at_the_narrower_width() -> None:
+    """Presence-gated: a store frame without vwap/count computes narrower.
+
+    Mirrors the pipeline-level width probe, but at the seam: the derived
+    columns are simply absent, and nothing raises or warns about it.
+    """
+    candles = _moving_candles(60)
+    for candle in candles:
+        candle.vwap = ""
+
+    df = fetch_ohlc_dataframe("ETH/USD", 60, pages=1, manager=FakeSource(candles))
+    # vwap is parsed as NaN, so the column is present and vwap_dev is all
+    # NaN -- the column set is unchanged, the values are not.
+    assert "vwap_dev" in df.columns
+    assert df["vwap_dev"].isna().all()
+    assert np.isfinite(df["volume_per_trade"].to_numpy(dtype=float)).all()
+
+    # count is always present on a real OHLCV frame, so drop it (and the
+    # already-derived columns, which the seam put there) to see the
+    # truly-absent path.
+    raw = candles_to_dataframe(candles).drop(columns=["count"])
+    without = add_derived_ohlcv_features(raw)
+    assert "trade_count_zscore_20" not in without.columns
+    assert "volume_per_trade" not in without.columns
+    assert "vwap_dev" in without.columns

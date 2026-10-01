@@ -1,0 +1,44 @@
+# Template for the funding-pull user unit.  Installed (with ETH/USD//home/seanc/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
+# substituted) by `just funding-timer`; the shipped `.service` next to it
+# is the same unit with the default values filled in.
+#
+# This is the ONE unit Gap-1 activation needs: without it the three
+# funding-derived columns (funding_rate_prediction, vol24h, spread) are
+# in the code but silently zero in production, because every
+# `*_features_file` key has nothing behind it.  It is deliberately NOT the
+# full Gap-2 scheduler — no news/social timers, no market-data-store
+# timer, no flake inputs for the other two sibling CLIs.
+#
+# Install manually if you would rather not use `just`:
+#   mkdir -p ~/.config/systemd/user
+#   sed -e 's|ETH/USD|ETH/USD|' -e "s|/home/seanc/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl|$HOME/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl|" \
+#     systemd/kraken-trading-bot-funding.service.in \
+#     > ~/.config/systemd/user/kraken-trading-bot-funding.service
+#   ln -sf "$PWD/systemd/kraken-trading-bot-funding.timer" ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kraken-trading-bot-funding.timer
+#
+# `loginctl enable-linger $USER` makes it fire while logged out.
+[Unit]
+Description=Pull Kraken funding snapshots into the trading bot's signal file
+Documentation=file:///home/seanc/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
+
+[Service]
+Type=oneshot
+# One reading per pull, appended.  Keyless (public Kraken Futures ticker).
+# The sibling writes the timestamp hour-floored, so a once-per-hour pull
+# naturally produces one record per hour.  A re-fire inside the same hour
+# (Persistent catch-up after a short suspend) appends a duplicate line,
+# which is harmless and self-limiting: `merge_extra_features` keeps the
+# last record per floored hour, so the extra line is discarded at the read
+# seam.  The file grows by ~1 line per hour, so it is a log, not state.
+#
+# `nix run` on the checked-out sibling avoids re-evaluating a flake per
+# fire while staying hermetic; the first fire builds it, later fires reuse
+# the store path.  The sibling is invoked, never modified.
+ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-funding-rates#kraken-funding-rates -- pull --pair ETH/USD --output /home/seanc/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl --append
+TimeoutStartSec=300
+# A failed pull must not be mistaken for a fresh file: leave the previous
+# JSONL alone and let the staleness bound (signal_max_age_hours) mark the
+# bars unobserved.
+SuccessExitStatus=0

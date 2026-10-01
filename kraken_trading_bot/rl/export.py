@@ -191,14 +191,34 @@ def build_export_frame(
     computed = features.compute(episode)
     observed = computed.ffill().fillna(0.0)
 
-    out = episode.copy()
+    # Drop columns the feature pipeline re-emits (the seam-derived
+    # OHLCV scalars and any merged signal column): they are already in
+    # `features`, and keeping the raw copy too would duplicate the column
+    # in the CSV and misreport the stage decomposition.
+    raw_only = [
+        c for c in episode.columns if c not in set(computed.columns)
+    ]
+    out = episode[raw_only].copy()
     out.insert(0, "timestamp", _timestamp_strings(out))
     # Same fill the environment applies before handing rows to the policy.
     out[list(observed.columns)] = observed
     out.insert(len(out.columns), "warmup", _warmup_mask(computed))
 
     ohlcv = [c for c in _OHLCV_COLUMNS if c in out.columns]
-    signals = [c for c in episode.columns if c not in set(_OHLCV_COLUMNS)]
+    # "Everything the read seam added that is not one of the eight raw
+    # OHLCV columns", minus anything the feature pipeline also emits.
+    # The subtraction matters: the seam-derived scalars
+    # (vwap_dev/trade_count_zscore_20/volume_per_trade) and every merged
+    # signal column are passed through by the `signals` feature group, so
+    # they are already in the `features` stage.  Listing them twice would
+    # put a duplicate-named column in the CSV and make the stage
+    # decomposition (which is the point of `attrs["stages"]`) a lie.
+    computed_names = set(computed.columns)
+    signals = [
+        c
+        for c in episode.columns
+        if c not in set(_OHLCV_COLUMNS) and c not in computed_names
+    ]
     normalized: list[str] = []
     if include_normalized:
         z = features.transform(episode, ticker_id=normalize_ticker_id(ticker_id))

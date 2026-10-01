@@ -35,15 +35,24 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import pandas as pd
 
 from .agent import RLAgent
-from .data import NotEnoughDataError, read_ohlc_dataframe
+from .data import (
+    NotEnoughDataError,
+    add_derived_ohlcv_features,
+    read_ohlc_dataframe,
+)
 from .environment import TradingEnvironment
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import (
+    FeaturePipeline,
+    NormalizationStats,
+    check_feature_width,
+    normalize_ticker_id,
+)
 from .registry import scan_model
 from .train import pair_from_ticker_id
 
@@ -317,27 +326,43 @@ class PaperTrader:
         """
         if self.context_bars is not None:
             df = df.tail(self.context_bars)
-        features = self.pipeline.compute(df).ffill().fillna(0.0)
+        # A frame handed straight to step() (tests, external schedulers)
+        # bypasses the read seam, so apply the same vwap/count derivation
+        # the seam would have applied before computing features.
+        computed = self.pipeline.compute(add_derived_ohlcv_features(df))
+        # ffill/fillna first, exactly as training did (fit/transform and
+        # the environment both z-score the *ffilled* matrix), so the affine
+        # transform is the observation's exact image.
+        features = computed.ffill().fillna(0.0)
         stats = self.pipeline.stats_for(self.ticker_key)
         if stats is not None:
+            self._validate_observation(computed.columns, stats)
             features = stats.normalize(features)
         obs = np.asarray(features.to_numpy(dtype=np.float32)[-1], dtype=np.float32)
-        return self._validate_observation(obs)
-
-    def _validate_observation(self, obs: np.ndarray) -> np.ndarray:
-        """Raise a clear error when the live observation width mismatches."""
-        expected = int(self.env.observation_space.shape[0])
-        actual = int(obs.shape[0])
-        if actual != expected:
-            raise ValueError(
-                f"Observation width mismatch for {self.ticker_key}/{self.model_name}: "
-                f"live features have {actual} columns but the model was trained "
-                f"with an observation space of {expected}. This usually means the "
-                f"feature config (feature_windows/feature_groups) or "
-                f"normalization.npz does not match the model; retrain or align "
-                f"the model config before paper trading."
-            )
         return obs
+
+    def _validate_observation(
+        self, columns: Sequence[str], stats: "NormalizationStats"
+    ) -> None:
+        """Assert the live frame's columns match the loaded model's.
+
+        Non-self-referential by construction: ``columns`` is what
+        ``pipeline.compute`` just produced from the live frame, while
+        ``stats.feature_names`` was read back from the model's own
+        ``normalization.npz``.  Neither side is derived from the other, so
+        a stale artifact cannot pass — the trap this replaces compared
+        ``env.observation_space.shape[0]`` against a vector that
+        ``NormalizationStats.normalize`` had *already* shrunk back to the
+        model's own width, so the check was true for any stale pair.
+
+        Raises:
+            FeatureWidthMismatchError: If the name sets differ.
+        """
+        check_feature_width(
+            stats.feature_names,
+            list(columns),
+            context=f"{self.ticker_key}/{self.model_name}",
+        )
 
     # ------------------------------------------------------------------
     # tick loop

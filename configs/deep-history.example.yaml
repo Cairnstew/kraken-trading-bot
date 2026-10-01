@@ -56,13 +56,17 @@ feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 
 # --- Exogenous signals (optional, as in default.yaml) --------------------
 extra_features_file: null
-funding_features_file: null
+# As in default.yaml, a real path: the systemd.user funding timer keeps
+# this file current, one hour-floored record per pull.
+funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
 social_features_file: null
 # Signal-merge guard rails, as in default.yaml (see the long comments
 # there): null derives a one-hour carry from the bar interval — with years
 # of seeded bars, 1h still matches the hourly signal cadence, and 0 would
-# demand a record on the exact hour of every bar.
-signal_max_age_hours: null
+# demand a record on the exact hour of every bar.  12 (as in default.yaml)
+# is the funding-appropriate value: funding settles ~8-hourly, so 1h would
+# leave most bars unobserved.
+signal_max_age_hours: 12
 signal_require_ticker: true
 
 # --- Local market-data store (deep history enabled) ----------------------

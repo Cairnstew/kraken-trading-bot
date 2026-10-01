@@ -235,6 +235,14 @@ def train_ticker(
     )
     agent.train(env, total_timesteps=total_timesteps)
 
+    # Width provenance, recorded BEFORE the config is written so it lands
+    # in config.yaml.  `n_features` is what the registry surfaces and
+    # what a stale-width artifact is detected by: a model trained before
+    # the 49 -> 55 widening has no such key, which is exactly the signal
+    # `registry.ModelRecord.is_stale_width` reports on.
+    n_features = int(env.observation_space.shape[0])
+    cfg["n_features"] = n_features
+
     # Persist the per-ticker normalization next to the policy.
     ticker_key = normalize_ticker_id(ticker_id)
     features.save_normalization(ticker_key, agent.save_dir / "normalization.npz")

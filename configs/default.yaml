@@ -59,10 +59,21 @@ extra_features_file: null
 # Path to a JSONL file of per-(ticker, hour) funding-rate/basis vectors
 # produced by the sibling `kraken-funding-rates` project:
 #   python ~/Projects/kraken-funding-rates/cli.py pull --pair ETH/USD \
-#     --output signals/eth_usd_funding.jsonl
-# Columns: funding_rate, basis, open_interest.  Merged after news signals
-# via the same timestamp-floor left-join.  Null/empty disables the feature.
-funding_features_file: null
+#     --output signals/eth_usd_funding.jsonl --append
+# Columns merged: funding_rate, basis, open_interest, plus
+# funding_rate_prediction (the forward/next-settlement estimate, distinct
+# from the settled rate), vol24h (the perp contract's rolling 24h volume)
+# and bid/ask — the last two of which the feature pipeline turns into the
+# `spread` column.  Merged after news signals via the same
+# timestamp-floor left-join.  Null/empty disables the feature.
+#
+# The path below is the one the systemd.user timer
+# (kraken-trading-bot-funding.{service,timer}, see nix/module.nix)
+# populates hourly (`just funding-timer`, or `just funding-pull` for a
+# one-off).  `--append` adds one hour-floored record per pull; a duplicate
+# inside the same hour is discarded at the merge seam.  Point a second
+# pair's model at its own file, e.g. signals/sol_usd_funding.jsonl.
+funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
 
 # Path to a JSONL file of per-(ticker, hour) social/search-trend vectors
 # produced by the sibling `kraken-social-signals` project:
@@ -83,11 +94,14 @@ social_features_file: null
 # A value with no reading behind it keeps its historical 0.0 fill, so this
 # pair is what tells a genuine 0 (extreme fear, balanced tilt) apart from
 # "nothing was reported".
-# null (default) derives the bound from the bar interval — one hour of
-# carry, i.e. one hourly bar, which is enough to bridge a single missed
-# pull.  Set an int to widen it (kraken-funding-rates settles ~8-hourly, so
-# a funding-heavy run wants e.g. 12) or 0 for a strict per-hour match.
-signal_max_age_hours: null
+# null derives the bound from the bar interval — one hour of carry, i.e.
+# one hourly bar, which is enough to bridge a single missed pull.  Set an
+# int to widen it, or 0 for a strict per-hour match.
+#
+# 12 is set here because `funding_features_file` is now a real file:
+# kraken-funding-rates settles ~8-hourly, so at the null→1h default a
+# funding reading covers only 76 of 721 bars, versus 301 of 721 at 12.
+signal_max_age_hours: 12
 
 # Require every merged signal file to actually be this ticker's file.
 # The sibling projects write a `ticker` field on every record, so a file

@@ -18,6 +18,11 @@ from kraken_api.models import Candle
 
 from kraken_trading_bot.cli import _build_parser, main
 from kraken_trading_bot.rl import train_ticker
+from kraken_trading_bot.rl.data import add_derived_ohlcv_features
+from kraken_trading_bot.rl.features import (
+    FeatureWidthMismatchError,
+    check_feature_width,
+)
 from kraken_trading_bot.rl.paper_trade import PaperSignal, PaperTrader, run_paper_trader
 
 
@@ -56,13 +61,17 @@ def _synthetic_ohlcv(n: int = 60, base: float = 2000.0, seed: int = 9) -> pd.Dat
     low = np.minimum(open_, close) * (1.0 - rng.uniform(0.0, 0.005, n))
     volume = rng.uniform(50.0, 200.0, n)
     idx = pd.date_range("2024-06-01", periods=n, freq="h")
+    # vwap/count too: the read seam derives the three OHLCV-only scalars
+    # from them, so a frame without them is a genuinely narrower one.
     return pd.DataFrame(
         {
             "open": open_,
             "high": high,
             "low": low,
             "close": close,
+            "vwap": (high + low + close) / 3.0,
             "volume": volume,
+            "count": rng.integers(10, 100, n),
         },
         index=idx,
     )
@@ -239,6 +248,14 @@ def test_sell_fires_when_position_held(trained_model):
 # observation correctness
 # ---------------------------------------------------------------------------
 def test_observation_width_mismatch_raises_clear_error(trained_model):
+    """A live frame narrower than the model was fitted on is rejected.
+
+    The guard is non-self-referential: the expected names come from the
+    model's own ``normalization.npz``, the actual columns from the live
+    ``compute``.  Dropping one column therefore fails *before*
+    ``normalize`` could silently shrink the row back to the model's
+    width, which is the tautology this replaced.
+    """
     root, _ = trained_model
     mgr = MockManager(_candle_window())
     trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
@@ -250,8 +267,40 @@ def test_observation_width_mismatch_raises_clear_error(trained_model):
         return out.loc[:, out.columns[1:]]  # one feature too few
 
     trader.pipeline.compute = broken
-    with pytest.raises(ValueError, match="Observation width mismatch"):
+    with pytest.raises(FeatureWidthMismatchError, match="Feature-width mismatch"):
         trader._build_observation(_synthetic_ohlcv(60))
+
+
+def test_observation_width_guard_is_not_self_referential(trained_model):
+    """The tautology: normalize() drops unknown columns, so a shape check
+    against ``env.observation_space`` always passes for a stale model.
+
+    Proven here directly: normalizing the live frame with the loaded
+    stats produces exactly the model's width again even when the live
+    pipeline had a whole extra column — which is precisely why the guard
+    must compare *names*, not the resulting row length.
+    """
+    root, _ = trained_model
+    mgr = MockManager(_candle_window())
+    trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
+
+    stats = trader.pipeline.stats_for(trader.ticker_key)
+    assert stats is not None
+    df = add_derived_ohlcv_features(_synthetic_ohlcv(60))
+    computed = trader.pipeline.compute(df)
+
+    # Simulate a widened live pipeline the model never saw.
+    computed = computed.copy()
+    computed["some_future_feature"] = 1.0
+
+    normalized = stats.normalize(computed.ffill().fillna(0.0))
+    assert normalized.shape[1] == len(stats.feature_names)
+    assert "some_future_feature" not in normalized.columns
+    # ...yet the name check still sees the truth.
+    with pytest.raises(FeatureWidthMismatchError, match="some_future_feature"):
+        check_feature_width(
+            stats.feature_names, list(computed.columns), context="unit"
+        )
 
 
 def test_built_observation_matches_env_space(trained_model):
@@ -288,12 +337,21 @@ def test_built_observation_is_z_scored_by_saved_stats(trained_model):
     df = _synthetic_ohlcv(60)
     obs = trader._build_observation(df)
 
-    # Identical transform to the training env's _raw_feature_array.
-    expected = trader.pipeline.transform(df, ticker_id=trader.ticker_key)
+    # Identical transform to the training env's _raw_feature_array.  Both
+    # sides derive the OHLCV-only scalars from the raw frame first, so a
+    # caller-supplied frame is on the same footing as a fetched one.
+    expected = trader.pipeline.transform(
+        add_derived_ohlcv_features(df), ticker_id=trader.ticker_key
+    )
     np.testing.assert_allclose(obs, expected[-1], rtol=1e-5, atol=1e-6)
 
     # ... and specifically not the raw ffilled row.
-    raw = trader.pipeline.compute(df).ffill().fillna(0.0).to_numpy(dtype=np.float32)
+    raw = (
+        trader.pipeline.compute(add_derived_ohlcv_features(df))
+        .ffill()
+        .fillna(0.0)
+        .to_numpy(dtype=np.float32)
+    )
     assert not np.allclose(obs, raw[-1])
 
 
@@ -365,3 +423,48 @@ def test_cli_paper_trade_dispatches_to_runner(trained_model):
         )
     assert rc == 0
     rpt.assert_called_once()
+
+# ---------------------------------------------------------------------------
+# Gap-1 widening: a caller-supplied frame is derived like a fetched one
+# ---------------------------------------------------------------------------
+def test_step_supplied_frame_gets_the_same_derivation(trained_model):
+    """A frame handed to step() is on the same footing as a fetched one.
+
+    step(df) skips the read seam, so the vwap/count derivation is applied
+    there too — otherwise a supplied frame would trip the width guard
+    rather than simply working.
+    """
+    root, _ = trained_model
+    mgr = MockManager(_candle_window())
+    trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
+
+    result = trader.step(_synthetic_ohlcv(60))
+    assert result["tick"] == 1
+    assert result["side"] in {"buy", "sell", "hold"}
+
+
+def test_paper_trader_observation_is_55_wide_with_a_funding_frame(trained_model):
+    """The gate number at the paper-trade boundary, with funding present.
+
+    49 base + three vwap/count scalars + funding_rate_prediction + vol24h
+    + spread.
+    """
+    root, record = trained_model
+    mgr = MockManager(_candle_window())
+    trader = PaperTrader("ETH/USD", "ppo_paper", manager=mgr, models_root=root)
+
+    df = add_derived_ohlcv_features(_synthetic_ohlcv(60))
+    df["funding_rate_prediction"] = 0.0003
+    df["vol24h"] = 42000.0
+    df["bid"] = df["close"] - 0.4
+    df["ask"] = df["close"] + 0.4
+
+    stats = trader.pipeline.stats_for(trader.ticker_key)
+    assert stats is not None
+    live = trader.pipeline.compute(add_derived_ohlcv_features(df))
+    assert live.shape[1] == 55
+
+    # Without the funding columns the live frame is the three-scalar-wider
+    # base, i.e. the trained model's own width.
+    plain = trader.pipeline.compute(add_derived_ohlcv_features(_synthetic_ohlcv(60)))
+    assert plain.shape[1] == len(stats.feature_names)

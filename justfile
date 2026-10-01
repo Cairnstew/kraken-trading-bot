@@ -7,6 +7,8 @@
 #   just export-data --ticker SOL_USD      dump the data pipeline frame to CSV
 #   just paper --ticker ETH_USD --model ppo_eth_01 --iterations 10
 #   just test               run the pytest suite
+#   just funding-pull       pull one Kraken funding snapshot (keyless)
+#   just funding-timer      enable the hourly systemd.user funding timer
 #
 # Every recipe that needs the project environment runs **inside the Nix
 # dev shell** automatically via `nix develop --command bash -c ...`, so you
@@ -119,6 +121,40 @@ balance:
 # Show open orders (requires credentials)
 orders:
   {{dev}} 'kraken-trading-bot orders'
+
+# ── Exogenous signals ───────────────────────────────────────────────────
+
+# Enable the hourly funding-snapshot systemd.user timer, so the funding
+# file `configs/default.yaml` points at stays current: one keyless API
+# call and one appended line per hour.
+#
+# `pair` and `output` must match the `funding_features_file` your model
+# config points at; the unit is generated (not symlinked) because
+# ExecStart embeds both.
+funding-timer pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir" "$root/$(dirname {{output}})"
+  sed -e "s|@PAIR@|{{pair}}|" -e "s|@OUTPUT@|$root/{{output}}|" \
+      "$root/systemd/kraken-trading-bot-funding.service.in" \
+      > "$unit_dir/kraken-trading-bot-funding.service"
+  ln -sf "$root/systemd/kraken-trading-bot-funding.timer" \
+      "$unit_dir/kraken-trading-bot-funding.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-funding.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-funding.timer --no-pager
+
+# Pull one funding snapshot by hand (the same command the timer runs)
+funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  mkdir -p "$root/$(dirname {{output}})"
+  nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
+    pull --pair {{pair}} --output "$root/{{output}}" --append
 
 # ── Tests / checks ───────────────────────────────────────────────────────
 

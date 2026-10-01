@@ -137,6 +137,50 @@ engine = TradingEngine(
 engine.run()
 ```
 
+### Observation width and the funding signal file
+
+The RL observation is **55 columns** wide with the default
+`feature_windows: [1, 4, 24]` and all five `feature_groups` — 49 base
+features plus six derived from columns the OHLCV and funding data
+already carry but that no builder used to read:
+
+| Column | Derived from |
+|---|---|
+| `vwap_dev` | the bar's own `vwap` (`close/vwap - 1`) |
+| `trade_count_zscore_20` | the bar's own `count` (20-bar rolling z-score) |
+| `volume_per_trade` | `volume / count` |
+| `funding_rate_prediction` | the funding JSONL's forward funding estimate |
+| `vol24h` | the funding JSONL's rolling 24h perp volume |
+| `spread` | the funding JSONL's `bid`/`ask` |
+
+The first three need nothing but the OHLCV frame, so they are live
+immediately. The last three need a funding file, which
+`configs/default.yaml` now points at:
+
+```bash
+# Populate it once (or: just funding-pull)
+nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
+  pull --pair ETH/USD \
+  --output ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl --append
+```
+
+Keep it fresh with the shipped user timer:
+
+```bash
+just funding-timer   # links + enables systemd/kraken-trading-bot-funding.{service,timer}
+```
+
+`signal_max_age_hours: 12` matches funding's ~8-hourly settlement (at the
+null→1h default a funding reading covers only 76 of 721 bars, versus 301
+at 12).
+
+**The width is guarded.** `train` records `n_features` in each model's
+`config.yaml` (`kraken-trading-bot models --json` surfaces it), and
+`backtest`/`paper-trade` compare the model's fitted `feature_names`
+against the live pipeline's columns and refuse to run on a mismatch. A
+model trained before this widening has no `n_features` and no derived
+columns, so it will not silently run column-less — retrain it.
+
 ## NixOS Module
 
 Import in your NixOS configuration:

@@ -1,0 +1,19 @@
+# One timer only.  Hourly is the cadence the funding cadence needs:
+# kraken-funding-rates settles ~8-hourly, but its snapshot also carries
+# bid/ask and vol24h, which move between settlements, so an hourly pull is
+# what keeps `spread` and `vol24h` non-stale.  It costs ~0.0003 calls/s.
+#
+# Installed/started by `just funding-timer`, or manually:
+#   systemctl --user enable --now kraken-trading-bot-funding.timer
+[Unit]
+Description=Hourly Kraken funding snapshot pull for kraken-trading-bot
+
+[Timer]
+OnCalendar=*-*-* *:17:00
+# Catch up after a suspend/lid-close instead of silently skipping hours.
+Persistent=true
+RandomizedDelaySec=120
+Unit=kraken-trading-bot-funding.service
+
+[Install]
+WantedBy=timers.target

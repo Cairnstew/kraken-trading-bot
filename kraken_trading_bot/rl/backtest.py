@@ -22,9 +22,9 @@ import numpy as np
 import pandas as pd
 
 from .agent import RLAgent
-from .data import read_ohlc_dataframe
+from .data import add_derived_ohlcv_features, read_ohlc_dataframe
 from .environment import TradingEnvironment
-from .features import FeaturePipeline, normalize_ticker_id
+from .features import FeaturePipeline, check_feature_width, normalize_ticker_id
 from .registry import ModelRecord, scan_model
 
 _LOGGER = logging.getLogger(__name__)
@@ -150,6 +150,11 @@ def backtest_model(
     else:
         df = data
 
+    # A caller-supplied frame bypasses the read seam, so apply the same
+    # vwap/count derivation here; otherwise the width guard below would
+    # (correctly) reject a frame that is merely missing the seam's step.
+    df = add_derived_ohlcv_features(df)
+
     # 2. Environment: reconstruct the pipeline when normalization exists.
     record = scan_model(ticker_id, model_name, root=models_root)
     config = record.config or {}
@@ -161,6 +166,21 @@ def backtest_model(
             or ["price", "technical", "volume", "microstructure", "signals"],
         )
         pipeline.load_normalization(ticker_key, record.normalization_path)
+
+    if pipeline is not None:
+        # Width guard (the 49 -> 55 widening ships with it).  backtest
+        # previously had no guard at all, so a stale artifact surfaced
+        # late — and, because normalize() drops unknown columns,
+        # silently — at agent.predict() instead of at a Dutch door.
+        # Non-self-referential: the model's feature_names come from its
+        # own normalization.npz, the columns from the live frame.
+        stats = pipeline.stats_for(ticker_key)
+        if stats is not None:
+            check_feature_width(
+                stats.feature_names,
+                list(pipeline.compute(df).columns),
+                context=f"{ticker_key}/{model_name} backtest",
+            )
 
     env = TradingEnvironment(
         ticker_id=ticker_id,

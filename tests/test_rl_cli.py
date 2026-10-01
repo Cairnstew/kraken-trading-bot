@@ -19,7 +19,7 @@ import pytest
 
 from kraken_trading_bot.cli import _build_parser, main
 from kraken_trading_bot.rl.backtest import BacktestResult
-from kraken_trading_bot.rl.registry import ModelRecord
+from kraken_trading_bot.rl.registry import ModelRecord, register_model
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +477,55 @@ def test_cli_export_data_dispatch_error_returns_1(capsys):
     captured = capsys.readouterr()
     assert rc == 1
     assert "Error exporting SOL_USD: boom" in captured.err
+
+# ---------------------------------------------------------------------------
+# Gap-1 widening: the CLI surfaces the observation width
+# ---------------------------------------------------------------------------
+def test_models_table_shows_a_width_column(tmp_path, capsys):
+    """`models` prints the width, or `?` for a pre-provenance artifact.
+
+    The whole point of recording `n_features` is that a human (or a
+    script) can tell a 49-wide artifact from a 55-wide one; the table is
+    where that shows up.
+    """
+    register_model(
+        "ETH_USD",
+        "ppo_wide",
+        {
+            "ticker": "ETH/USD",
+            "action_space": "continuous",
+            "reward": {"mode": "pnl"},
+            "feature_windows": [1, 4, 24],
+            "n_features": 55,
+        },
+        root=tmp_path,
+    )
+    register_model(
+        "SOL_USD",
+        "ppo_legacy",
+        {"ticker": "SOL/USD", "action_space": "discrete", "reward": {"mode": "pnl"}},
+        root=tmp_path,
+    )
+
+    assert main(["models", "--models-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    header = [line for line in out.splitlines() if line.startswith("Ticker")][0]
+    assert "Width" in header
+    rows = {
+        line.split()[0]: line for line in out.splitlines() if line.startswith(("ETH", "SOL"))
+    }
+    assert rows["ETH_USD"].split()[-1] == "55"
+    # No n_features recorded -> cannot be shown to match anything.
+    assert rows["SOL_USD"].split()[-1] == "?"
+
+
+def test_models_json_carries_n_features(tmp_path, capsys):
+    register_model(
+        "ETH_USD",
+        "ppo_wide",
+        {"ticker": "ETH/USD", "action_space": "continuous", "n_features": 55},
+        root=tmp_path,
+    )
+    assert main(["models", "--models-root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ETH_USD"][0]["config_summary"]["n_features"] == 55

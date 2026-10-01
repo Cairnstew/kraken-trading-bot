@@ -39,6 +39,10 @@ _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 # They are the reason a zero-filled value can be told apart from a
 # genuine 0 / balanced reading, so they must be added here once, not
 # re-declared per source.
+# OHLCV-derived scalars, derived at the ``data.py`` read seam from the
+# ``vwap``/``count`` columns every OHLCV frame already carries (Gap-1
+# widening, 49 -> 55).  vwap_dev = close/vwap - 1, volume_per_trade =
+# volume/count, trade_count_zscore_20 = 20-bar rolling z-score of count.
 _SIGNAL_COLUMNS = (
     "sentiment_score",
     "article_count",
@@ -51,6 +55,25 @@ _SIGNAL_COLUMNS = (
     "fng_index",
     "signal_age_hours",
     "signal_observed",
+    "vwap_dev",
+    "trade_count_zscore_20",
+    "volume_per_trade",
+    # Funding-record columns the sibling already emits but the merge
+    # allow-list used to drop: the forward (next-settlement) funding
+    # estimate, distinct from the settled funding_rate above, and the
+    # perp contract's rolling 24h volume (a different horizon than the
+    # bar `volume` the volume group already models).
+    "funding_rate_prediction",
+    "vol24h",
+    # Emitted by _add_microstructure_features from the funding bid/ask
+    # pair; see _SIGNAL_BUILDER_INPUT_COLUMNS for why it is listed here
+    # but not copied verbatim by the signals builder.
+    "spread",
+    # Raw bid/ask of the funding snapshot.  Listed so the merge seam
+    # carries them to the frame; the micro builder is what turns them
+    # into `spread`, so they never reach the observation themselves.
+    "bid",
+    "ask",
 )
 
 # The two columns above that describe freshness rather than a signal
@@ -59,6 +82,23 @@ _SIGNAL_COLUMNS = (
 # signal at all still contributes a usable number to the observation
 # instead of a NaN that would spread through the z-scoring.
 _SIGNAL_FRESHNESS_COLUMNS = ("signal_age_hours", "signal_observed")
+
+# Members of ``_SIGNAL_COLUMNS`` that reach the frame through the merge
+# seam but are NOT copied into the observation by
+# ``_add_signals_features``:
+#
+# * ``bid``/``ask`` are raw dollar prices that only exist as *builder
+#   inputs* — ``_add_microstructure_features`` turns them into the single
+#   ``spread`` column, so whitelisting them raw would put two more
+#   dollar-scale columns into the observation for information the price
+#   group already carries.
+# * ``spread`` is emitted by that same builder, which stays its
+#   single writer; copying it here as well would be a second writer for
+#   one column.  A future tick-level tape recorder must use
+#   ``realized_spread_bps`` instead of competing for this name.
+#
+# Net accounting is therefore +1 for the funding bid/ask pair, not +3.
+_SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread")
 
 
 @dataclass
@@ -142,6 +182,76 @@ class NormalizationStats:
             safe_std = std if std > 1e-12 else 1.0
             out[name] = (frame[name] - mean) / safe_std
         return out
+
+
+class FeatureWidthMismatchError(ValueError):
+    """A fitted model's feature set does not match the live pipeline's.
+
+    Raised instead of the previous width comparison, which was
+    tautological for the staleness it was meant to catch: both sides
+    derived from the same loaded :class:`NormalizationStats`, and
+    :meth:`NormalizationStats.normalize` silently drops any frame column
+    without a registered stat.  A stale 49-wide ``normalization.npz``
+    against a 55-wide ``compute()`` therefore normalized straight back
+    down to 49 and the check saw ``49 == 49``.
+
+    The check is now non-self-referential: the model's own
+    ``feature_names`` (read back from the ``.npz``, or recorded as
+    ``n_features`` at training time) are compared against the column set
+    the *live* pipeline actually produces.
+    """
+
+
+def check_feature_width(
+    expected_feature_names: Sequence[str],
+    actual_columns: Sequence[str],
+    *,
+    context: str,
+) -> None:
+    """Assert a model's fitted feature names match a live frame's columns.
+
+    This is the width guard that ships with the 49 -> 55 widening.  It is
+    deliberately **non-self-referential**: ``expected_feature_names`` comes
+    from the artifact (the ``feature_names`` array inside
+    ``normalization.npz``), ``actual_columns`` from the columns
+    ``FeaturePipeline.compute`` just produced.  Neither side is derived
+    from the other, so a stale artifact cannot pass by construction.
+
+    Comparison is by name, not merely by count, because a same-width
+    mismatch (one column replaced by another) is just as silent as a
+    width mismatch.
+
+    Args:
+        expected_feature_names: The names the model was fitted on, in fit
+            order (e.g. from ``NormalizationStats.feature_names``).
+        actual_columns: The columns the live pipeline produced.
+        context: Human-readable description of what is being checked, used
+            verbatim in the error message.
+
+    Raises:
+        FeatureWidthMismatchError: If the two sets differ, naming the
+            missing and the unexpected columns.
+    """
+    expected = list(expected_feature_names)
+    actual = list(actual_columns)
+    missing = [name for name in expected if name not in set(actual)]
+    unexpected = [name for name in actual if name not in set(expected)]
+    if not missing and not unexpected:
+        return
+    detail = []
+    if missing:
+        detail.append(f"missing from the live frame: {missing}")
+    if unexpected:
+        detail.append(f"not in the model: {unexpected}")
+    raise FeatureWidthMismatchError(
+        f"Feature-width mismatch ({context}): the model was fitted on "
+        f"{len(expected)} features but the live pipeline produced "
+        f"{len(actual)}. " + "; ".join(detail) + ". This means the "
+        f"feature pipeline was widened or narrowed after training "
+        f"(feature_windows / feature_groups, or the funding/vwap/count "
+        f"inputs the derived columns need). Retrain the model, or restore "
+        f"the feature config it was trained with."
+    )
 
 
 class FeaturePipeline:
@@ -432,6 +542,8 @@ class FeaturePipeline:
         silently skipped (the merge may not always be active).
         """
         for col in _SIGNAL_COLUMNS:
+            if col in _SIGNAL_BUILDER_INPUT_COLUMNS:
+                continue
             if col in df.columns:
                 out[col] = df[col].astype(float)
 
@@ -512,7 +624,9 @@ def _atr(
 
 __all__ = [
     "FeaturePipeline",
+    "FeatureWidthMismatchError",
     "NormalizationStats",
+    "check_feature_width",
     "normalize_ticker_id",
 ]
 
