@@ -57,9 +57,12 @@ feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 extra_features_file: null
 
 # Path to a JSONL file of per-(ticker, hour) funding-rate/basis vectors
-# produced by the sibling `kraken-funding-rates` project:
-#   python ~/Projects/kraken-funding-rates/cli.py pull --pair ETH/USD \
-#     --output signals/eth_usd_funding.jsonl --append
+# produced by the sibling `kraken-funding-rates` project.  There is no
+# cli.py at that repo's root — the CLI is the package console script, so
+# invoke it through the flake (this is exactly what the systemd unit's
+# ExecStart and `just funding-pull` run):
+#   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
+#     pull --pair ETH/USD --output signals/eth_usd_funding.jsonl --append
 # Columns merged: funding_rate, basis, open_interest, plus
 # funding_rate_prediction (the forward/next-settlement estimate, distinct
 # from the settled rate), vol24h (the perp contract's rolling 24h volume)
