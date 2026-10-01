@@ -139,10 +139,19 @@ engine.run()
 
 ### Observation width and the funding signal file
 
-The RL observation is **55 columns** wide with the default
-`feature_windows: [1, 4, 24]` and all five `feature_groups` — 49 base
-features plus six derived from columns the OHLCV and funding data
-already carry but that no builder used to read:
+The observation width with the default `feature_windows: [1, 4, 24]` and
+all five `feature_groups` is **dynamic**, because every builder is
+presence-gated — a source that is absent contributes nothing instead of
+failing the pipeline:
+
+| Configuration | Width |
+|---|---|
+| Neither the OHLCV `vwap`/`count` columns nor a funding file | **49** (unchanged) |
+| OHLCV `vwap`/`count` present, no funding file | **52** |
+| Funding file present (the shipped `configs/default.yaml`) | **60** |
+
+The jump from 49 to 60 is not all new work: it is six columns derived
+from data the pipeline already carried but that no builder read —
 
 | Column | Derived from |
 |---|---|
