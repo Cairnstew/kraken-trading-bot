@@ -46,6 +46,7 @@ from tools.model_matrix import (  # noqa: E402
     median,
     quartile,
     split_cell_overrides,
+    span_bars_for,
     window_has_split,
     window_is_pinned,
     summarize,
@@ -281,16 +282,97 @@ def test_cell_id_is_not_the_index(tmp_path):
 # ── expected bars ───────────────────────────────────────────────────────
 
 
-def test_expected_bars_derived_from_pinned_window():
-    bars = expected_bars_for(
-        {"data_window": {
+def _round_clamped(n_bars: int, split: float) -> int:
+    """``rl.data_window.split_index`` arithmetic, restated locally.
+
+    Duplicated rather than imported so this module keeps its promise of
+    never importing the RL package. The equivalence is asserted against
+    the real function in ``tests/test_matrix_rl_contract.py``.
+    """
+    return min(max(int(round(n_bars * split)), 1), n_bars - 1)
+
+
+def test_expected_bars_is_the_eval_slice_not_the_whole_span():
+    """With a split active, the denominator is the EVAL slice.
+
+    ``n_bars`` counts bars a backtest REPLAYED, and the RL side gives
+    training the leading ``eval_split`` of a pinned window. So a healthy
+    out-of-sample cell returns ~(1 - eval_split) x the span. Denominating
+    by the whole span marked every out-of-sample cell INVALID: measured
+    against the real CLI on 2026-10-01, a 672-bar window logged "202
+    replayable bars" and the guard demanded 336, so a correct 178-bar
+    replay was reported as `n_bars:178<0.50x672`.
+    """
+    overrides = {"data_window": {
+        "since": "2026-09-01T00:00:00Z",
+        "until": "2026-09-20T00:00:00Z",
+        "eval_split": 0.7,
+    }}
+    assert span_bars_for(overrides, interval_minutes=60) == 456  # 19d * 24h
+    # round(456 * 0.7) = 319 training bars, so 137 remain to be replayed.
+    assert expected_bars_for(overrides, interval_minutes=60) == 137
+
+
+def test_expected_bars_matches_the_rl_side_split_boundary():
+    """The harness and the RL side must not disagree by a bar.
+
+    The harness rounds and clamps the split boundary the same way the RL
+    side does (``rl.data_window.split_index``); a harness-side ``floor()``
+    would silently shift the guard's denominator by one bar. The
+    arithmetic is pinned here to the values the RL side logs; the
+    cross-check against the real module lives in
+    ``tests/test_matrix_rl_contract.py``.
+    """
+    # round(456 * 0.5)=228 -> 228 eval bars; 0.7 -> 319/137; 0.8 -> 365/91.
+    for split, train, eval_ in ((0.5, 228, 228), (0.7, 319, 137), (0.8, 365, 91)):
+        overrides = {"data_window": {
             "since": "2026-09-01T00:00:00Z",
             "until": "2026-09-20T00:00:00Z",
-            "eval_split": 0.7,
-        }},
-        interval_minutes=60,
-    )
-    assert bars == 456  # 19 days * 24 hourly bars
+            "eval_split": split,
+        }}
+        assert expected_bars_for(overrides, interval_minutes=60) == eval_
+        assert _round_clamped(456, split) == train
+
+
+def test_expected_bars_is_full_span_when_no_split_applies():
+    """No split -> the backtest replays the whole window, as before."""
+    pinned_no_split = {
+        "data_window": {"since": "2026-09-01T00:00:00Z", "until": "2026-09-20T00:00:00Z"}
+    }
+    assert expected_bars_for(pinned_no_split, interval_minutes=60) == 456
+
+
+def test_expected_bars_treats_eval_split_one_as_no_split():
+    """``eval_split: 1.0`` is the RL side's "no split" switch.
+
+    ``DataWindow.has_split`` requires ``< 1.0``, so the backtest replays
+    the whole window. Sizing the denominator at 1 bar here would let a
+    near-empty replay pass the width guard.
+    """
+    pinned_full = {"data_window": {
+        "since": "2026-09-01T00:00:00Z",
+        "until": "2026-09-20T00:00:00Z",
+        "eval_split": 1.0,
+    }}
+    assert expected_bars_for(pinned_full, interval_minutes=60) == 456
+
+
+def test_a_correct_out_of_sample_replay_passes_the_width_guard():
+    """The regression this whole fix exists for.
+
+    A real run replayed 178 of the 202-bar eval slice of a 672-bar window.
+    That is a measurement, not a degenerate cell, and must not be INVALID.
+    """
+    overrides = {"data_window": {
+        "since": "2026-09-02T00:00:00Z",
+        "until": "2026-09-30T00:00:00Z",
+        "eval_split": 0.7,
+    }}
+    denominator = expected_bars_for(overrides, interval_minutes=60)
+    assert denominator == 202
+    assert is_valid(_record(n_bars=178, num_trades=154), expected_bars=denominator)
+    # ...and the guard still catches a genuinely degenerate replay.
+    assert not is_valid(_record(n_bars=1, num_trades=5), expected_bars=denominator)
 
 
 def test_expected_bars_is_none_without_a_pinned_window():

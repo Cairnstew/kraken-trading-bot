@@ -95,6 +95,7 @@ __all__ = [
     "main",
     "materialize_configs",
     "split_cell_overrides",
+    "span_bars_for",
     "summarize",
     "window_has_split",
     "window_is_pinned",
@@ -107,6 +108,11 @@ __all__ = [
 RESERVED_AXES: frozenset[str] = frozenset(
     {"ticker", "seed", "pages", "timesteps"}
 )
+
+#: Train fraction the RL side applies when a config names ``data_window``
+#: without an ``eval_split``. Mirrors ``rl.data_window.DEFAULT_EVAL_SPLIT``
+#: and ``configs/default.yaml``; used only to size the width denominator.
+DEFAULT_EVAL_SPLIT = 0.7
 
 #: The backtest JSON contract this tool codes against. A record missing any
 #: of these cannot be assessed, so it is INVALID rather than silently passed:
@@ -536,7 +542,7 @@ def expected_bars_for(
     pages: Any = None,
     interval_minutes: int = 60,
 ) -> int | None:
-    """Bars the cell ASKED for, or None when that cannot be derived.
+    """Bars the cell ASKED FOR, or None when that cannot be derived.
 
     A pinned ``data_window`` (since + until) is the only trustworthy
     denominator: it states the span. ``pages`` is deliberately NOT used --
@@ -544,18 +550,85 @@ def expected_bars_for(
     ``pages * 720`` guess would flag healthy cells as truncated. Returns
     None instead, which makes the width check explicitly skipped rather
     than silently wrong.
+
+    With an active ``eval_split`` the denominator is the **eval slice**,
+    not the whole span, because that is what the backtest is asked to
+    replay. ``n_bars`` counts bars REPLAYED, and with ``eval_split: 0.7``
+    the RL side gives training the leading 70% and replays only the
+    remainder -- so a healthy cell returns ~0.3x the span, not 1.0x.
+
+    Measured against the real CLI (2026-10-01, ETH_USD, pages 4):
+    a 672-bar window logged "202 replayable bars", of which 178 were
+    replayed after feature warm-up. Denominating by the full 672 demanded
+    336 and marked every out-of-sample cell INVALID, so a correctly
+    out-of-sample matrix reported zero usable cells. The split boundary is
+    taken with the same ``round(n * split)`` clamped to ``[1, n - 1]`` the
+    RL side uses, so the two sides cannot disagree by a bar.
+
+    This narrows the denominator to the segment actually under test; it
+    does NOT relax the guard -- a cell replaying 1 bar of 202 is still
+    INVALID, which is exactly the failure the guard exists to catch.
     """
     window = config_overrides.get("data_window")
-    if isinstance(window, Mapping):
-        since = parse_iso(window.get("since"))
-        until = parse_iso(window.get("until"))
-        if since and until:
-            span = (until - since).total_seconds()
-            seconds_per_bar = max(1, int(interval_minutes)) * 60
-            bars = int(span // seconds_per_bar)
-            if bars > 0:
-                return bars
+    bars = span_bars_for(config_overrides, interval_minutes)
+    if bars:
+        cut = _split_boundary(config_overrides, bars)
+        if cut is not None:
+            return max(1, bars - cut)
+        return bars
     return None
+
+
+def span_bars_for(
+    config_overrides: Mapping[str, Any], interval_minutes: int = 60
+) -> int | None:
+    """Bars in the WHOLE pinned ``data_window`` span, or None.
+
+    Distinct from :func:`expected_bars_for`, which narrows that span to the
+    eval slice when a split is active. This one answers "how far must the
+    fetch reach to cover the window", which is what the ``--pages``
+    undershoot warning is about -- so it must stay the full span.
+    """
+    window = config_overrides.get("data_window")
+    if not isinstance(window, Mapping):
+        return None
+    since = parse_iso(window.get("since"))
+    until = parse_iso(window.get("until"))
+    if not (since and until):
+        return None
+    span = (until - since).total_seconds()
+    seconds_per_bar = max(1, int(interval_minutes)) * 60
+    bars = int(span // seconds_per_bar)
+    return bars if bars > 0 else None
+
+
+def _split_boundary(
+    config_overrides: Mapping[str, Any], n_bars: int
+) -> int | None:
+    """Number of leading TRAINING bars, or None when no split applies.
+
+    Mirrors the RL side's ``rl.data_window.split_index``: ``round(n *
+    eval_split)`` clamped to ``[1, n - 1]``, and inert unless the window is
+    actually pinned (``eval_split`` below 1.0 on a null window is
+    deliberately ignored there, and is ignored here for the same reason).
+    """
+    if not window_has_split(config_overrides):
+        return None
+    window = config_overrides.get("data_window") or {}
+    raw = window.get("eval_split")
+    if isinstance(raw, bool):
+        return None
+    try:
+        split = float(raw) if raw is not None else DEFAULT_EVAL_SPLIT
+    except (TypeError, ValueError):
+        return None
+    # ``eval_split: 1.0`` means NO split on the RL side (DataWindow.has_split
+    # requires < 1.0), so the backtest replays the whole window. Honouring it
+    # as a split here would size the denominator at 1 bar and let a
+    # near-empty replay pass the width guard.
+    if not (0.0 < split < 1.0) or n_bars < 2:
+        return None
+    return min(max(int(round(n_bars * split)), 1), n_bars - 1)
 
 
 @dataclass(frozen=True)
@@ -717,7 +790,10 @@ def assess_cell(
         record: One JSONL record written by ``run``.
         min_bar_ratio: Fraction of the requested window a cell must replay.
         min_trades: Minimum executed trades for the cell to be informative.
-        expected_bars: What the cell asked for (from a pinned window).
+        expected_bars: What the cell asked for -- the pinned window's span
+            narrowed to the eval slice when ``eval_split`` is active, since
+            that (not the whole window) is what a backtest replays. See
+            :func:`expected_bars_for`.
         reference_bars: Fallback denominator -- typically the largest
             ``n_bars`` seen for the same ticker in this results file. Every
             cell of one ticker requests the same window, so 1 bar next to
@@ -1279,14 +1355,22 @@ def build_warnings(spec: MatrixSpec, cells: Sequence[Cell]) -> list[dict[str, st
     # 10. --pages must be sized to REACH `until`. The window bounds are a
     #     CLIP on the read, not a push-down, so a too-small --pages
     #     silently yields a short window that only n_bars reveals.
-    sized = [c for c in cells if c.expected_bars and c.cli_params.get("pages")]
-    undersized = [c for c in sized if int(c.cli_params["pages"]) * 300 < c.expected_bars]
+    sized = [
+        c
+        for c in cells
+        if span_bars_for(c.config_overrides) and c.cli_params.get("pages")
+    ]
+    undersized = [
+        c
+        for c in sized
+        if int(c.cli_params["pages"]) * 300 < span_bars_for(c.config_overrides)
+    ]
     if undersized:
         warn(
             "pages_may_undershoot",
             "WARN",
             f"{len(undersized)} cell(s) request a window of up to "
-            f"{undersized[0].expected_bars} bars with only "
+            f"{span_bars_for(undersized[0].config_overrides)} bars with only "
             f"{undersized[0].cli_params['pages']} page(s). Window bounds are "
             "a CLIP, not a push-down, so too few pages yields a silently "
             "short window. Cells below min_bar_ratio of the requested span "
