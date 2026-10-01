@@ -1,263 +1,323 @@
-# VALIDATION — kraken-trading-bot data-pipeline pass (2026-09-30, pass 2)
+# Validation — audit-pipeline IMPROVE-EXISTING pass, 2026-10-01 (RE-VERIFICATION)
 
-Phase 6. Outcome type **IMPROVE-EXISTING**; target **Candidate 1 — make the
-three existing exogenous signal seams sound** (AUDIT.md A1–A4, DECISION.md §2).
-Bots' work landed on master: `5951f72` (builder A1–A4) and `1e404ba`
-(integrator config wiring + the sub-hourly carry-bound fix). Baseline suite
-**106 passed** → **119 passed** after the pass.
+Base: `a39e184` + `28fcfb0` + `eb3771e` + `8f6ab7b` + `b45a7a4` (master `b45a7a4`).
 
-This is **not** a new data source and **not** a store-backed source, so the
-store-adapted Phase 6 template (persistence, verify-contiguous, bars-vs-721-
-ceiling) does not apply. The gate shape is the adapted in-repo one the prior
-pass recorded: **(a)** feature-width proof, **(b)** improvement-is-consumed
-proof, **(c)** equivalent-metrics gate = all tests green + `nix flake check`
-green + no regression in the observation shape at the new keys' defaults.
+This supersedes the prior gate verdict in this file. That gate returned **NEEDS_FIX** on a
+silent defect (§2.4 of the previous revision); the fix is `b45a7a4`. Everything below was
+re-measured on the post-fix tree — nothing is carried over from the pre-fix run.
 
-The question this document answers is not *"are the new functions tested?"*
-(they are, in `tests/test_rl_data_store.py` and
-`tests/test_rl_signal_config_wiring.py`). It is: **does the seam actually change
-what the policy sees, through the CLI/config path, and does it leave the shipped
-defaults untouched?**
+## 0. GATE VERDICT: **PASS**
+
+All six criteria pass. The defect is fixed, the fix is **non-vacuous** (§3 — the new test
+fails with exactly the window-consumed symptom when the source change alone is reverted),
+and nothing the prior gate passed has regressed.
 
 ---
 
-## 1. UNIT VALIDATION
+## 1. Suite validation
 
 | Check | Command | Result |
 |---|---|---|
-| Full suite | `nix develop --command bash -c "pytest tests/ -q"` | **119 passed**, 20 warnings, **20.17 s** ✅ |
-| Flake | `nix flake check` (from this repo) | **all checks passed** — `packages` (2 derivations), `nixosModules.default`, `devShells.x86_64-linux.default` ✅ |
+| pytest | `nix develop --command bash -c "python -m pytest tests/ -q"` | **147 passed, 0 failed** (20 warnings, 17.56s) |
+| flake | `nix develop --command bash -c "nix flake check --no-build"` | **all checks passed!** (ran once) |
 
-Flake note: `nix flake check` reports *"The check omitted these incompatible
-systems: aarch64-darwin, aarch64-linux, x86_64-darwin"*. That is the default
-host filter, not a failure, and `--all-systems` was not needed for this gate.
-
-`119 − 106 = 13` new tests, all from this pass: 6 in
-`tests/test_rl_data_store.py` (A1 ticker mismatch does not merge; filters to
-requested ticker; untagged file still merges; duplicate hour does not raise;
-ffill bounded + age grows; absence distinguishable from zero) and 7 in
-`tests/test_rl_signal_config_wiring.py` (YAML keys reach the merge through
-`export`; mispointed config raises through a consumer; freshness columns reach
-the z-scored observation; freshness survives the no-`since` read; null max-age
-is one hour of carry on any bar interval; every consumer threads both keys;
-`paper_trade` deliberately passes no `since`).
+147 is the exact count on `b45a7a4` (143 before the fix, +4 regression tests). No test was
+modified, skipped or weakened to produce this number; §3 is the proof of the opposite.
 
 ---
 
-## 2. INTEGRATION-TEST MATRIX — both legs actually ran
+## 2. The decisive check — the gate scenario, reproduced live
 
-Every row is a real run from this repo inside `nix develop` against the live
-keyless Kraken API, driven through the packaged `kraken-trading-bot` CLI. No
-mocks. Scratch configs, fixtures, models and exports live under `/tmp` and were
-never committed (`git status` shows only `.data-audit/*.md`).
+Real keyless funding file, fresh pull, genuine sparse shape:
 
-### FEATURE-WIDTH TABLE (the gate's core measurement)
-
-| Config | Signal files | `signal_*` cols on frame | Observation width | Δ vs Leg A |
-|---|---|---|---|---|
-| **Leg A** (`/tmp/audit-sig/legA.yaml`) | all three `null` (shipped defaults) | **0** | **49** | — (control) |
-| Leg B, news only | `eth_news.jsonl` | **5** (3 news + 2 freshness) | **54** | **+5** |
-| **Leg B** (`/tmp/audit-sig/legB.yaml`) | all three fixtures | **11** (9 values + 2 freshness) | **60** | **+11** |
-| Leg B, max-age 12 | all three fixtures | **11** | **60** | +11 (bound only, not width) |
-
-The `signal` column is the CLI's own `export` accounting (`stages: 1 timestamp,
-8 OHLCV, N signal, M observation (raw), 0 normalized, warmup flag`). **This is
-the paired control the gate asks for: the freshness columns arrive *with* a
-signal file, and with all three keys at their shipped defaults the observation
-is byte-for-byte the same width it was before this pass (49).**
-
-### Leg A — defaults unchanged, no regression (the equivalent-metrics-baseline leg)
-
-| Step | Command (abbrev) | Result |
-|---|---|---|
-| Train | `kraken-trading-bot train --ticker ETH_USD --model ppo_seam_legA --config /tmp/audit-sig/legA.yaml --pages 2 --timesteps 3000 --models-root /tmp/audit-sig/models-legA` | **OK** — `Training PPO on 721 bars of ETH_USD (49 obs features, 3000 timesteps)` |
-| Backtest | `kraken-trading-bot backtest --ticker ETH_USD --model ppo_seam_legA --pages 2 --models-root …` | **OK** — 697 steps, return **3.10 %**, Sharpe **0.469**, max DD **4.55 %**, trades **531**, win **0.00 %**, final equity **10,310.32** |
-| Export | `kraken-trading-bot export-data --ticker ETH_USD --pages 2 --config …/legA.yaml --output …/legA.csv` | **OK** — 721 bars × 59 cols, **0 signal**, 49 observation |
-
-**No observation-width mismatch, no `NotEnoughDataError`, no traceback, no
-signal/freshness column at all.** The 49-wide `normalization.npz` carries
-`signal_* : []` — i.e. with the shipped defaults the pass is a no-op on the
-observation, which is exactly what an IMPROVE-EXISTING in-repo seam fix must be.
-
-### Leg B — the seam actually feeds the observation (outcome consumed)
-
-Scratch fixtures in `/tmp/audit-sig/signals/`, hand-written per the sibling
-schema (`ticker`, `timestamp`, and that source's columns):
-
-- `eth_news.jsonl` — 303 records, hourly, `sentiment_score` / `article_count` /
-  `novelty_flag`, all `ticker: "ETH/USD"`. Deliberately seeded with **(i) one
-  duplicate-hour record** (a second write into the newest hour, the exact shape
-  the sibling's documented hourly-append cron produces) and **(ii) one
-  `ticker: "BTC/USD"` record** carrying an extreme `sentiment_score: -0.9`,
-  `article_count: 777`.
-- `eth_funding.jsonl` — 38 records at **8-hourly** cadence (`kraken-funding-
-  rates`' real settling cadence), `funding_rate` / `basis` / `open_interest`.
-- `eth_social.jsonl` — 301 records, hourly, `stt_mention_count` / `stt_tilt` /
-  `fng_index`.
-
-| Step | Command (abbrev) | Result |
-|---|---|---|
-| Train | `kraken-trading-bot train --ticker ETH_USD --model ppo_seam_legB --config /tmp/audit-sig/legB.yaml --pages 2 --timesteps 3000 --models-root /tmp/audit-sig/models-legB` | **OK** — `Training PPO on 721 bars of ETH_USD (60 obs features, 3000 timesteps)` |
-| Backtest | `kraken-trading-bot backtest --ticker ETH_USD --model ppo_seam_legB --pages 2 --models-root …` | **OK** — 697 steps, return **12.38 %**, Sharpe **1.291**, max DD **5.17 %**, trades **517**, win **0.00 %**, final equity **11,238.22** |
-| Paper-trade | `kraken-trading-bot paper-trade --ticker ETH_USD --model ppo_seam_legB --iterations 1 --dry-run --models-root …` | **OK** — 1 tick, `side=buy volume=0.05930682 price=2685.02`, equity 10,000 |
-| Export | `kraken-trading-bot export-data --ticker ETH_USD --pages 2 --config …/legB.yaml --output …/legB.csv` | **OK** — 721 bars × 70 cols, **11 signal**, 60 observation |
-| Export (news only) | same with `…/legB_news_only.yaml` | **OK** — 721 bars × 64 cols, **5 signal**, 54 observation |
-
-**The observation widened 49 → 60 through the CLI/config path, and a PPO policy
-trained, backtested and paper-traded on the widened vector.** That is the
-improvement-is-consumed proof at the integration level: all four consumers
-(`train`, `backtest`, `paper_trade`, `export`) thread
-`signal_max_age_hours` / `signal_require_ticker` through to
-`merge_extra_features` (`train.py:190-194`, `backtest.py:143-147`,
-`paper_trade.py:294-298`, `export.py:171-175`).
-
----
-
-## 3. THE FRESHNESS PAIR, AS DELIVERED TO THE AGENT
-
-Read out of the Leg B **export CSV** — a real observation-shaped artifact
-produced by the CLI, not a unit-test fixture:
-
-| Measurement | Value |
-|---|---|
-| `signal_age_hours` present on frame | ✅ (range `[-1.0, 1.0]`, distinct `{-1.0, 0.0, 1.0}`) |
-| `signal_observed` present on frame | ✅ (values `{0.0, 1.0}`; **301/721** bars observed = 41.7 %) |
-| observed/unobserved separation | the 420 bars before the fixtures' 301-hour window are `signal_age_hours = -1.0`, `signal_observed = 0.0` — and their `sentiment_score` is `0.0`, so **"no record" is now distinguishable from a genuine 0 / balanced reading** (A4) |
-
-### The z-scored observation carries them
-
-`normalization.npz` written by the Leg B train (`allow_pickle=False`):
-
-| Property | Leg A | Leg B |
-|---|---|---|
-| `means.shape` / `stds.shape` / `len(feature_names)` | (49,) (49,) **49** | (60,) (60,) **60** |
-| `signal_*` in `feature_names` | **`[]`** | **`['signal_age_hours', 'signal_observed']`** |
-| signal value cols in `feature_names` | `[]` | all 9 (news 3 + funding 3 + social 3) |
-| `signal_age_hours` mean / std | — | **−0.529820 / 0.595416** |
-| `signal_observed` mean / std | — | **0.417476 / 0.493143** |
-| all means/stds finite | ✅ | ✅ |
-
-The finiteness matters and is load-bearing: `_NO_SIGNAL_AGE = -1.0` is a finite
-sentinel precisely so that "no reading" cannot reach
-`NormalizationStats.normalize` as a NaN and poison the whole z-scored vector.
-A non-trivial `std` on both columns (`0.595` / `0.493`) also proves the
-freshness pair is *doing work* in the normalization, not a degenerate constant.
-
-`config.yaml` provenance (read back by `backtest`/`paper_trade`) carries both
-new keys on both legs — Leg A: `signal_max_age_hours: None`,
-`signal_require_ticker: True`; Leg B: the same plus the three fixture paths.
-
-### All four A1–A4 defects, reproduced/fixed through the live CLI path
-
-| Defect (DECISION §2) | Live-path evidence |
-|---|---|
-| **A1 ticker-blind join** | The BTC fixture record (`sentiment_score: -0.9`, `article_count: 777`) **never reaches the ETH frame**: exported `sentiment_score ∈ [-0.499999, 0.5]`, `article_count ∈ [0.0, 99.0]`. A **BTC-only** file against ETH now **hard-fails through the CLI**: `Signal file …/btc_only.jsonl holds no records for ETH/USD (contains: BTCUSD)` — CLI **exit code 1**, no CSV written. Before this pass that was a silent merge. |
-| **A2 duplicate-hour crash** | `eth_news.jsonl` deliberately contains two records in the newest floored hour. **No `ValueError: cannot reindex on an axis with duplicate labels`** on any of the six Leg-B runs, and the newest bar's `sentiment_score` is **−0.42** — the *last written* record for that hour, i.e. last-write-wins as specified. |
-| **A3 unbounded ffill, no freshness** | `signal_age_hours` **maxes at 1.0** and never grows without bound; an 8-hourly funding source contributes a live reading on only **76/721** bars (each record covers 2 bars at the 1 h bound: age 0 and age 1) instead of being forward-filled across the whole 300-hour fixture window. |
-| **A4 absence == a genuine extreme** | The 420 bars outside the fixture window carry `signal_observed = 0.0` / `signal_age_hours = -1.0` alongside a zero-filled `fng_index`/`sentiment_score`, so the zero fill is no longer ambiguous. 225 bars additionally have `funding_rate == 0.0` **while `signal_observed == 1.0`** (the hourly sources kept the shared flag true) — a visible, non-ambiguous "this source had nothing live here". |
-
----
-
-## 4. ONE FINDING WORTH RECORDING: `signal_max_age_hours: null` silently zeroes a funding-heavy user
-
-This is the interpretation the integrator flagged, and it is **measured**, not
-argued. Same fixtures, same 721-bar window, one config key changed:
-
-| `signal_max_age_hours` | funding bars with a live reading | `signal_age_hours` range | observation width |
-|---|---|---|---|
-| `null` (default → derived **1 h**) | **76 / 721** (10.5 %) | `[-1.0, 1.0]` | 60 |
-| `12` | **301 / 721** (41.8 %) | `[-1.0, 7.0]` | 60 |
-
-`kraken-funding-rates` settles ~8-hourly, so under the derived 1-hour bound
-**≈89 % of the funding channel is zero-filled** for a funding-heavy user who
-previously got unbounded carry. The observation width is unaffected (60 either
-way) and `signal_observed` / `signal_age_hours` make the gap *visible* rather
-than silent — which is the A3 fix working as designed — but the funding
-*value* itself is gone from those bars.
-
-**My read: acceptable-as-documented, with one caveat that is a documentation
-task, not a code task.**
-
-- It is the **safe** direction. The alternative (`null` = unbounded) is the
-  behaviour this pass exists to remove: an 8-hourly funding snapshot carried for
-  three days reads as current. Silently keeping unbounded carry would
-  reintroduce A3 behind the new columns.
-- The remedy is **one config key and is already documented in
-  `configs/default.yaml:97-99`** (*"null (default) derives the bound from the
-  bar interval — one hour of carry … Set an int to widen it
-  (kraken-funding-rates settles ~8-hourly, so a funding-heavy run wants e.g.
-  12)"*), and `configs/deep-history.example.yaml` carries the same keys.
-- The caveat: the doc says *"wants e.g. 12"* but does **not** say what a user
-  who leaves it at `null` actually loses. The honest one-line addition is
-  *"with the default, an 8-hourly funding source contributes a live reading to
-  ~2 bars out of every 8 and is zero-filled for the other 6 — if you train on
-  funding, set this key."* That belongs to Phase 7 (a comment in
-  `configs/default.yaml`), and I am read-only on code, so it is filed rather
-  than applied.
-
----
-
-## 5. GATE VERDICT
-
-| Clause | Requirement | Evidence | Verdict |
-|---|---|---|---|
-| (a) feature-width proof | observation unchanged at 49 with no signal file; freshness columns arrive with signals (49→54 news-only, 49→60 all three); z-scored observation separates observed/unobserved | §2 width table; §3 npz (Leg A 49 with `signal_* : []`, Leg B 60 with the pair, finite, non-trivial std) | ✅ |
-| (b) improvement-is-consumed | a train/backtest-style path reading through the merged frame sees the freshness pair | §2 Leg B: **real CLI train at 60 obs features**, backtest 697 steps, paper-trade 1 tick, export 11 signal columns; all four consumers thread both keys | ✅ |
-| (c) equivalent-metrics gate | all tests green + `nix flake check` green + no regression in the observation shape at the new keys' defaults | §1: **119 passed**, **flake all checks passed**; Leg A trains at 49-wide and backtests cleanly against a null-config | ✅ |
-
-No trusted-config behaviour change: with all three `*_features_file` keys at
-their shipped `null` default the merge never runs, the two new keys are inert,
-and the observation is 49-wide exactly as before the pass.
-
-**GATE: PASS**
-
-*(The Leg A vs Leg B backtest numbers — 3.10 % vs 12.38 % return, 531 vs 517
-trades — are recorded for completeness and are explicitly **not** evidence. At
-721 bars / 1 seed / 3,000 timesteps a return difference is seed noise; this
-document makes no convergence claim, for the same reason the prior pass declined
-its A/B.)*
-
----
-
-## 6. REPRODUCING THIS
-
-```bash
-nix develop --command bash -c "pytest tests/ -q"     # 119 passed
-nix flake check                                     # all checks passed
-
-S=/tmp/audit-sig            # scratch root; fixtures + configs generated there
-# Leg A (defaults):  all three *_features_file null, both new keys at default
-nix develop --command kraken-trading-bot train \
-  --ticker ETH_USD --model ppo_seam_legA --config $S/legA.yaml \
-  --pages 2 --timesteps 3000 --models-root $S/models-legA
-nix develop --command kraken-trading-bot backtest \
-  --ticker ETH_USD --model ppo_seam_legA --pages 2 --models-root $S/models-legA
-
-# Leg B (seam on):    the three scratch JSONL fixtures
-nix develop --command kraken-trading-bot train \
-  --ticker ETH_USD --model ppo_seam_legB --config $S/legB.yaml \
-  --pages 2 --timesteps 3000 --models-root $S/models-legB
-nix develop --command kraken-trading-bot backtest \
-  --ticker ETH_USD --model ppo_seam_legB --pages 2 --models-root $S/models-legB
-nix develop --command kraken-trading-bot paper-trade \
-  --ticker ETH_USD --model ppo_seam_legB --iterations 1 --dry-run \
-  --models-root $S/models-legB
-nix develop --command kraken-trading-bot export-data \
-  --ticker ETH_USD --pages 2 --config $S/legB.yaml --output $S/exports/legB.csv
+```
+$ nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
+    pull --pair ETH/USD --output /tmp/rv2/eth_usd_funding.jsonl --append
+Wrote 1 funding records to /tmp/rv2/eth_usd_funding.jsonl
 ```
 
-Ticker note carried forward from the prior pass: `--ticker ETH_USD` works,
-`--ticker USD_SOL` fails with `Unknown Kraken pair: 'USD/SOL'`. `ETH_USD` is
-what `configs/default.yaml` itself sets.
+The file did not exist beforehand, so this is a **1-record** file produced by a real pull —
+not a trimmed one. Both legs: `--pages 2` (721 bars), `--timesteps 3000`, `--seed 42`,
+discrete actions, ETH/USD, scratch config + `--models-root` under `/tmp/rv2/`.
 
-Scratch artifacts (`/tmp/audit-sig/**`, `/tmp/audit-flake-check.log`) are
-outside the repo and were **not** committed. The only files this pass writes are
-`.data-audit/VALIDATION.md` and `.data-audit/PLAN.md`; no source file was
-modified.
+### 2.1 Before / after, both measured here
 
-### Test-suite delta attributable to this pass
+**Before** — the same scenario on a scratch copy of the tree with ONLY
+`rl/features.py` + `rl/environment.py` + `rl/export.py` reverted to `b45a7a4^`:
 
-`106 → 119 passed` is `5951f72` + `1e404ba`: 6 new tests in
-`tests/test_rl_data_store.py` and 7 in
-`tests/test_rl_signal_config_wiring.py`. Phase 6 added **no** tests and changed
-**no** code — it is validation only.
+```
+Training PPO on 721 bars of ETH_USD (60 obs features, 3000 timesteps)
+Backtest ETH_USD/rv2_prefix: 1 steps, return=0.00% max_dd=0.00% trades=0 win=0.00%
+```
+
+**After** — the committed tree, same budget:
+
+```
+Training PPO on 721 bars of ETH_USD (60 obs features, 3000 timesteps)
+Backtest ETH_USD/rv2_funding: 697 steps, return=4.35% max_dd=4.93% trades=374 win=46.07%
+```
+
+The defect reproduces exactly as recorded and is gone: **1 bar / 0 trades → 697 bars / 374
+trades**, width 60 on both sides, `0.9667 = 697/721 > 0.9`. Both bar count and trade count
+pass the criterion. (The fix commit's message claims 576 trades; I measured 374. PPO is
+stochastic across runs — see §5.1 — and the gate is on bars and trades > 0, both of which
+hold.)
+
+### 2.2 Direct environment probe (the same numbers, without PPO in the way)
+
+`TradingEnvironment` built from the live read path, funding-backed vs not:
+
+```
+FUNDING-BACKED   n_bars=721 width=60 _start_index=24 replayable=697 ratio=0.9667 passes=True
+   spread non-NaN 1/721 | signal_observed sum 1.0 | signal_age_hours max 0.0
+NULL-FUNDING     n_bars=721 width=52 _start_index=24 replayable=697 ratio=0.9667 passes=True
+NO-NEW-INPUTS    width=49 vwap_dev=False spread=False _start_index=24 replayable=697
+```
+
+Same probe on the reverted tree, so the mechanism is attributable and not incidental:
+
+```
+FUNDING-BACKED   n_bars=721 width=60 _start_index=720 replayable=1 ratio=0.0014 passes=False
+NULL-FUNDING     n_bars=721 width=52 _start_index=24  replayable=697 ratio=0.9667 passes=True
+NO-NEW-INPUTS    width=49 _start_index=24 replayable=697
+```
+
+Note the null-funding and no-new-input legs are **unchanged by the fix** (24 / 697 in both
+trees). Only the sparsely-covered exogenous leg moved, which is what §4.5 requires.
+
+The exported `warmup` flag now agrees with the environment instead of contradicting it —
+previously the export claimed 720 warm-up rows while the environment traded 1 bar:
+
+```
+$ kraken-trading-bot export-data --ticker ETH_USD --pages 2 --output /tmp/rv2/funding_export.csv
+Built export frame: 721 bars, 72 columns (60 features, 2 signal)
+warmup rows flagged True: 24
+```
+
+---
+
+## 3. NON-VACUITY of the new tests — the part that matters
+
+`test_sparse_funding_coverage_does_not_consume_the_window` was run against a scratch copy
+(`/tmp/rv2/scratch`) whose source is at `b45a7a4^` for the three files the fix touched
+(`rl/features.py`, `rl/environment.py`, `rl/export.py`) while the tests are at `b45a7a4`.
+Only the source was reverted. Confirmed the scratch tree really is pre-fix
+(`hasattr(features, "first_tradable_index")` → `False`).
+
+```
+$ cd /tmp/rv2/scratch && nix develop --command bash -c \
+    "python -m pytest tests/test_rl_environment.py::test_sparse_funding_coverage_does_not_consume_the_window -q"
+```
+
+It **fails**, with the window-consumed symptom and the exact message:
+
+```
+>       assert replayable > 0.9 * env.n_bars, (
+            f"a one-record funding file left only {replayable} of {env.n_bars} "
+            f"bars tradable (start index {env._start_index})"
+        )
+E       AssertionError: a one-record funding file left only 1 of 721 bars tradable (start index 720)
+E       assert 1 > (0.9 * 721)
+E        +  where 721 = <TradingEnvironment object>.n_bars
+1 failed in 1.07s
+```
+
+With the three source files restored, the same four tests pass:
+
+```
+$ python -m pytest tests/test_rl_environment.py -q -k 'sparse or null_funding_start or presence_gating_survives'
+4 passed, 26 deselected in 0.83s
+```
+
+So the test pins the fix, it does not merely restate the fixture. The 143-test suite missed
+this defect because every fixture populated funding on every row; the new fixture builds the
+sparse shape (721 bars, one funding record) that the shipped configuration actually
+produces, and it asserts preconditions (`spread.notna().sum() == 1`,
+`signal_observed.sum() == 1.0`) so it cannot quietly stop being that shape.
+
+---
+
+## 4. No regression of what the prior gate passed
+
+### 4.1 Widths — 49 / 52 / 60, all three reproduced
+
+| Inputs present | Width | How measured now |
+|---|---|---|
+| No OHLCV `vwap`/`count`, no funding file | **49** | live read with `vwap`, `count` and the three derived columns dropped; `vwap_dev` absent, `spread` absent |
+| `vwap`/`count` present, no funding file | **52** | train log on the null-funding config |
+| Funding file present (what `configs/default.yaml` ships) | **60** | train log on the funding config |
+
+52 → 60 is **+8**, confirmed by set difference:
+
+```
+observation columns ONLY with funding (+8):
+  ['basis', 'funding_rate', 'funding_rate_prediction', 'open_interest',
+   'signal_age_hours', 'signal_observed', 'spread', 'vol24h']
+```
+
+### 4.2 All six names reach the observation — three sinks
+
+| The six new columns | export CSV (721 bars) | `normalization.npz` `feature_names` | train log |
+|---|---|---|---|
+| `vwap_dev` | present | present | in the 60 |
+| `trade_count_zscore_20` | present | present | in the 60 |
+| `volume_per_trade` | present | present | in the 60 |
+| `funding_rate_prediction` | present | present | in the 60 |
+| `vol24h` | present | present | in the 60 |
+| `spread` | present | present | in the 60 |
+
+```
+funding artifact feature_names: 60 entries
+{'vwap_dev': True, 'trade_count_zscore_20': True, 'volume_per_trade': True,
+ 'funding_rate_prediction': True, 'vol24h': True, 'spread': True}
+baseline artifact feature_names: 52 entries
+"bid" in observation: False   "ask" in observation: False
+```
+
+Non-degeneracy in the post-fix funding-backed export:
+
+```
+vwap_dev                nunique=721  min=-0.0113278 max=0.0251535   nonzero 721/721
+trade_count_zscore_20   nunique=703  min=-2.22985    max=3.95118     nonzero 702/721
+volume_per_trade        nunique=721  min=0.130569    max=2.10747     nonzero 721/721
+funding_rate_prediction nunique=2    min=0           max=0.0360916   nonzero   1/721
+vol24h                  nunique=2    min=0           max=37923.9     nonzero   1/721
+spread                  nunique=2    min=0           max=3.72079e-05 nonzero   1/721
+```
+
+The three OHLCV derivations are live on every bar. The three funding-sourced columns are
+still non-zero on **1 of 721** bars — that is now, correctly, a *coverage* fact and not a
+*defect*: the fix restored the trading window, it did not enrich the signal. See §6.
+
+Clean-vs-naive accounting holds: `bid`/`ask` are absent from both observations even though
+the export CSV carries them as staged columns.
+
+### 4.3 Legacy columns are bit-identical (same-frame method)
+
+One shared OHLCV frame through the merge seam twice (funding file vs nothing):
+
+```
+merged   OBSERVATION width: 60
+unmerged OBSERVATION width: 52
+the 52 pre-existing columns: max|delta| = 0.0
+```
+
+Method note carried forward: comparing two separately-fetched export CSVs is invalid — a
+90-second gap moves the partial tail candle, so every rolling window anchored on it shifts.
+Same-frame comparison is the only valid form.
+
+### 4.4 The width guard is UNTOUCHED and still fires
+
+Pointed the **52-wide** trained artifact at a **mismatched** config (its
+`funding_features_file` repointed at the real one-record file, `n_features` left at 52),
+then ran the real CLI:
+
+```
+$ kraken-trading-bot backtest --ticker ETH_USD --model rv2_stale --pages 2 --seed 42 \
+    --models-root /tmp/rv2/staleroot
+Error backtesting ETH_USD/rv2_stale: Feature-width mismatch (ETH_USD/rv2_stale backtest):
+the model was fitted on 52 features but the live pipeline produced 60. not in the model:
+['spread', 'funding_rate', 'basis', 'open_interest', 'signal_age_hours',
+ 'signal_observed', 'funding_rate_prediction', 'vol24h']. This means the feature pipeline
+was widened or narrowed after training (feature_windows / feature_groups, or the
+funding/vwap/count inputs the derived columns need). Retrain the model, or restore the
+feature config it was trained with.
+```
+
+It refuses and names the eight missing columns. The fix touches only the start-index
+selection, never `check_feature_width`; unit coverage including the anti-tautology pin is
+unchanged and inside the 147.
+
+### 4.5 Null-funding start index is still exactly 24
+
+Pinned on the committed tree and re-measured on the reverted tree:
+
+| | `_start_index` (post-fix) | `_start_index` (pre-fix) |
+|---|---|---|
+| Null-funding (width 52) | **24** | 24 |
+| Funding-backed (width 60) | 24 | 720 |
+| No new inputs (width 49) | **24** | 24 |
+
+The fix did not trade the bug for a changed warm-up semantic: on the leg with no exogenous
+column the rule reduces to the original one and the number is bit-for-bit the same. New
+tests `test_null_funding_start_index_is_unchanged` and
+`test_sparse_and_null_funding_share_the_warmup_boundary` pin exactly 24.
+
+---
+
+## 5. Baseline comparison, recorded honestly
+
+| | Funding-backed (`rv2_funding`) | Null-funding baseline (`rv2_baseline`) |
+|---|---|---|
+| Obs width (train log) | **60** | **52** |
+| `n_features` in config.yaml | 60 | 52 |
+| Train | completed, `Trained: True` | completed, `Trained: True` |
+| Backtest bars replayed | **697 of 721** | **697 of 721** |
+| Total return | 4.35% | 2.24% |
+| Sharpe | 0.876 | 0.298 |
+| Max drawdown | 4.93% | 7.39% |
+| Trades | 374 | 298 |
+| Win rate | 46.07% | 40.00% |
+| Final equity | 10,434.69 | 10,224.00 |
+
+No `FeatureWidthMismatchError` and no `NotEnoughDataError` on either leg. The two failure
+modes the gate names are absent, and unlike the previous revision both legs replay a
+comparable number of bars.
+
+### 5.1 What the gate does and does not assert on metrics
+
+PPO with a fixed seed is **still stochastic across runs** — measurably so here: the fix
+commit reports 576 trades on this exact scenario and I measured 374. The comparison
+therefore gates on:
+
+- **feature vectors being identical** for shared columns — asserted, **PASSING** (§4.3: all
+  52 bit-identical, `max|delta| = 0.0`);
+- **bars replayed and trades > 0** on the funding-backed leg — asserted, **PASSING** (§2.1,
+  §2.2);
+- **metrics in the same neighbourhood** — **NOT ASSERTED, and not assertable at this
+  budget**. A 3,000-timestep PPO run on 721 bars with one seed cannot establish behavioural
+  equivalence, and the two legs here differ in width (60 vs 52) so they are not the same
+  model class anyway. Any claim that funding-backed training "matches" null-funding must
+  rest on many-seed, many-window runs. The numbers above are a record, not a result.
+
+---
+
+## 6. Persistence, freshness, and what the fix did *not* do
+
+- **Funding file**: `/tmp/rv2/eth_usd_funding.jsonl`, produced by the keyless sibling CLI.
+  **1 record**. No API key used anywhere in this pass.
+- **Freshness**: `signal_observed` is 1.0 on exactly **1** row; `signal_age_hours` maxes at
+  0.0. Both are in the observation, so "a zero here means no reading" is unambiguous to the
+  agent rather than guessed at.
+- **Coverage is still thin, and that is now honest rather than hidden.** One record covers 1
+  of 721 bars. The fix made absence *observable and non-destructive*; it did not make the
+  signal richer. At `signal_max_age_hours: 12` a freshly-configured deployment reads funding
+  on a handful of bars until the file accumulates. That is Gap-2 work — see `PLAN.md` §3.
+- **Ticker warning**: the sibling writes `spot_pair`, not `ticker`, so the seam logs
+  `has no 'ticker' field — treating it as a one-ticker file and merging every record` and
+  merges at WARNING. Correct documented behaviour; it does mean the sibling's output cannot
+  satisfy `signal_require_ticker: true` as shipped. Producer-side follow-up, not a defect in
+  this slice.
+- **Scratch discipline**: configs `/tmp/rv2/{funding,baseline}.yaml`, models
+  `/tmp/rv2/models*`, CSV `/tmp/rv2/funding_export.csv`. Nothing under `models/`; nothing
+  under `/tmp` committed. The reverted-source experiment lived in `/tmp/rv2/scratch` and was
+  restored from the MAIN checkout afterwards.
+
+---
+
+## 7. Summary
+
+| # | Criterion | Verdict |
+|---|---|---|
+| a | pytest green + flake check green | **PASS** — 147 passed; flake "all checks passed!" |
+| b | real train AND backtest, no width mismatch, no `NotEnoughDataError`, window intact | **PASS** — 697/697 bars replayed, 374 trades; the pre-fix 1-bar/0-trade failure reproduced and is gone (§2.1, §2.2) |
+| c | consumed proof, six names by name | **PASS** — export CSV + `normalization.npz` + `Obs features: 60` |
+| d | guard non-tautological and fires, untouched by the fix | **PASS** — real CLI raises on a 52-wide artifact against a 60-wide frame, naming the eight columns |
+| e | presence-gating: no new inputs → 49 | **PASS** — measured 49 |
+| f | baseline comparison recorded, with the stochasticity caveat | **PASS as a record** — vector identity and bar/trade counts asserted; metric equality explicitly not asserted, and not assertable (§5.1) |
+| g | the fix's own tests are non-vacuous | **PASS** — the key test fails with `1 of 721 bars tradable (start index 720)` when only the source is reverted (§3) |
+
+The gap that mattered is closed, and it is closed with evidence rather than assertion: the
+defect reproduces on a reverted tree, disappears on the committed tree, the no-new-inputs
+and null-funding widths and start indices are unchanged, and the guard that did its job
+before still does.

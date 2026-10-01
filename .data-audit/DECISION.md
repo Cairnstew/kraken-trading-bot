@@ -1,10 +1,13 @@
-# DECISION — kraken-trading-bot data-pipeline pass (2026-09-30, pass 2)
+# Decision — 2026-10-01
 
-Overwrites the prior pass's DECISION.md (that one chose Candidate 1 =
-"normalization.npz is applied to the observation", which LANDED — see
-`PLAN.md`/`VALIDATION.md` and AUDIT.md §5 "ALREADY DONE"). This pass is
-decided on the FRESH AUDIT.md (`master` @ `17899e1`, 106 tests green), not on
-the earlier audit the researchers were assigned from.
+Overwrites the prior-pass DECISION.md (git `18343ce`), which chose Candidate 1 =
+make the three signal seams sound (A1–A4) — **LANDED** as `5951f72`/`1e404ba`,
+GATE: PASS (`VALIDATION.md` §5). This pass is decided on the fresh, on-disk,
+authoritative `AUDIT.md` (`ca360a8`), the three researcher files it derives from
+(`RESEARCH-1/2/3.md`), the lead-assembled `RESEARCH.md`, `VALIDATION.md`, and
+`PLAN.md` — all read in full first. An earlier AUDIT.md draft with Rank-1–4
+numbering was superseded; the ranked substance is identical, and this decision
+uses the revised gap numbering.
 
 ---
 
@@ -12,252 +15,293 @@ the earlier audit the researchers were assigned from.
 
 **IMPROVE-EXISTING.**
 
-Chosen on AUDIT.md evidence, not by default. AUDIT.md §7 states the finding
-directly: *"this repo's data gap is not 'we need another source' — it is that
-the three sources already wired in cannot currently be trusted, and the one
-window the model was trained on is not recorded"* and *"the Decision phase must
-not treat NEW-DATA-SOURCE as the default outcome — on current code evidence the
-cheapest high-directness work is not a new project."* The fresh audit's top-3
-are all zero-new-sourcing IMPROVE-EXISTING / in-place-activation items; the
-genuinely-new-source directions (Candidates 6–9: book/trade recorder, on-chain,
-macro, academic) all lose on directness-vs-cost (AUDIT.md §4: D1 low-medium +
-mostly paid + needs an asset→pair mapping layer; D2 low + weekly/daily horizon
-vs an hourly observation; D3 very low, no route from a paper to a per-(ticker,
-hour) numeric column).
+Chosen on AUDIT.md evidence, not by default. The authoritative audit's own
+ranking makes the case: Gap 1 scores **5/5 directness / 1/5 difficulty**, is
+fully in-repo, needs **zero new repo, dependency, or API call**, and is the
+natural continuation of the pass-2 sequence the prior DECISION.md already
+championed ("this repo's data gap is not 'we need another source'"). The audit
+is explicit that the IMPROVE-EXISTING / dead-machinery class is:
+
+> *"the highest-directness class; explicitly the class prior `DECISION.md` §1
+> says must not be pre-filtered away"* — AUDIT.md Gap 1 heading.
+
+The decision-shaping evidence jointly points the same way:
+
+- **Gap 1's six/five on-disk columns** (`vwap`, `count` + `vol24h`,
+  `funding_rate_prediction`, and the prior `bid`/`ask` → `spread`) are already
+  in the parquet/JSONL every read already parses. Zero new bytes to acquire.
+- **The microstructure recorder (the NEW-DATA-SOURCE candidate) is keyless and
+  ~100× under rate limits** (RESEARCH-3 §2) — legitimate, but it is **3/5
+  difficulty, a new sibling repo, a recorder process, and is gated on the
+  scheduler that does not exist yet** (Gap 2). Its own researcher frames it as
+  the *fallback*: RESEARCH-3 §4 — *"In-repo (option i) ... is strictly inferior
+  on tape coverage but is ~30 lines and no infra"* — and Gap 1 is strictly
+  cheaper with higher directness.
+- **Substantive overlap**: RESEARCH-1 §1 shows `volume_per_trade` *is* the
+  bar-scale analogue of the tape's `mean_trade_size`, and `vwap_dev` overlaps
+  the tape's `vwap_pressure` (RESEARCH-3 §3 ii). The recorder's genuinely-new
+  scalars (taker side split, `realized_spread_bps`) do not clear the bar over
+  six columns that are literally free.
+- **`spread` must stay single-writer** (decision-shaping note, RESEARCH-3
+  §4.4): Gap 1 activates `spread` from funding `bid`/`ask`; a future recorder
+  must use `realized_spread_bps`. Complementary, not competing — which is why
+  the recorder is the **runner-up**, not a competitor this pass.
 
 **No new repo. No naming step. No submodule.** Phase 4 is **4B — implement in
-the existing target**.
+the existing target** (`kraken-trading-bot`), plus one *invoke-only* use of the
+existing `kraken-funding-rates` sibling CLI to produce the one JSONL that turns
+the funding half of Gap 1 on. The sibling is not modified.
 
 ## 2. CHOSEN TARGET (one)
 
-**Candidate 1 — make the three existing signal seams sound before anything is
-added to them.** AUDIT.md §3 A1–A4; §4 Candidate 1.
+**Gap 1 — activate the on-disk columns the feature pipeline throws away**, as a
+coherent slice that is honest about Gap 1's one caveat. AUDIT.md states that
+caveat plainly: *"because every `*_features_file` key is `null`, this ships 6
+columns that still produce 0 until a funding file is configured — it needs Gap
+5 to actually turn on."* RESEARCH.md's cross-file note #1 therefore defines the
+deliverable exactly:
 
-- **A1 ticker-blind join** — `data.py:134-166` never reads the `ticker` field
-  that is present in *every* record shape (`ticker_news_signals/models.py:97-104`,
-  `kraken_social_signals/models.py:34-40`, `kraken_funding_rates/models.py:53-66`).
-  Reproduced: a `BTC_USD` signal file merges onto an ETH/USD frame with **no
-  error, no log** — `sentiment_score = -0.9` on ETH bars. All 8 merge tests
-  (`tests/test_rl_data_store.py:211-374`) write records with **no `ticker`
-  field**, so the join key is untested.
-- **A2 duplicate-hour hard crash** — `data.py:161`
-  `signal_df.reindex(ohlc_index)` on a non-unique index raises
-  `ValueError: cannot reindex on an axis with duplicate labels`. Reproduced two
-  ways. **The sibling's own documented cadence produces it**:
-  `ticker-news-signals/INTEGRATION.md:114-120` documents an hourly cron that
-  appends to the same JSONL, and `fetch_signals(lookback_hours=1)`
-  (`ticker_news_signals/pipeline.py:96`) re-emits the current hour every run.
-  A second pull inside the same hour kills every train, backtest, paper tick
-  and export.
-- **A3 unbounded ffill, no freshness** — `data.py:165-166`
-  `.ffill().fillna(0.0)`; grep for `stale|age_hours|asof|freshness|last_seen`
-  over the package returns one unrelated hit (`paper_trade.py:314`). Reproduced:
-  one record at h0 propagates *unchanged* to h1, h2. Funding settles ~8-hourly
-  and news/social are hand-pulled, so multi-hour gaps are the normal case, and
-  the agent cannot tell a 3-day-old `funding_rate` from a current one.
-- **A4 absence == a genuine extreme** — `kraken_social_signals/pipeline.py:38`
-  `_FNG_MISSING = 0` collides with the low end of the real 0–100 scale
-  ("extreme fear"), and `:52-62` `_tilt` returns `0.0` for "no tagged message",
-  which is also "perfectly balanced"; `data.py:166`'s `fillna(0.0)` then makes
-  *no record at all* identical to *neutral*.
+> *"a coherent slice is Gap 1 columns + Gap 5 activation (at least a funding
+> file via the sibling CLI under a systemd.user timer, i.e. one slice of Gap
+> 2)."*
 
-**Why this is the winner, not a footnote:** it is the only candidate that is
-**upstream of the other three**.
+So the single outcome — *the model's observation actually contains the columns
+that already exist on disk, provably width-guarded, in production* — is
+delivered as: **Gap 1 widening (49 → 55) + the mandatory `n_features` width
+guard (the Gap 4 component any widening must ship with) + minimal Gap 5
+activation of the funding file under one `systemd.user` timer (one slice of Gap
+2).** That is one outcome with its named set of in-scope landing points, not
+three half-built targets; every element is a precondition named by Gap 1's own
+evidence.
 
-1. It blocks Candidate 4 (schedulers + flake) *mechanically*: A2 means the
-   cadence AUDIT.md C1 wants to ship is the thing that crashes the merge. You
-   cannot schedule a pull loop onto a seam that raises `ValueError` on the
-   second pull of the hour.
-2. Candidate 2 (activate `spread` from the funding JSONL, 49→51 features, zero
-   new API calls) rides **the same allow-list at `data.py:147,156`**. Widening
-   that allow-list before the join is sound means shipping *more* columns
-   through a join that can silently attach BTC's numbers to ETH and then
-   forward-fill them for days. Worse: without A3's age column, an 8-hourly
-   `spread` forward-filled across a whole session is precisely the
-   stale-read-looks-fresh defect — so Candidate 2 is only safe *after* this one.
-3. Candidate 3 (record the window + holdout) is eval integrity: it decides
-   whether a feature's measured value is real. It is meaningless if the 9
-   exogenous columns feeding the A/B are silently wrong (A1) or stale (A3).
-4. Its own blast radius is the largest per unit of work: these 9 columns are
-   the **only** non-OHLC inputs that reach the observation
-   (`features.py:404-417`), and the defect is repeated on every train, every
-   backtest and every 60 s paper tick because the merge runs 3× per read
-   (`data.py:323-325` live path, `data.py:457-459` store path).
+### 2.1 The committed column set — 49 → 55
 
-Zero new sourcing. Low risk. The only behavioural change is that a
-mis-configured or duplicated file **fails loudly** instead of silently.
+Measured base today: **49** (RESEARCH-1 §0, ran the real pipeline:
+price=10, technical=33, volume=6, microstructure=0, signals=0). Committed
+delta **+6 → 55**, per RESEARCH-1 §6's recommended minimal set (items 1+3+4).
+
+| # | Column | Source bytes | Produced at | Read per ticker at | Zero-config? |
+|---|---|---|---|---|---|
+| 1 | `vwap_dev` = `close/vwap − 1` | OHLCV frame (`_OHLCV_COLUMNS`, `data.py:58`) | derive at seam (`data.py:623`/`:779-787`/`:929-940`) | `_SIGNAL_COLUMNS` `features.py:42-54`; `_add_signals_features` `features.py:434-436` | **yes — works immediately, no config, no file** |
+| 2 | `trade_count_zscore_20` | `count` parse `data.py:651` | same seam | same | **yes** |
+| 3 | `volume_per_trade` = `volume/count` | `volume` + `count` parse | same seam | same | **yes** |
+| 4 | `funding_rate_prediction` | funding JSONL (`kraken_funding_rates/models.py:58`) | sibling CLI, hour-floored | merge allow-list `data.py:420-424` | needs funding file (activation) |
+| 5 | `vol24h` | funding JSONL (`models.py:65`) | same | same | needs funding file |
+| 6 | `spread` (clean +1) | funding `bid`/`ask` (`models.py:63,64`) → `_add_microstructure_features` `features.py:408-413` | same | same; builder already test-covered (`tests/test_rl_environment.py:205-215`) | needs funding file |
+
+**Excluded from the committed set, as the borderline internal runner-up:**
+`mark_price`, `index_price`. They are 2 lines on the same tuple and ride the
+same retrain, but RESEARCH-1 §3 makes the deeper, measured call: the funding
+sibling computes `basis = (mark_price − index_price) / index_price`
+(confirmed at `kraken_funding_rates/models.py:30,101`), and `basis` is already
+merged. The audit's counter-claim — mark-vs-OHLCV-`close` is a genuinely
+different (spot-side) number — is real but marginal. **Gate number: 55.
+Integrator direction: if the interface budget permits, `mark_price` and
+`index_price` may ride the same `_SIGNAL_COLUMNS` edit for the same retrain cost
+(→ 57), but they are not required for the gate and default to excluded.**
+Naming them keeps the width accounting unambiguous and the decision single.
+
+**Clean-vs-naive accounting is fixed at clean:** whitelist `bid`/`ask` as
+*builder inputs* and let `_add_microstructure_features` emit `spread`; exclude
+`bid`/`ask` from raw `signals` pass-through the way `_SIGNAL_FRESHNESS_COLUMNS`
+is excluded, so the net is **+1 (`spread`), not +3** (RESEARCH-1 §3 "clean +1").
+No raw dollar-price columns in the observation.
+
+**`order_book_imbalance` (+1 → 56) is explicitly NOT in this slice.** It needs
+the `bid_vol`/`ask_vol` producer, which requires the engine recorder (Gap 3
+territory, RESEARCH-1 §2/§6 item 2, "only if the engine loop is the intended
+deployment"). Deferred with Gap 3.
+
+### 2.2 The mandatory guard (Gap 4 component, lands WITH the widening)
+
+Decision-shaping note (and RESEARCH-1 §1.1, RESEARCH-2 §2): any widening **must**
+ship with `n_features` provenance, or the six on-disk 49-wide models silently
+run column-less. `paper_trade.py:327-340`'s `_validate_observation` is
+**tautological for this threat** — both sides derive from the same loaded
+`NormalizationStats`, and `NormalizationStats.normalize` (`features.py:138-144`)
+silently drops columns not in `feature_names`. `backtest.py` has **no guard at
+all**. In-scope landing points:
+
+- `train.py:238-242` — write `n_features` (`env.observation_space.shape[0]`,
+  RESEARCH-2 §2.2) into the model's `config.yaml`.
+- `registry.py:60-78` `config_summary()` — surface `n_features` (and the
+  `data_window`/`feature_fingerprint` fields are SPEC'd in RESEARCH-2 §2.2 but
+  are **deferred** — not required to make Gap 1 safe; only `n_features` is in
+  this slice).
+- Replace the tautological guard with a non-self-referential width assertion:
+  `feature_names` read from `normalization.npz` (`features.py:94,117`, already
+  round-tripped) vs the live pipeline's column set, at load.
+- **All 6 on-disk `models/{ETH,SOL,XRP}_USD/*` artifacts must be deleted and
+  retrained at 55** — they are null-signal scratch artifacts (`PLAN.md` §5 item
+  4), so there is no backtest/reproducibility burden; a future widening is what
+  the guard now makes loud.
+
+### 2.3 The minimal activation (Gap 5 / one slice of Gap 2)
+
+- `configs/default.yaml:65` — set `funding_features_file:` to a real path,
+  populated by `kraken-funding-rates pull --pair ETH/USD --output <path>
+  --append` (idempotent by `(ticker, hour)`; RESEARCH-2 §4.1). One-off pull
+  generates the history for a training window; the timer keeps it fresh for
+  live paper-trade so `signal_observed` is non-zero in production.
+- `signal_max_age_hours`: funding settles ~8-hourly, and at the `null`→1 h
+  default a funding reading covers only **76/721 bars** vs **301/721** at 12
+  (`VALIDATION.md` §4). Activation therefore sets `signal_max_age_hours: 12`
+  in the funding-bearing config. The per-source-bounds schema change is the
+  filed Gap-2/PLAN follow-up, not this slice.
+- **One timer only**: a `systemd.user` timer+service pair in this repo
+  (`nix/module.nix` `systemd.user.*` section, or a plain unit under
+  `~/.config/systemd/user/`), `OnCalendar` hourly or 3×/day, invoking the
+  funding CLI. That is **not** Gap 2's full fix (news/social timers, flake
+  inputs, market-data store timer, and the `kraken-market-data` ExecStart bug
+  all stay deferred) — it is the single unit without which Gap 1's funding
+  columns are silent, per Gap 1's own caveat.
 
 ## 3. LIBRARY(IES)
 
-**None. Stdlib + pandas only.** No new dependency, no new transitive closure.
-
-The four defects are join-key selection, de-duplication, time-based ffill
-bounding, and missing-value encoding — all expressible in the pandas already a
-hard dependency of the package (`flake.nix:58-64`). Anything else would be a
-re-plumbing of a working seam: `duckdb` (storage/query layer, not a join
-policy), `dvc`/`lakeFS` (dataset versioning, for a question about *stale
-values*, not dataset identity), `polars`/`dask` (parallelism this frame size
-does not need). RESEARCH-1 §7 reached the same conclusion for the adjacent
-window-recording gap and its library survey is reused here; RESEARCH-2 and
-RESEARCH-3 likewise returned "no new deps" (measured, not assumed). Consensus
-across all three researchers: **there is no library-shaped win on this board.**
+**None. Stdlib + numpy + the pandas already a hard dependency**
+(`flake.nix:58-64`). The three OHLCV derivations are two-line vectorized
+pandas operations on the frame the pipeline already holds; the funding columns
+are raw z-scored pass-throughs. RESEARCH-1/2/3 all independently returned
+"no new deps"; there is no library-shaped win on this board (prior DECISION
+§3 consensus stands: duckdb/polars/dvc solve storage/parallelism/versioning,
+none of which this frame size needs).
 
 ## 4. IMPROVEMENT SCOPE (Phase 4B)
 
-**Touched repo: this one only — `/home/seanc/Projects/kraken-trading-bot`.**
-No sibling repo is modified. (Rationale, consistent with PLAN.md §2.2: a
-one-repo outcome keeps Phase 4B inside this repo's boundary. The source-side
-half of A4 in `kraken-social-signals` is therefore deliberately left as an
-*upstream, deferred* item — see §7 — and the bot-side disambiguation is
-achieved in-repo instead, which is both sufficient and cheaper.)
+**Touched repo: this one — `/home/seanc/Projects/kraken-trading-bot.`** The
+`kraken-funding-rates` sibling is *invoked* (its CLI already exists and emits
+hour-floored JSONL) but **not modified**. In-scope files/units:
 
-### Primary unit — the merge seam
+| Unit | File:line (commit `ca360a8`) | Change |
+|---|---|---|
+| Allow-list | `kraken_trading_bot/rl/features.py:42-54` `_SIGNAL_COLUMNS` | +6 names (`vwap_dev`, `trade_count_zscore_20`, `volume_per_trade`, `funding_rate_prediction`, `vol24h`, `spread`); `bid`/`ask` as builder inputs excluded from raw pass-through |
+| Seam derive | `rl/data.py:623` (`candles_to_dataframe`) or `:775-787`/`:929-940` (post-merge, both legs) | derive the three OHLCV scalars, presence-gated like `_add_microstructure_features` (`features.py:408-418`); no `_OHLCV_COLUMNS`-required change |
+| Micro builder | `rl/features.py:405-418` `_add_microstructure_features` | already emits `spread` from `{bid,ask}` — no change required; verify covered by `tests/test_rl_environment.py:205-215` |
+| Width guard | `rl/registry.py:60-78`, `rl/train.py:238-242`, `rl/paper_trade.py:327-340`, `rl/backtest.py` | `n_features` in config_summary + write; non-tautological assert (`npz` `feature_names` vs pipeline columns) at load |
+| Activation | `configs/default.yaml:65` (+ `configs/deep-history.example.yaml:56-58`) | `funding_features_file` path; `signal_max_age_hours: 12` |
+| Timer | `nix/module.nix` (`systemd.user.*`) or `~/.config/systemd/user/` | one funding-pull unit (Option A, RESEARCH-2 §4.2) |
+| Tests | `tests/test_rl_data_store.py`, `tests/test_rl_environment.py`, `tests/test_rl_signal_config_wiring.py` | RESEARCH-1 §6 verification hooks §7: `{vwap,count}` compute assert; `_SIGNAL_COLUMNS` member round-trip through `merge_extra_features`; width probe `compute().shape[1] == 55` with all inputs, `== 49` when new inputs absent (presence-gated); the 6 funding/OHLCV names reach the observation |
 
-`kraken_trading_bot/rl/data.py:79-176` `merge_extra_features()` — the **exact
-landing point**. It is the single door through which every exogenous column
-enters the OHLCV frame for all four consumers. It is called with the caller's
-`pair`/`ticker_id`, so it is where the feature is **read per ticker**. Four
-changes:
-
-| # | Change | Site | Effect |
-|---|---|---|---|
-| 1 | **Ticker filter** — require/derive the `ticker` field and filter records to the requested pair *before* building `signal_df`; treat a file with no `ticker` field as **explicitly opted-in to the one-ticker file** (log at WARNING, so the existing 8 tests and the documented one-ticker cron keep working) and hard-fail on a file whose tickers do not include the requested pair | `data.py:134-141` | Kills A1. A `BTC_USD` file can no longer silently annotate ETH bars |
-| 2 | **De-duplicate the floored hour** — `groupby(level=0).last()` (last write wins, i.e. the most recent pull for that hour) before the reindex; also `drop_duplicates` on the raw record index | `data.py:144-156` | Kills A2. The documented hourly-append cron stops raising `ValueError`; a two-ticker file stops crashing even before the filter above |
-| 3 | **Bounded ffill + freshness column** — replace `.ffill()` with `.ffill(limit=<hours derived from the bar interval>)`, and add a `signal_age_hours` (float, per source) plus a `signal_observed` bool so "no record within the window" is a first-class value instead of a silent zero | `data.py:161-166` | Kills A3. A 3-day-old `funding_rate` is now visibly 72h old in the observation |
-| 4 | **Absence != neutral** — with the `signal_observed` flag from (3), never encode "absent" as the same float as "genuinely 0 / balanced"; `_SIGNAL_COLUMNS` members that are absent entirely keep their existing `fillna(0.0)` behaviour for backward compatibility, but a *present-but-stale* or *present-but-null* value is now distinguishable | `data.py:165-166` | Kills A4 from the bot's side, without a sibling edit |
-
-### Secondary units (same slice, same file family)
-
-- `kraken_trading_bot/rl/features.py:35-45` `_SIGNAL_COLUMNS` — add the
-  new provenance columns to the tuple **once** (it is already the single
-  canonical source; `data.py:37-41` imports it — AUDIT.md's correction: this
-  centralization is DONE, not duplicated). The new age/observed columns ride
-  the existing `signals` group (`features.py:25,48`) into the observation with
-  **zero new plumbing**.
-- `configs/default.yaml:57` (and the sibling keys at `:65,:73`) — two new keys
-  beside the three existing `extra_features_file` / `funding_features_file` /
-  `social_features_file`:
-  `signal_max_age_hours:` (int, default `null` = current unbounded behaviour,
-  so this lands safe) and `signal_require_ticker:` (bool, default `true` once
-  the file set is ticker-tagged). Same in `configs/deep-history.example.yaml`.
-- `tests/test_rl_data_store.py:211-374` — extend the 8 existing merge tests,
-  they are the right home: **ticker mismatch must not merge**; **duplicate
-  floored hour must not raise**; **ffill is bounded and `signal_age_hours`
-  grows**; **`fng_index` absence is distinguishable from `fng_index=0`**.
-
-### Explicitly OUT of scope for this slice (so Phase 4B stays one clean outcome)
-
-A5 (defaults-drift centralization — real, but orthogonal bookkeeping),
-A6/A7 (fetch reliability + store collapse — RESEARCH-3's measured answer is a
-sibling-repo `transport.py` change), A8/A9 (window recording + provenance —
-RESEARCH-1, the next slice), the `_SIGNAL_COLUMNS` widening that turns on
-`spread` (Candidate 2 — **downstream**, it needs `signal_age_hours` to be
-correct), and the schedulers/flake wiring (Candidate 4 — **downstream**, it
-needs A2 fixed).
+**Explicitly NOT in this slice** (stays deferred, with reasons): `until` client
+fix (~8 LOC, changes no column, belongs to data-window recording — RESEARCH
+note 5); full Gap 2 scheduler + flake inputs for the other two signal CLIs;
+Gap 3 engine recorder / `order_book_imbalance`; full Gap 4 provenance suite;
+`mark_price`/`index_price` (gate-optional); on-chain / macro / academic /
+new-text-news (re-verified and still rejected — AUDIT.md "Categories
+deliberately NOT ranked", unchanged from DECISION §6.6-6.8).
 
 ## 5. INTEGRATION SKETCH (one paragraph)
 
-A follow-up pass turns the seam sound without touching the feature pipeline's
-shape, because the observation door is already open: `read_ohlc_dataframe`
-(`data.py:329`) takes `extra_features_file` / `funding_features_file` /
-`social_features_file` and calls `merge_extra_features` three times on both the
-live leg (`data.py:323-325`) and the store leg (`data.py:457-459`); the fix
-lands entirely inside that one function, so `fetch_ohlc_dataframe` →
-`prepare_episode` (`data.py:505-567`) → `TradingEnvironment._raw_feature_array`
-(`environment.py:445-464`) → `_observe` (`environment.py:367-375`) →
-`PPO(MlpPolicy)` (`agent.py:179`) is unchanged, and `backtest_model`
-(`backtest.py:84-262`) and `PaperTrader.step` (`paper_trade.py:343-380`) inherit
-it for free. What changes is what arrives at the frame: with a per-ticker
-filter, a de-duplicated hour index, a bounded ffill and a `signal_age_hours` /
-`signal_observed` pair appended to `_SIGNAL_COLUMNS`, the `signals` feature
-group (`features.py:25,48,404-417`) forwards both raw value and its freshness,
-so the observation gains 1–2 *correctness* columns per source while every
-exogenous column becomes either a genuine per-ticker reading or a visibly
-absent one. Fit stays slice-then-fit (`prepare_episode`, `data.py:550-559`) so
-no look-ahead is introduced, and the artifacts at
-`models/{TICKER_ID}/{model_name}/{model.zip,normalization.npz,config.yaml}`
-keep their contract — with one caveat that must land in the same slice or be
-filed loudly: widening the observation invalidates any existing `model.zip`,
-`models/` is currently empty (`.gitkeep` only, AUDIT.md C3), so this costs no
-retrain today, and the RESEARCH-2 width guard (`feature_names` already in the
-npz, `features.py:78,101-106`) is the cheap insurance that the next widening —
-Candidate 2's `spread` — cannot be loaded against a stale policy.
+The output contract is unchanged in shape — a per-(ticker, bar) OHLCV frame
+whose per-ticker observation gains 6 named scalars, delivered through the
+existing, already-sound seam (`merge_extra_features`, repaired `5951f72`): the
+three OHLCV-derived columns (`vwap_dev`, `trade_count_zscore_20`,
+`volume_per_trade`) are computed in `read_ohlc_dataframe`'s return path on both
+the live leg (`data.py:779-787`) and the store leg (`data.py:929-940`), so all
+four consumers (`train.py:188`, `backtest.py:138`, `export.py:166`,
+`paper_trade.py:294`) inherit them with zero config the moment the code lands;
+the three funding columns (`funding_rate_prediction`, `vol24h`, `spread`) enter
+through the same `funding_features_file` key every consumer already threads,
+fed by one `systemd.user` timer running the `kraken-funding-rates` CLI. The
+widened frame flows unchanged through `FeaturePipeline.compute`
+(`features.py:280`) — the micro group (`:405`) turns `{bid,ask}` into `spread`,
+the signals group (`:420`) copies the new `_SIGNAL_COLUMNS` members — then
+`_raw_feature_array` (`environment.py:445`) → `_observe` (`:367`) → `PPO`. Each
+new column's value is per-ticker-normalized by the existing `NormalizationStats`
+(per-ticker, z-scored — RESEARCH-1's note that `vol24h` is a slow-moving level
+is handled by z-scoring), and the pipeline is retrained at width 55, with
+`n_features` recorded in the registry so `scan_model`/`cli.py models` shows any
+stale-width artifact instead of silently running a column-less policy.
 
 ## 6. RUNNER-UPS (and exactly why each lost)
 
-1. **Candidate 2 — activate dormant `microstructure` from on-disk funding data**
-   (49→51 features, zero new API calls; `bid`/`ask` already emitted at
-   `kraken_funding_rates/models.py:47-48,62-63` and dropped at `data.py:147,156`).
-   **Lost by ordering, not by value.** It rides the *same* allow-list
-   (`data.py:147`) this target repairs, and `_add_microstructure_features`
-   (`features.py:389-402`) would emit an `spread` forward-filled from an
-   8-hourly funding snapshot — the exact A3 defect. Cheapest width win on the
-   board; **the immediate follow-up** once `signal_age_hours` exists.
-2. **Candidate 3 — record the training window, then split it** (A8/A9;
-   fully researched in RESEARCH-1: one `data_window: {since,until}` config
-   block after `market_data_store` at `configs/default.yaml:97`, four one-line
-   caller edits, provenance after `prepare_episode`, no library). **Lost on
-   severity, not cost.** A3-equivalent: it does not *corrupt* the observation,
-   it makes every reported return/Sharpe/drawdown less trustworthy (the 16 %
-   `rsi_24` fitted-std drift, VALIDATION §4). Correctness beats
-   reproducibility. Fully specced and ready.
-3. **Candidate 4 — schedule the three signal projects + put them in the flake**
-   (C1/C2: only `kraken-market-data` has a timer; `flake.nix:4-8,71` cannot run
-   the other three CLIs; all three keys null). **Blocked by this target** —
-   shipping the documented hourly cron before A2 is fixed ships a crash loop.
-4. **Candidate 5 — retry/backoff + bar cache** (A6/A7; RESEARCH-3's measured
-   answers: Kraken rate-limits in the **body** with HTTP 200 so
-   `urllib3.Retry(429)` never fires; `from_env(min_interval=)` is a silent
-   no-op at `kraken_api/auth.py:73`; the throttle is ~300× under limit so the
-   real cost is the re-fetch and the 3 O(file) JSONL parses per tick). **Lost
-   on boundary** — the load-bearing half is a sibling-repo `transport.py`
-   change, and reliability is not signal content.
-5. **Candidate 6 — order-book depth + trade-tape recorder** (B3/D4: the only
-   feature with no producer; `manager.py:185,192,200` keyless and uncalled).
-   **Lost on directness vs cost** — medium directness, keyless but high ops,
-   and a 10-level snapshot at 60 s is a weak estimator, not book history.
-6. **Candidate 7 — on-chain** (D1). Low-medium directness, mostly paid/API-keyed,
-   needs an asset→pair mapping layer that does not exist. Rejected.
-7. **Candidate 8 — macro calendar** (D2). Low directness — macro events move
-   this on a weekly/daily horizon; the observation is hourly. Rejected.
-8. **Candidate 9 — research/academic as a data source** (D3). Very low
-   directness; no route from a paper to a per-(ticker, hour) numeric column.
-   Rejected.
+1. **NEW-DATA-SOURCE — the `kraken-microstructure` trade-tape/spread recorder
+   (Gap 3, the leading alternative).** Legitimate: keyless, both wrappers
+   (`recent_trades`/`spread`) return `(rows, last)` exactly like `_page_candles`
+   (RESEARCH-3 §1d), ~100× under rate limits at 15-60 s (RESEARCH-3 §2),
+   feed-directness 4/5. **It lost on directness-per-cost and sequencing.**
+   Gap 1 is 5/5 directness / 1/5 difficulty with zero new repo/dep/API;
+   the recorder is 3/5 difficulty, a new sibling project with a `_meta.json`
+   opaque-cursor sidecar, and — decisively — **it is gated on the scheduler
+   that does not exist yet (Gap 2)**: the tape only exists if someone listens,
+   and the same timer Gap 1's slice needs for one funding CLI is the
+   *precondition* the recorder needs for a 15-60 s poller. Its headline scalars
+   also overlap Gap 1's free ones (`volume_per_trade` vs `mean_trade_size`;
+   `vwap_dev` vs `vwap_pressure`; RESEARCH-1 §1). The `spread` single-writer
+   rule means it must use `realized_spread_bps` regardless — compatible but not
+   additive. Correct ordering: this pass ships the free columns and the first
+   timer; the recorder is the right **next** NEW-DATA-SOURCE once the scheduler
+   and Gap 5 activation actually exist (i.e. as a follow-up pass).
+2. **Gap 5 alone (activation).** Directness 4/5 but difficulty 1/5 and no new
+   columns — it is the *precondition* included in this slice as §2.3, not an
+   independent target; there is nothing to activate that is more load-bearing
+   than the funding file the committed columns need.
+3. **Gap 2 in full (schedulers + flake inputs for all three signal CLIs).**
+   Directness 2/5, difficulty 2/5, and it adds no column. The full build (three
+   `systemd.user`/system timers + `git+https` flake inputs, RESEARCH-2 §4
+   options A→C) is deferred; only Option A's single funding unit ships here
+   because Gap 1's caveat names it.
+4. **Gap 4 in full (until fix, data_window provenance, cache, replay).**
+   Directness 2/5, no columns; gates *reproducibility*, not *observation
+   content*. Only the `n_features` component ships (mandatory-with-widening);
+   the `until` clip fix (~8 LOC, RESEARCH-2 §1.3) and full provenance suite
+   stay deferred, correctly sequenced after Gap 1 per RESEARCH note 5.
+5. **`order_book_imbalance` via the engine recorder (Gap 3 in-repo fallback,
+   RESEARCH-1 item 2).** +1 column to 56, needs a ~25-30-line engine
+   aggregator, and is only correct if the engine loop is the deployment. The
+   60 s engine `Depth` call keeps being made and discarded (Gap 3's "machinery
+   already running" fact) — that is recorded as the future producer, not split
+   into this slice.
+6. **On-chain / macro / academic / new-text-news.** Re-verified by the audit
+   and carried forward unchanged (AUDIT.md "Categories deliberately NOT ranked"):
+   paid/API-keyed, needs an asset→pair mapping layer, weekly/daily horizon vs
+   hourly observation, or no route to a per-(ticker, hour) numeric. No new
+   evidence overturns them.
 
 ## 7. DEFERRED, WITH WHAT MUST HAPPEN FIRST
 
-- **Candidate 2 (`spread`/`order_book_imbalance`)** — after this slice. Needs
-  `signal_age_hours`; then widening `_SIGNAL_COLUMNS` is one line. The
-  `bid_vol`/`ask_vol` half additionally needs a recorder (Candidate 6).
-- **Candidate 3 (window + provenance)** — independent; can run in parallel, but
-  sequence it here so the A/B it enables measures a *correct* observation.
-- **Candidate 4 (schedulers + flake)** — after this slice; the hourly-append
-  cron is the reproducer for A2, so it is the natural acceptance test.
-- **A5 (defaults drift: `_FEATURE_GROUPS` re-spelled 4× + `pages=6` ×5 + the
-  `export.py:73-79` fifth spelling; `[1,4,24]` ×4)** — real and cheap, but
-  orthogonal bookkeeping, not a correctness defect. Filename-free follow-up.
-- **A6/A7 + `transport.py` retry** — sibling-repo change; RESEARCH-3's design
-  is ready when that boundary is opened.
-- **A4 source-side in `kraken-social-signals`** (`_FNG_MISSING = 0` at
-  `pipeline.py:38,136`; `_tilt` `0.0` at `:52-62`) — the bot-side
-  `signal_observed` flag makes the ambiguity harmless from here; changing the
-  sibling's on-disk encoding is an upstream improvement, deliberately not
-  bundled.
-- **RESEARCH-3's bonus bug** — `until` is silently dropped on the live
-  (null-store) path (`data.py:402-412`); one-line fix + test, file it with the
-  Candidate 3 slice where `until` starts mattering.
-- **Run the `kraken-deep-history seed`** (`RESEARCH-1.md` §5) — still ops, not
-  code, and still un-run on this host. The store root is absent and
-  `market_data_store: null` everywhere.
+Same table, current status per `ca360a8` (from AUDIT.md deferred summary):
+Candidate 2 (`spread`) — **now ship** (part of Gap 1 scope); Candidate 3
+(`until` + window record) — after this slice, needs the fix sequenced with a
+window-recording step (RESEARCH note 5); Candidate 4 (schedulers + flake) —
+full version after this slice's single timer proves the pattern; Candidate 5
+(retry/backoff, `transport.py`) — sibling-repo boundary, unchanged; Candidate 6
+(book/trade recorder) — remains the next NEW-DATA-SOURCE after a scheduler
+exists; `kraken-deep-history seed` / `market_data_store` — ops, still un-run;
+`signal_max_age_hours` per-source bounds — filed schema change; A5 defaults
+drift (`_FEATURE_GROUPS`, `pages=6` ×5, `_FETCH_PAGES=2`) — cheap, orthogonal,
+also still open; width guard / `n_features` — **now ship** (Gap 1 scope).
+
+## 8. GUARDRAILS HONORED
+
+- **Keyless preference**: Gap 1 makes zero additional Kraken calls; the funding
+  file comes from an already-keyless sibling CLI. The recorder (keyless) is the
+  only keyless *new-source* candidate and it is deferred, not preferred.
+- **Rate limits**: no new REST traffic this slice. One funding pull/hour ≈ 0.0003
+  calls/s against a 15-20/s tier — negligible; the existing per-tick cost
+  (2 OHLC pages + 3 JSONL parses) is untouched.
+- **`spread` single-writer**: funding `bid`/`ask` → `spread` is the only owner;
+  any future tape recorder must use `realized_spread_bps` (recorded in
+  RESEARCH-3 §4.4, honored here).
+- **Widening = guard + retrain**: `n_features` provenance and a non-tautological
+  width assertion ship in the same slice; the six 49-wide artifacts are deleted
+  and retrained at 55, never backtested at the wrong width.
+- **Presence-gated, not required-column**: new builders read their inputs
+  `if present` exactly like `_add_microstructure_features`, so a frame without
+  `vwap`/`count` still computes (width probe: 49 unchanged when inputs absent).
+- **One clean outcome**: Gate number 55 + the guard + the funding timer, in one
+  repo, no new dependency, TGIF-compatible with the standing /tmp-scratch and
+  recorded-window constraints from PLAN.md §7.
 
 ---
 
-## 8. PHASE 4 VERDICT
+## 9. PHASE 4 VERDICT
 
-**Phase 4B — implement in the existing target**, inside
-`kraken_trading-bot` alone. `merge_extra_features` (`data.py:79-176`) plus
-`_SIGNAL_COLUMNS` (`features.py:35-45`), two config keys, and four new
-regression tests in `tests/test_rl_data_store.py`. No new repo, no submodule,
-no new dependency.
+**Phase 4B — implement in the existing target.** Gap 1 widening 49 → 55
+(`_SIGNAL_COLUMNS` + seam derivation), `n_features` guard, minimal funding-file
+activation under one `systemd.user` timer. Touched repo: `kraken-trading-bot`
+only; `kraken-funding-rates` invoked, not modified. No new repo, no submodule,
+no new dependency. Runner-up (microstructure recorder / NEW-DATA-SOURCE) filed
+as the next project once a scheduler exists.
 
 DECISION COMPLETE
