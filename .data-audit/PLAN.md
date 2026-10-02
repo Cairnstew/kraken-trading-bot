@@ -1,226 +1,220 @@
-# PLAN — the data-pipeline audit, what happened, and what is next
+# PLAN — data-pipeline audit, Phase 6 close-out
 
-Supersedes the Phase-4 version of this file. Written by `reviewer` at the close
-of Phase 6. Read `VALIDATION.md` for the evidence; this file is the map.
-
----
-
-## 1. What was audited, and what came of it
-
-The pass was scoped in `.data-audit/AUDIT.md` (auditor) against the pipeline's
-**data** surface, then `DECISION.md` (architect) picked exactly one
-(gap, improvement) pair and fixed the outcome type.
-
-| phase | agent | artifact | outcome |
-|---|---|---|---|
-| audit | `auditor` | `AUDIT.md` | enumerated + ranked candidate gaps spanning >1 category |
-| research | `researcher1/2/3` | `RESEARCH-1/2/3.md` | library/API surveys for the top 3 gaps |
-| decide | `architect` | `DECISION.md` | **chose CAND-3a** (seed a local market-data store, flip one config key) as **IMPROVE-EXISTING**, and folded in **CAND-5** (a dispersion gate) as the acceptance instrument |
-| build | `builder*` | source + tests | store seam, `just store-*` recipes, dispersion gate, venue label, non-finite guard, IN-SAMPLE labelling, pinned-window error |
-| gate | `reviewer` (this file's companion) | `VALIDATION.md` | **`NEEDS_FIX`** |
-
-**What CAND-3a delivered, stated without inflation:** a store makes an
-**out-of-sample measurement possible at all**. On the shipped default,
-`since`/`until: null` means `training_frame` and `evaluation_frame` return the
-**same object**, so no OOS number existed to be good or bad. It did **not**
-deliver better returns, and it did **not** deliver a claim that could be
-adjudicated without the two-matrix method (§4.1 below).
-
-**Verified working:**
-
-| claim | status |
-|---|---|
-| store seam reads years of history from one config key | ✅ 76,563 bars, 0.19 s |
-| `n_features` 60 and `start_index` 24 on **both** arms | ✅ hard-asserted |
-| `IN-SAMPLE` / `OUT-OF-SAMPLE` label on every result, 3 surfaces | ✅ verified in real output |
-| pinned window with disjoint splits | ✅ 36,804 train / 15,773 eval, 0 overlap |
-| pinned-without-store names the seed recipe + its cost | ✅ `just store-plan` / `just store-seed`, ~158 s, ~13 MB |
-| non-finite guard: hard finite check on `fit` **and** `transform` | ✅ and **non-vacuous** |
-| live-arm width-neutrality (no `models/` artifact invalidated) | ✅ **byte-identical**, sha256 match |
-| honest OOS result | ✅ **−34.30 % / Sharpe −0.568**, reproduces §9A.3 to the digit |
-
-**Not delivered, or delivered wrong — see `VALIDATION.md` §0.** Headline:
-the store arm's dispersion (the +1800 % seed) is a **friction artifact**, not
-seed variance, so the gate's yardstick is currently measuring a cost
-assumption.
+Pass date **2026-10-02/03**. Gate verdict: **PASS** (see `VALIDATION.md`).
+`HEAD = a7a9cbe`. Nothing pushed; the close-out push is the lead's.
 
 ---
 
-## 2. What was deferred, and why
+## 1. What this pass was
 
-| # | deferred item | why | trigger to revisit |
-|---|---|---|---|
-| D1 | **CAND-2** — exogenous coverage (funding backfill + Fear&Greed + the timer) | runner-up 1, "the closest call" (DECISION §9.1). Deferred only because the pass could hold one outcome. **Its look-ahead handling must be settled before it lands**: the merge seam currently uses `signal_max_age_hours` + `ffill`, and a funding series that backfills *after* the fact would put a record into a bar that did not know it yet. | **next pass.** Needs an explicit decision on whether the funding backfill is (a) point-in-time reconstructible from the settlement timestamps or (b) only usable going forward. Answer (b) ⇒ the timer must land first and the backfill must not touch the evaluation window. |
-| D2 | **CAND-1** — a `kraken-microstructure` trade-tape source (`NEW-DATA-SOURCE`) | runner-up 2, the best NEW-DATA-SOURCE candidate and it still lost (DECISION §9.2). A sibling repo + flake input is a larger surface than this pass allowed. | only after CAND-2 resolves the exogenous look-ahead question; the two share the merge seam. |
-| D3 | **CAND-4** — retry/backoff/salvage on `_page_candles` | runner-up 4, deferred *with a trigger* (DECISION §9.4). A seeded store's seed leg is 158 s over the network; a dropped page there is expensive. | **fires when a `store-seed` run reports a short page / partial month.** Store-side gap accounting (D5/F6) is what will detect it, so land that first. |
-| D4 | **§9A.1 harness defect** — a live-vs-store pair inside ONE matrix is structurally uncomparable | **deferred to Phase 7 by user decision** (2026-10-02). Forcing the guard to treat a 697-bar arm as a peer of a 76,538-bar arm marks all live cells INVALID and excludes all valid cells as IN-SAMPLE, so **6 cells yield 0 usable measurements and the gate never fires**. Confirmed still reproducible in Phase 6. | **Phase 7.** Interim method this pass: two separate matrices, each with its own `min_bar_ratio` reference, then `pooled_within_spread` / `dispersion_verdict` across the two replicate sets. That method works and reproduces §9A.2's ratios exactly. |
-| D5 | **`since`/`until` push-down** (CAND-3b, ~21 ln) | DECISION §10.4. `train.py:215-226` and `backtest.py:400-419` never pass them, so it is dead code on the default path; and a whole-store read is 0.142 s vs 0.010 s windowed, so the saving is not load-bearing. | once Phase 6's pinning is the *default* path (it is not — see §12.1 of DECISION). |
-| D6 | **sibling `_meta.json` venue label** | DECISION §10.2 — this repo consumes `kraken-market-data` as a pinned flake input (`rev 055d7f6`), so a sibling edit needs a `flake.lock` bump + push. The label went on the artifact the reviewer already opens (`config.yaml`) instead. | next time the sibling is touched anyway. |
+One outcome type, one target: `IMPROVE-EXISTING`, gap **G2**, the
+one-record-deep funding channel. Phases 1–5 produced `AUDIT.md`,
+`RESEARCH*.md` and `DECISION.md`; Phase 6 ran the gate.
+
+**Audited**: whether the bot now *sees* a live funding series rather than
+2 distinct values on 13 of 721 bars — by running it end to end (seed →
+export → train → backtest, both arms plus a baseline control), not by
+reading the diff. Plus the pre-registered structural gates
+(`just audit-verify` with **two different commits**, the bot suite) and a
+re-derivation of every number two agents had measured differently.
 
 ---
 
-## 3. What was built (Phase 5, by the builders)
+## 2. What was built (all committed before this pass)
 
-| builder | files | change |
+| phase | commit | what |
 |---|---|---|
-| `builder` / `builder2` | `data.py`, `justfile`, `configs/deep-history.example.yaml` | store read/upsert seam, `just store-plan/seed/stats/verify`, venue label |
-| `builder-inf` | `kraken_trading_bot/rl/features.py` | `NonFiniteFeatureError`, `_require_finite`, `fit`/`transform`/`normalize` gates, `_NON_FINITE_INPUTS` / `_NON_FINITE_INPUTS_NO_ZERO`, sweep of every ratio/log/pct_change site |
-| `builder-inlabel` | `data_window.py`, `backtest.py`, `data.py` | `EvaluationScope`, `evaluate_scope`, `evaluation_scope_label` on every result surface, `PinnedWindowUnavailableError` |
-| finishing passes | tests + `tools/model_matrix.py` | 379 → **429 tests**; the three gaps reported back were closed (missing CLI label, missing `__init__` export, pinned failure classified as opaque `process_failed`) |
+| 4B | `8cada4e` | `just funding-backfill`; corrected two factually-wrong "~8-hourly" comments (the series is **hourly**); `data.py` producer hint `&&`; `/tmp` output fix |
+| 5 | `aba7b9b` | seam closed through train/backtest/paper; 8 stale "8-hourly" mentions closed; 252 lines of tests |
+| — | `a7a9cbe` | F-7..F-13 dispositions recorded at `DECISION.md` §7.8 |
 
-**Headline commit:** `aeace32` — *"429 passed (from 379 at the start of Phase 5),
-flake check green."*
+Sibling `kraken-funding-rates` @ `dc49847`: `historical_funding_rates()`,
+`FundingHistoryRow`, `@_register("funding_history")`, `backfill`
+subcommand. Keyless, 1 request, ~366 d hourly.
 
-Worth recording as a process note: the lead's recovery commit `fef25b3` had
-**broken 3 existing tests** — it applied the zero-guard to a passthrough column,
-where zero is *data* (`signal_observed` 0.0/1.0, `signal_age_hours` −1.0), so it
-erased the distinction between "no reading" and a genuine 0. Fixed by
-`builder-inf`, and now pinned by
-`tests/test_feature_nonfinite_guards.py::test_exogenous_passthrough_preserves_zero_and_the_minus_one_sentinel`
-rather than by a comment. This is the 2026-10-01 absence-vs-observed lesson in
-new costume, and the fix is verified non-vacuous (revert #3 in `VALIDATION.md`
-§1a).
+**Measured result**: `funding_rate` goes from **2 distinct values on
+13/721 bars → 721 distinct on 721/721 bars**, at **unchanged observation
+width 60**, fitted STD **×6.941**. Coverage **8,792 records**,
+`2025-10-01T08:00Z → 2026-10-02T23:00Z`, measured 2026-10-02; the count
+grows ~1/day because the window is recomputed each call.
 
 ---
 
-## 4. What this pass found wrong — the concrete work list
+## 3. Stated plainly: what this pass is worth, and what it is not
 
-Ordered by severity. All are **fix-in-place**; none needs a redesign.
+**It recovers 1 of 6 columns.** Kraken's `/historical-funding-rates`
+carries only `funding_rate`; all 8,792 backfilled records have
+`basis`, `open_interest`, `funding_rate_prediction`, `vol24h`, `bid`,
+`ask` = **null**. Downstream, five columns that the single live snapshot
+gave 13 real readings on now read as constant zero (`spread` included),
+taking the degenerate-STD count from 3 features to 10. One real
+distribution gained; five lost. That is the honest trade.
 
-### 4.1 Re-run the gate with costs — **MAJOR, blocks any use of the dispersion numbers**
+**`signal_observed` no longer distinguishes absence per-column (F-2).**
+It is a per-channel OR (`data.py:812`), so it reads 1.0 on 721/721 bars
+while five of six funding columns are zero-fill. `signal_observed` and
+`signal_age_hours` become *correct constants* on a dense file (1.0 and
+0.0) rather than diagnostics. Per-column absence is now only visible by
+comparing a column's distinct-value count against the bar count — which
+is exactly how §3.2 of `VALIDATION.md` reports it, and why that table is
+the artefact to keep.
 
-`VALIDATION.md` §2(d). Store arm, same models / same 76,539 bars / same trade
-counts, only `fee_rate`/`slippage` changed:
-
-| seed | trades/bar | frictionless | Kraken taker (0.26 % + 0.05 %) |
-|---|---|---|---|
-| 42 | 0.606 | +219.73 % | −99.79 % |
-| 43 | 0.700 | +53.68 % | −99.86 % |
-| 44 | 0.878 | **+2015.13 %** | **−88.18 %** |
-
-Store IQR **1961 pp → 11.7 pp**. The gate's yardstick is currently 873 pp of
-unpriced churn. Steps:
-1. set non-zero `fee_rate`/`slippage` in the matrix base config (Kraken taker
-   ≈ 0.26 %, plus slippage);
-2. re-run all 6 cells;
-3. re-score with the two-matrix method;
-4. rewrite §9A.2's **explanation**: `NOT SEPARATED` survives, but the reason is
-   *the metric has no cost basis*, not *the gap sits inside seed noise*;
-5. the two **RESOLVED** rows (`sharpe` 1.400, `max_drawdown` 10.74) must not be
-   reported as evidence of a better model — they are churn artifacts, and the
-   horizon confound §9A.2 names is the *smaller* of the two effects.
-
-### 4.2 Fix the false pandas claims — **MAJOR**
-
-`VALIDATION.md` §2(a)(i). Measured on pandas 3.0.4:
-
-- `rolling(w)` **masks** inf → NaN (it does not propagate), so the compute seam
-  is **not** what stops an infinity escaping the rolling builders;
-- `ewm()` **skips** the bad bar — finite, silently wrong, no NaN.
-
-Correct five places: `features.py:789-791` (the seam's justification),
-`1054-1056` (`_rsi`), `1098-1101` (`_bollinger`), `1121-1123` (`_atr`), and
-`tests/test_feature_nonfinite_guards.py:703-708`. The test
-`test_compute_seam_is_the_only_guard_for_the_rolling_technical_group` is
-**vacuous** — reverting the seam leaves all 31 tests green — so either delete it
-or rewrite it around what the seam actually buys (0 → NaN in `sma`/`obv`, and
-the price group's semantics). Also document the real residual hazard: `ewm`
-yields a **silently wrong but finite** feature that the guard cannot catch.
-
-### 4.3 Fix the bar-count wording — material
-
-`VALIDATION.md` §2(c). The discrepancy is **resolved**: benign accumulation from
-the live upsert leg (`data.py:1349-1352`), ~1 bar per run, 0 duplicates, pinned
-edge unmoved. There are **four** live figures in circulation (76,561 / 76,562 /
-76,538 / 76,563). Fixes:
-- `DECISION.md` §3 (`:47`, `:85`, `:86`), §5.1 (`:127`), §8 (`:318`, `:325`) and
-  §11 (`:605`) still say **76,561** — strike or annotate as superseded by §9A;
-- add a header to `RESEARCH.md` and `RESEARCH-3.md` pointing at §9A, since both
-  quote 76,561 with no `NOT SEPARATED` and no −34.3 % OOS figure;
-- quote bar counts **with their timestamp or their run**, never as a constant.
-
-### 4.4 Correct the zero-volume-bar description — material
-
-`VALIDATION.md` §4 F4. §9A.3 says "a zero-volume bar at each **partial-month
-boundary** (4 across the store)". **Wrong.** 0 of 106 month-first bars have zero
-volume; all 4 are mid-month, and 2 sit immediately before an exchange-downtime
-gap. They are **no-trade outage bars**. Point this at data integrity, and fix
-the wording wherever it is repeated.
-
-### 4.5 Add store gap accounting — material (new finding)
-
-`VALIDATION.md` §4 F6. The store has **157 missing hourly bars across 28 gaps**,
-max single gap **39 hours**, including a **38-bar hole at the seed/live-append
-seam in the most recent month**. Features are computed on *bar counts*, so a
-39-hour jump is z-scored as a 1-bar step and the 24-bar warm-up spans more than a
-day. Fixes:
-- `just store-verify` should report gap count and max gap, and warn past a
-  threshold;
-- `market_data_store_venue` provenance should record that the seed (Binance
-  archive) and the live leg (Kraken REST) are **two venues joined without an
-  overlap check** — the existing label only names one;
-- decide whether the seed should backfill the seam months rather than leaving a
-  hole where live trading would run.
-
-### 4.6 Make the store-off remedy true — material
-
-`VALIDATION.md` §4 F3. `_resolve_env_setting` (`backtest.py:282-307`) **skips**
-a `None` source, so `market_data_store: null` in a run config cannot override a
-store-trained model's own config — yet `data.py:267` tells users that is exactly
-how to go back to live. Either honour an explicit sentinel (`""` / a
-`--no-store` flag) or reword to name the model's own `config.yaml`.
-
-### 4.7 Pin or drop the redundant guards — minor
-
-`VALIDATION.md` §1a. Reverting any one of these leaves the suite green:
-`features.py:745-750` (the final float32 check — **429 pass without it**),
-`features.py:737-742`, `features.py:452-457`, and
-`data_window.py:589-601` (`has_split`, redundant with the overlap clause).
-They are defence-in-depth and harmless, but four unpinned call sites read as
-load-bearing. Either add a test per site or say in the docstring that the check
-is deliberately redundant.
-
-### 4.8 Keep the dead-under-config lines, but say why — minor
-
-`return_1` / `log_return_1` (`features.py:883-884`) are overwritten by the
-`windows` loop when `1 ∈ windows` (the shipped default). They are **not**
-deletable — a config without `1` would need them. Add a one-line note; do not
-remove.
+**Both arms are IN-SAMPLE** (`data_window.since`/`until` both null, the
+shipped default; the bot warns on every run). No predictive claim is
+supported by anything in this pass.
 
 ---
 
-## 5. Next steps, in order
+## 4. Deferred, and why
 
-1. **Land 4.1** (re-run the gate with costs) — it is the only item that changes
-   a published number. Until it lands, treat **every** dispersion figure in
-   §9A.2 as unquoted.
-2. **Land 4.2** (false pandas claims + the vacuous seam test) — the next agent
-   will otherwise trust a mechanism that does not exist.
-3. **Land 4.3 + 4.4** (wording) — cheap, and they are what a future reader
-   hits first.
-4. **Land 4.5 + 4.6** (gap accounting, store-off remedy).
-5. **Land 4.7 + 4.8** (test/docstring tidy).
-6. **Phase 7**: the §9A.1 harness defect (D4). Decide whether the fix is a
-   per-arm `min_bar_ratio` reference, an explicit `comparable_cohort` flag, or a
-   refusal to score arms whose depth differs by construction. **Whichever it is,
-   any report comparing arms of deliberately different depth must state the
-   limitation rather than quoting a `report` run that silently produced no
-   verdict** (DECISION §9A.1).
-7. **Then D1 (CAND-2)**, with the look-ahead question answered first.
+Unchanged by this pass. Recorded so the deferral is a decision with a
+reason rather than an omission.
 
-## 6. Standing rules this pass established
+### G1 — `order_book_imbalance` has no producer · **NEXT SLICE**
 
-- **`NOT SEPARATED` is a result.** It is not a failure and must never be
-  presented as one. The gate exists to be able to say it.
-- **Verify the fix, not the intent.** Four separate claims in this pass were
-  true in spirit and false in mechanism (the compute seam, `has_split`, the
-  transform's final check, and the "partial-month boundary" bars). A guard that
-  is *collectively* load-bearing can still have individual call sites that no
-  test reaches.
-- **Measure the pandas/stdlib behaviour; do not document it from memory.** Three
-  docstrings asserted `ewm` masks inf to NaN. It does not — it skips the bar and
-  returns a finite, wrong number. The comment was the bug.
-- **Record magnitude on every run.** Bars replayed **and** trades taken. A run
-  that exits 0 while replaying ~1 bar is a fail, not a pass.
-- **Never `.venv/bin/python`.** Its editable install points at the MAIN
-  checkout and silently tests a different tree.
+The `microstructure` group is enabled in the shipped config but
+`order_book_imbalance` is unreachable: `_add_microstructure_features`
+computes it only when `bid_vol`/`ask_vol` are present, no producer emits
+them, and `_SIGNAL_COLUMNS` does not list them. Meanwhile
+`data["order_book"] = manager.order_book(pair, count=10)` already runs
+every 60 s and is thrown away by `strategies/base.py:92`.
+
+**Why it is the right next slice.** It is the only remaining gap that
+*widens the observation* rather than deepening one column. G2 recovered a
+series the agent could mostly already see; G1 adds a dimension
+(order-book depth) that is structurally absent from every training run so
+far. Highest remaining information gain per unit of work.
+
+**Why it is UN-backfillable — the reason it was not a G2-shaped fix.**
+G2 worked because Kraken publishes *historical* funding rates, so an
+existing endpoint could be replayed ~366 days into the past. **Kraken's
+order book is a live snapshot only.** There is no historical depth
+endpoint, and a depth log cannot be reconstructed after the fact: the
+`count=10` snapshot at time *t* does not encode what the book looked like
+at *t−1h*. So G1 is **forward-only by physics, not by choice** — it needs
+a recorder plus a timer plus a widening of `_SIGNAL_COLUMNS`, and its
+first bars only exist from the day it is switched on. Running it in
+parallel with the other work is the only way to have any depth at all.
+It also carries the §14 hazard in a sharper form: a forward-only file
+means the *early* training bars of every future run are depth-absent, so
+the recorder must be running before the next G1 slice is worth measuring.
+
+### G3 — no retry / backoff / rate-limit handling
+A partial page-loop failure discards every candle already collected. A
+robustness fix on the fetch path; orthogonal to signal depth, and it
+touches the same function G1's recorder would sit beside, so sequence it
+*after* G1 to avoid two edits to one path in one pass.
+
+### G4 — thin historical depth behind `market_data_store: null`
+Still fully open, and worth being precise about what this pass did
+**not** fix: the funding channel is now ~366 days deep, but the **price**
+frame is still the ~721-bar live REST ceiling, because the pass kept
+`market_data_store: null` deliberately (live-fetch leg). Deep funding on a
+721-bar price frame is still a 721-bar episode. G4 is the gap between
+"the signal is deep" and "the episode is long", and it remains the
+binding constraint on episode length.
+
+### G5 — dead strategy machinery + a wrong bar-interval comment
+Cosmetic/low-risk; a clean standalone slice.
+
+### G6 — shipped config trains and backtests at zero fees and zero slippage
+Both backtest arms in this pass ran at `fee=0.0000% slip=0.0000%`, so
+their returns are gross. Every return figure in `VALIDATION.md` inherits
+that. Do not quote one as achievable.
+
+### G7 — whole data categories with zero presence anywhere
+Needs its own scoping pass before it can be ranked.
+
+---
+
+## 5. Findings this pass settled
+
+**F-9 / C8 — resolved (frame mismatch, exact arithmetic).** 684 and 0 are
+the same pipeline measured on two frames. `first_tradable_index = 24`, so
+the tradable slice is 697 bars; `697 − 13` finite `spread` = **684**, and
+on that slice `spread` is the only non-finite column. The integrator's
+**0** is on `observed` (`compute().ffill().fillna(0.0)`) — the frame the
+policy sees, the frame `width_check` hashes, the frame `export-data`
+writes. Both arms: 0. The builder's "identical in baseline and target" is
+**wrong** (684 vs 697 on the same slice).
+
+**F-11 — resolved (one arm, two frames; right edge named).** 13 =
+`computed`, 24 = `observed`, same file. The record sits 23 bars back from
+the frame's right edge, so its 12 readings span offsets −23…−11 and
+`ffill` carries them over the last 11 bars: 13 + 11 = **24**. The
+integrator's "byte-identical both arms" is **wrong** — the backfilled arm
+is 0/721, because its file has no `bid`/`ask` anywhere.
+
+**F-8 — confirmed by measurement; assert nothing.** 52 (all-null) / 60
+(shipped). C1's 57 and C2's 49 are 3 low because the fixture lacked
+`vwap`/`count`. F-13's correction (52 is the all-null width) is confirmed.
+
+**F-10 — confirmed.** `signal_age_hours` max **12.0** on the shipped
+live-snapshot shape (it is `ages.max(axis=1)`, the stalest column, and
+the bound itself is the max); 0.0 on a dense file. C12's "≤ 2.0" is
+unachievable as written, which **confirms F-6 / DEV-2**.
+
+**New, for the lead to record in `DECISION.md` §7.8** (I am read-only on
+source; `just audit-findings` will refuse without them):
+
+- **F-14** — the two new characterisation tests are **vacuous for
+  `069a826..HEAD`**: both pass with `data.py`/`features.py` reverted to
+  the pre-registration commit, because `executable_ast` is byte-equal on
+  both files across the whole pass. Not a defect — the pass made no
+  executable change — but they must not be read as regression coverage of
+  this diff. The genuinely non-vacuous test is the producer-hint pin
+  (`assert "#" not in err.producer`), proven by reverting only that
+  string and watching it fail with the `#` symptom.
+- **F-15** — `width_check.py` calls `compute()` but never
+  `add_derived_ohlcv_features`, so a raw OHLCV parquet reports **49**
+  where every shipped state is 52 or 60. My own `verify --frame` receipt
+  printed it. Same class as F-8, but a **tool** trap rather than a doc
+  trap.
+
+---
+
+## 6. Concrete next steps
+
+1. **Record F-14 and F-15** in `DECISION.md` §7.8 (lead), then
+   `just audit-findings` and the ordered close-out push.
+2. **Annotate `width_check.py`'s docstring** (F-15) so a `--frame` receipt
+   is never mistaken for a shipped-width record. Docstring-only, invisible
+   to the `executable-ast` guard.
+3. **Start the G1 depth recorder now**, even before writing the feature
+   work — it is forward-only, so every hour it is not running is an hour
+   of depth that cannot be recovered. Budget the widening of
+   `_SIGNAL_COLUMNS` for `bid_vol`/`ask_vol` as its own commit.
+4. **Decide G6 before any return figure is quoted.** Fees and slippage at
+   zero make every number in `VALIDATION.md` gross.
+5. **Pin `data_window.since`/`until`** for the first genuinely
+   out-of-sample measurement. Both arms here are IN-SAMPLE by shipped
+   default and the bot says so on every run.
+6. **If a report needs a bar count, date it.** 8,792 measured 2026-10-02,
+   growing ~1/day. This repo has shipped an undated count as an error
+   twice.
+7. **G4 remains the binding constraint on episode length** — deep funding
+   does not lengthen the price frame. Consider it alongside G1's
+   recorder, since both want the store populated on a schedule.
+
+---
+
+## 7. Reproducing this gate
+
+```
+nix develop --command bash -c "python tools/audit_checks.py verify --prereg 069a826 --since 8cada4e"
+nix develop --command bash -c "python -m pytest -q"          # 457 passed
+just funding-backfill ETH/USD /tmp/rev/signals/eth_usd_funding.jsonl
+```
+
+The seeding command is the **production path** — the same
+`nix run ~/Projects/kraken-funding-rates#kraken-funding-rates --` the
+hourly timer's `ExecStart` and the justfile recipe use. My brief
+specified a dev-shell `PATH` lookup, which cannot work (`flake.nix` pins
+only `kraken-python` and `kraken-market-data`); that is a correction of
+the brief, not a deviation, and it produces the artifact the timer
+writes. Assert the sibling is clean at `dc49847` before seeding — the
+choice of a non-flake-input sibling rests on the tree you seed from being
+the committed one.
+
+All scratch (models, stores, exports, frames) under `/tmp/rev/`. Never
+committed. No real API key used — the funding endpoint is keyless.

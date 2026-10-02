@@ -1,574 +1,533 @@
-# VALIDATION — independent review of the CAND-3a + CAND-5 pass
+# VALIDATION — Phase 6 gate: G2 funding-history backfill
 
-Reviewer: `reviewer` (team `audit-pipeline-1002`), Phase 6. Read-only on source.
-Reviewed HEAD: **`aeace32`** (tree clean at review start).
+**Verdict: PASS** (with two NEW findings for the lead to record, and one
+self-inflicted receipt caveat at §7.3 that must not be pasted onward).
 
-# GATE VERDICT: `NEEDS_FIX`
+Reviewer: `reviewer` (qa). Pass date **2026-10-02/03** (all live
+measurements below are stamped). `HEAD = a7a9cbe`. Nothing pushed.
+Sibling `kraken-funding-rates` @ `dc49847`, tree clean (asserted before
+seeding: `git status --porcelain` empty, `HEAD == dc49847afa11320b43804a82c0ee6a437603161a`).
 
-The **functional** gate passes: 429 tests, flake green, the store arm runs
-end to end, the honest OOS number reproduces exactly, and live-arm
-width-neutrality is byte-identical so no `models/` artifact is invalidated.
-
-The **claim** gate fails. Three shipped claims are false, and one of them —
-the "+1800% seed" — is a degenerate artifact that invalidates the quantity the
-CAND-5 gate is built to measure. Details, with the evidence:
-
-| # | finding | severity |
-|---|---|---|
-| F1 | **The +1800% store seed is a friction artifact, not seed variance.** Same model, same bars, same trades: **+2015% → −88%** at Kraken taker costs. Across all 3 seeds the store-arm IQR collapses **1961pp → 11.7pp (168×)**. The gate's yardstick measures a cost assumption. | **MAJOR** |
-| F2 | `test_compute_seam_is_the_only_guard_for_the_rolling_technical_group` is **vacuous and its stated mechanism is false**. Deleting the compute seam leaves **all 31** non-finite tests green. 5 docstrings state a pandas behaviour that is the *opposite* of what pandas does. | **MAJOR** |
-| F3 | **`market_data_store: null` cannot turn the store off** for a store-trained model, yet three remedy messages advertise exactly that as the fix. | material |
-| F4 | "zero-volume bar at each **partial-month boundary**" (§9A.3) is **factually wrong**. 0 of 106 month-first bars are zero-volume; all 4 are mid-month and sit **inside exchange-downtime gaps**. | material |
-| F5 | `DECISION.md` is **internally inconsistent** on the bar count (§3/§5/§8/§11 say 76,561; §9A.3 says 76,562) and `RESEARCH.md` / `RESEARCH-3.md` carry 76,561 with no `NOT SEPARATED` labelling. | material |
-| F6 | **157 missing hourly bars in 28 gaps**, including a **38-bar hole at the seed/live-append seam in the most recent month**. Features are computed on *bar counts*, so a 39-hour jump is z-scored as a 1-bar step. Not previously reported. | material |
-| F7 | 4 guard sites + 1 `evaluate_scope` clause are redundant-and-unpinned (removing any one leaves the suite green). | minor |
-
-`NOT SEPARATED` is a **valid, non-failing** outcome and is reported as-is.
+Pre-registration commit `069a826`. Measurement track
+`tools/model_matrix.py` is byte-identical to it, so every threshold in
+this document is the pre-registered one and none was moved.
 
 ---
 
-## 1. Test matrix
+## 1. Gate receipts (verbatim)
 
-| check | command | expected | observed | verdict |
-|---|---|---|---|---|
-| unit suite | `nix develop --command bash -c "python -m pytest -q"` | 429 passed | **429 passed**, 24 warnings, 34.46 s | **PASS** |
-| flake | `nix flake check --no-build` | green | **all checks passed** | **PASS** |
-| non-vacuity | 12 source reverts in `/tmp` clone (below) | tests fail without their fix | **5 of 12 revert cleanly; 4 expose redundancy; 3 expose a false claim** | **see §2** |
-
-### 1a. Non-vacuity battery
-
-Method: clone HEAD to `/tmp/krb-verify/vacuity/repo`, revert **only the source**
-(never the test), run the pinned test, restore. Control run first and last:
-**79 passed** on the three relevant files, **429 passed** on the full suite.
-
-| # | source reverted | site | test run | result | non-vacuous? |
-|---|---|---|---|---|---|
-| 1 | `fit` hard finite gate | `features.py:641-646` | `test_fit_refuses_to_persist_a_non_finite_stat_and_names_the_column` | **FAILS** | **YES** |
-| 2a | `transform` final float32 check | `features.py:745-750` | all 31 in `test_feature_nonfinite_guards.py` | 31 pass | **NO — vacuous** |
-| 2b | `transform` in-sample-fallback check | `features.py:737-742` | `test_transform_in_sample_fallback_...` | 1 pass | redundant |
-| 2c | `normalize`'s own check | `features.py:452-457` | `test_transform_fails_loudly_on_a_poisoned_stats_artifact` | 2 pass | redundant on this path |
-| 2d | **all three** transform-path guards | 3 sites | all 31 | **21 FAIL** | **YES (collectively)** |
-| 2e | final float32 check alone | `features.py:745-750` | **full suite, 429** | **429 pass** | **NO — vacuous** |
-| 3 | passthrough-zero subset | `features.py:70` | `test_exogenous_passthrough_preserves_zero_and_the_minus_one_sentinel` | **FAILS** | **YES** |
-| 4 | `evaluate_scope` `is_pinned` clause | `data_window.py:575-587` | `test_default_window_is_labelled_in_sample` | **FAILS** | **YES** |
-| 4b | `evaluate_scope` `has_split` clause | `data_window.py:589-601` | 2 tests | 2 pass | redundant (overlap clause catches it) |
-| 4c | `evaluate_scope` empty-halves clause | `data_window.py:603` | `test_pinned_window_with_disjoint_halves_...` | **FAILS** | **YES** |
-| 5 | `_guard_pinned_coverage` → no-op | `data_window.py:467-514` | `test_pinned_without_a_store_names_the_fix_and_its_cost`, `test_pinned_window_covering_nothing_...` | **2 FAIL** | **YES** |
-| 6 | **the compute seam itself** | `features.py:800-803` | all 31, incl. `test_compute_seam_is_the_only_guard_...` | **31 pass** | **NO — see F2** |
-
-The five the brief named are all non-vacuous: **#1 fit gate, #2d transform
-gate (collectively), #3 passthrough-zero, #4c IN-SAMPLE derivation, #5
-`_guard_pinned_coverage`.**
-
-Note on #5: `test_pinned_multi_year_window_on_a_short_frame_raises_not_enough_data`
-correctly still **passed** with the guard no-op'd — that is the "ordinary short
-frame must *not* fire" half, which is the behaviour `data_window.py:481-487`
-documents. Correct, not a gap.
-
----
-
-## 2. The five pre-gate items
-
-### (a) Inf-fix coverage — **coverage is real; two claims are false**
-
-**Is there a hard finite check after normalization on both `fit` and `transform`?**
-**Yes**, and it is proven load-bearing:
-
-| stage | site | what it checks | non-vacuous? |
-|---|---|---|---|
-| `fit` | `features.py:641-646` | the **ffilled observation frame**, before any stat is built | **YES** (#1) |
-| `normalize` | `features.py:452-457` | the normalized output; the only site that catches a poisoned on-disk `normalization.npz` | only via #2d |
-| `transform` fallback | `features.py:737-742` | in-sample branch input | redundant |
-| `transform` return | `features.py:745-750` | the float32 array actually returned | **NO** (#2a/2e) |
-
-`_require_finite` (`features.py:297-340`) does one vectorised `np.isfinite`
-pass, names the offending column, reports stage/count/kind, and
-`NonFiniteFeatureError` subclasses `ValueError` (`features.py:206`) so existing
-handlers keep working. The `fit` check is transactional — `self._stats[...]` is
-assigned only after the check (`features.py:657`). **This satisfies §12.5.**
-
-**Is every ratio/log/pct_change site guarded or provably safe?** I audited every
-builder. All 8 division sites and both `log` sites carry an explicit guard, and
-the remaining rolling/indicator helpers are division-free or zero-guarded:
-
-| site | file:line | guard |
-|---|---|---|
-| `return_1` numerator+denominator | `features.py:875-876` | `_NON_FINITE_INPUTS` |
-| `log_return_1` **numerator** | `features.py:882` | `_NON_FINITE_INPUTS` (log(0) = −inf) |
-| `range_1` both sides | `features.py:888-890` | both sides |
-| `return_{w}` / `log_return_{w}` loop | `features.py:893-894` | numerator **and** denominator |
-| `price_ratio_sma_{w}` numerator+denominator | `features.py:901-903` | both |
-| `volume_change_1` | `features.py:930` | `_NON_FINITE_INPUTS` (0 **is** a hazard in a denominator) |
-| `volume_zscore_20` | `features.py:938-940` | `.replace(0, 1.0)`; no inf guard needed (see F2) |
-| `obv` | `features.py:946` | `np.sign(inf)=±1` finite; `inf*0.0=NaN` → `fillna(0.0)`; cumsum of finite stays finite |
-| `spread` passthrough | `features.py:962-963` | `_NON_FINITE_INPUTS` |
-| `spread` computed | `features.py:969-971` | both sides |
-| `order_book_imbalance` | `features.py:976-980` | both sides, incl. cancellation |
-| signals passthrough | `features.py:1017-1023` | `_NON_FINITE_INPUTS_NO_ZERO` |
-| `_rsi` | `features.py:1063` | `avg_loss.replace(0, np.nan)` |
-| `_bollinger` width / %B | `features.py:1107-1110` | `mid.replace(0,nan)`, `.where(\|denom\|>1e-12, 0.5)` |
-
-**No unguarded site found.** The zero-is-a-denominator / zero-is-data split is
-correct and is pinned by test #3.
-
-#### (a)(i) — the compute-seam docstring: **NOT ACCURATE. Claim falsified.**
-
-The module claims (`features.py:789-791`) that the seam "covers the rolling
-builders too (`sma`/`ema`/`rsi`/`macd`/`bollinger`/`atr`), which no per-expression
-guard reaches", and the test named for it says
-(`tests/test_feature_nonfinite_guards.py:703-708`):
-
-> "An infinite close therefore reaches `close.rolling(4).mean()` as `inf` and
-> comes straight back out as `inf`"
-
-**Measured on pandas 3.0.4** (one `±inf` at index 100 of 200, window 20):
-
-| aggregation | inf out | NaN out | value at idx 100 vs clean |
-|---|---|---|---|
-| `rolling(20).mean()` | **0** | 39 | `nan` |
-| `rolling(20).std(ddof=0)` | **0** | 39 | `nan` |
-| `rolling(4).mean()` | **0** | 7 | `nan` |
-| `ewm(span=20, adjust=False).mean()` | **0** | **0** | **finite and WRONG** (144.975 vs 145.478 clean) |
-| `ewm(alpha=1/14, adjust=False).mean()` | **0** | **0** | finite and wrong |
-
-Two corrections:
-
-1. **`rolling()` MASKS inf → NaN.** It does not propagate. NaN is repairable by
-   `ffill().fillna(0)`, so the seam is **not** what stops an infinity escaping
-   the rolling builders — pandas does that on its own.
-2. **`ewm()` neither masks nor propagates — it SKIPS the bar**, returning a
-   finite, subtly-wrong number. The docstrings at `features.py:1054-1056`
-   (`_rsi`), `1098-1101` (`_bollinger`), `1121-1123` (`_atr`) all say
-   "pandas' `ewm` masks a non-finite input as NaN (**measured**)". They are
-   wrong, and the claim they support is the wrong claim.
-
-**Consequence, proven by revert #6:** removing the seam
-(`features.py:800-803`) leaves **all 31** tests passing — including the test whose
-docstring asserts it "cannot" pass with the seam removed. **The seam is
-entirely redundant**; every builder carries its own guard.
-
-This is *not* a functional break: the guards that work are proven non-vacuous
-(#1, #2d), and the end-to-end store-arm fix is real (§4). But a false mechanism
-is asserted in five places and pinned by a test that cannot fail — which is the
-2026-10-01 "absence-vs-observed" lesson recurring on the *explanatory* axis. The
-residual real hazard `ewm` does introduce — a **silently wrong but finite**
-feature that passes the guard — is unmentioned anywhere.
-
-#### (a)(ii) `log_return_1` / `return_1` dead code: **CONFIRMED (conditionally)**
-
-`out["return_1"]` (`features.py:883`) and `out["log_return_1"]`
-(`features.py:884`) are overwritten by the `for w in self.windows` loop at
-`features.py:893-894`, because `1 ∈ windows` — the module default is
-`(1, 4, 24)` (`features.py:558`) and the shipped config is `feature_windows:
-[1, 4, 24]` (`configs/default.yaml:43`). AST dump of `_add_price_features` in
-source order confirms the FOR follows both assignments, and the formulas are
-identical (`pct_change()` ≡ `pct_change(1)`, `shift(1)` ≡ `shift(1)`) — both
-verified equal.
-
-**Refinement to the report as filed:** it is dead *under the shipped
-configuration*, not unconditionally. If a user configured `feature_windows`
-without `1`, the loop would not emit those names and lines 883-884 would become
-load-bearing. So this is a latent redundancy that must stay, not code to delete.
-
-### (b) Width-neutrality for the LIVE arm — **PASS, byte-identical**
-
-Controlled experiment: the live frame was captured **once** through the
-production read seam (`read_ohlc_dataframe(..., market_data_store=None)`, 721
-bars, 2026-09-02 16:00 → 2026-10-02 16:00) and cached, then the *same* frame was
-pushed through the `FeaturePipeline` at both `aeace32` and `bfe32aa`. Holding the
-frame constant removes the live API as a confounder.
-
-| | `aeace32` (post-fix) | `bfe32aa` (pre-fix) | |
-|---|---|---|---|
-| raw bars | 721 | 721 | = |
-| **n_features** | **60** | **60** | = |
-| **start_index** | **24** | **24** | = |
-| usable bars | 697 | 697 | = |
-| column names | 60 identical | 60 identical | identical |
-| **obs sha256** | `93edc733…068fa8` | `93edc733…068fa8` | = |
-| **arr sha256** (float32 transform) | `6a88a379…84eab` | `6a88a379…84eab` | = |
-| `cmp` byte-diff | — | — | **BYTE-IDENTICAL** |
-| non-finite obs cells | 0 | 0 | = |
-
-The live frame carries **0 zero-volume bars and 0 zero-price bars** (only 19
-warm-up NaNs in `trade_count_zscore_20`), confirming §9A.3's "the live arm was
-unaffected — 721 Kraken bars contain no zero-volume bar".
-
-**Conclusion: no `models/` artifact is invalidated.** Confirmed.
-
-### (c) The 76,562 vs 76,561 discrepancy — **RESOLVED: benign accumulation**
-
-There are **four** numbers in circulation, and they are all the same store at
-different wall-clock times. Each figure is *pre-warm-up* unless stated.
-
-| figure | what it is | source | when |
-|---|---|---|---|
-| **76,561** | store bars, pre-warm-up | `RESEARCH.md:107`, `RESEARCH-3.md:117` | Phase 2/3 |
-| **76,562** | store bars, pre-warm-up | `matrix/cells.jsonl` train `n_bars`, DECISION §9A.3 | 15:08 today |
-| **76,538** | 76,562 − **24** warm-up → bars **replayed** | `matrix/cells.jsonl` backtest `n_bars` | 15:08 today |
-| **76,563** | store bars, pre-warm-up | my `train` JSON | 17:41 today |
-| **76,539** | 76,563 − 24 → bars replayed | my `backtest` `n_steps` | 17:41 today |
-
-**Leading hypothesis CONFIRMED, with the mechanism.** The store arm's live
-upsert leg re-fetches the trailing Kraken window on *every* read
-(`data.py:1349-1352`: `candles = _page_candles(...); store.upsert(...)`). The
-newest hourly bar advances with wall-clock time, so each run appends ~1 bar:
-
-- Partition mtimes prove the footprint: `2026-09.parquet` and `2026-10.parquet`
-  were rewritten at **15:49, 17:21 and 17:48** (my runs), while the 103 older
-  partitions still carry **15:49** from the seed.
-- Every store-arm log line reads `Upserted 721 60-minute ETH/USD bars into
-  market-data store`.
-- `2026-10.parquet` = 41 rows ending 2026-10-02 16:00 — i.e. the live leg's
-  newest bar, growing hourly.
-
-**Verdict: benign accumulation, NOT a defect.** Explicitly ruled out:
-- **no double-counting** — 76,563 rows, 76,563 unique timestamps, 0 duplicates;
-- **no window-edge move** — the pinned window `2020-01-01…2026-01-01` reads
-  `kept 52577 of 76563` on every run; the trailing bars are outside the pin, so
-  growth does not shift the pinned edge.
-
-**But the docs must stop quoting a live count as a fixed figure.** "76,561" and
-"76,562" are both snapshots. Also note the §9A.3 wording says "76,562 bars" —
-that was true at 15:08 and is 76,563 now. Recommend: quote the figure with its
-timestamp, or quote `n_bars` from a named run.
-
-### (d) The +1800% seed — **MAJOR FINDING: it IS a degenerate artifact**
-
-First, located it. From `matrix/cells.jsonl`, store arm, seed 44:
-
-| seed | arm | n_bars | num_trades | trades/bar | return | Sharpe | maxDD | **excess** |
-|---|---|---|---|---|---|---|---|---|
-| 42 | store | 76,538 | 46,413 | 0.606 | +225.13% | 1.626 | 58.46% | **−19.48%** |
-| 43 | store | 76,538 | 53,579 | 0.700 | +53.17% | 0.954 | 66.97% | **−191.84%** |
-| **44** | **store** | 76,538 | **67,183** | **0.878** | **+1800.10%** | 2.654 | 79.92% | +1555.06% |
-| 42 | live | 697 | 575 | 0.825 | +4.07% | 0.574 | 5.03% | −3.23% |
-| 43 | live | 697 | 587 | 0.842 | −0.44% | −0.043 | 4.79% | −7.72% |
-| 44 | live | 697 | 565 | 0.811 | +8.87% | 1.262 | 3.32% | +1.44% |
-
-I re-ran seed 44 and **reproduced it**: frictionless gives **+2015.13%**
-(vs +1800.10%; the delta is the 25 bars the store gained since 15:08 — 76,539 vs
-76,538 replayed). So the number is stable, not a one-off glitch.
-
-**Then I tested the four hypotheses.**
-
-| hypothesis | verdict | evidence |
-|---|---|---|
-| (i) zero-volume boundary bars | **NO** | all 4 zero-volume bars are 2019-06-07 21:00, 2020-12-21 14:00, 2021-02-11 03:00, 2023-03-24 12:00 — **none at a month boundary**; 0 of 106 month-first bars have zero volume. They also contribute **0** to seed 44's behaviour: only 2 of 4 fall inside the 2020-01-01…2026-01-01 pin. |
-| (ii) NaN-vwap bar | **NO** | the 4 NaN-vwap bars are the *same 4* zero-volume rows; and `vwap` is not an allow-listed observation column, so it never reaches the feature matrix. |
-| (iii) window-edge artifact | **NO** | the matrix cells are **unpinned** (`since`/`until` null) — there is no window edge at all. |
-| (iv) **frictionless 0 fee / 0 slippage compounding over 76k bars** | **YES — CONFIRMED, DECISIVE** | see below |
-
-**The decisive experiment.** Same trained models, same 76,539 bars, same trade
-counts — only the cost assumption changes. `fee_rate`/`slippage` are `0.0` in
-every config used (`configs/default.yaml` inherited).
-
-| seed | trades | frictionless | **Kraken taker** (0.26% fee + 0.05% slip) | swing |
-|---|---|---|---|---|
-| 42 | 46,761 | +219.73% | **−99.79%** | 319.5 pp |
-| 43 | 53,624 | +53.68% | **−99.86%** | 153.5 pp |
-| 44 | 67,148 | **+2015.13%** | **−88.18%** | **2103.3 pp** |
-| — | — | median **+219.73%**, IQR **1961.45pp** | median **−99.79%**, IQR **11.68pp** | **IQR falls 168×** |
-| *live 42* | *471* | *+4.41%* | *−1.06%* | *5.5 pp* |
-
-**This is a degenerate artifact.** Three independent signatures:
-
-1. **Cost-sensitivity inversion.** 31 bp round-trip moves the store arm by up to
-   2,103 pp while moving the live arm (100× fewer trades) by 5.5 pp. The return
-   is the *churn*, not an edge — seed 44 pays 67,148 round trips ≈ 416 pp of
-   drag and still returns −88%.
-2. **Monotone in trade count.** Return tracks `trades/bar` almost perfectly:
-   0.606 → +225%, 0.700 → +53%, 0.878 → +2015%, while Sharpe rises with it
-   (1.626 / 0.954 / 2.654) and maxDD deepens (58% / 67% / 80%). Both "wins" of
-   the store arm are mechanical consequences of trading more.
-3. **The spread is manufactured.** The store arm's IQR of 8.73 — the entire
-   yardstick of the CAND-5 gate — **collapses to 0.117 (11.7pp) at realistic
-   costs.** The gate is measuring friction, not seed variance.
-
-**So yes — plainly: the dispersion gate is measuring noise-that-isn't-seed-variance.**
-Two consequences for §9A.2:
-
-- The headline `NOT SEPARATED` verdict on `excess_return` (ratio 0.037) is
-  **still correct**, but §9A.2's stated reason — "the between-arm gap sits
-  entirely inside seed noise" — is **not the real reason**. The real reason is
-  that the gated metric has no cost basis at all. The verdict survives; the
-  explanation must change.
-- The two **RESOLVED** rows (`sharpe` 1.400, `max_drawdown` 10.74) are **also
-  artifacts of the same churn**, not merely "confounded by horizon" as §9A.2
-  says. Under costs, seed 44's Sharpe goes 2.717 → −0.550. §9A.2's horizon
-  confound is real but is the *smaller* of the two.
-
-Minimum honest remedy: **re-run the gate with non-zero `fee_rate`/`slippage`** on
-both arms, then quote the ratios. Do not quote the frictionless dispersion
-numbers as a seed-variance measurement. `configs/default.yaml` ships
-`fee_rate: 0.0`/`slippage: 0.0`, and `configs/matrix.example.yaml:124` already
-asks "does more training help, or does it just cost more?" — the answer here is
-*it costs more*.
-
-### (e) Wording — **PASS, with two required corrections**
-
-Required wording is present verbatim at **DECISION.md:537-539**:
-
-> "The store arm reached **76,562 bars** with **disjoint** train/eval splits …
-> Honest out-of-sample result: **−34.3% return, Sharpe −0.568**. The CAND-5 gate
-> reports **NOT SEPARATED** on both return metrics. **No claim of improvement.**"
-
-Every hit for the forbidden claims:
-
-| file:line | text | status |
-|---|---|---|
-| `DECISION.md:539` | "**No claim of improvement.**" | **REQUIRED — present** |
-| `DECISION.md:533` | "It did **not** deliver better returns" | negation, correct |
-| `DECISION.md:318` | "It cannot **prove** 76,561 bars is *better* than 721" | negation, correct |
-| `DECISION.md:325-328` | "No report may describe this as '106× more training'" | **explicit prohibition — correct** |
-| `DECISION.md:128` | "76,561 bars buys *diverse* experience … **not** 106× more gradient steps" | negation, correct |
-| `DECISION.md:75` | "the **only** candidate that changes it by **106×**" | about **bars**, not training — acceptable but unlabelled |
-| `RESEARCH-3.md:117` | "**76,561 bars — 106× the 721-bar ceiling** — from one config value, 0.48 s, zero code changes." | ⚠ **pre-amendment artifact**: stale count, no `NOT SEPARATED` |
-| `RESEARCH.md:107` | "**shape (76561, 11) in 0.48 s** = **106× the 721 ceiling**" | ⚠ same |
-| `configs/matrix.example.yaml:124` | "does more training help, or does it just cost more?" | correct framing |
-
-**No instance of "106× more training" exists**; all three near-misses are about
-**bars** and two are explicit prohibitions. ✓
-
-Two corrections required:
-1. **F5 — `DECISION.md` is internally inconsistent.** §3 (`:47`, `:85`, `:86`),
-   §5.1 (`:127`), §8 (`:318`, `:325`) and §11 (`:605`) all say **76,561**, while
-   §9A.3 (`:537`) says **76,562**. A reader who lands on §11 — the builder's own
-   verification checklist — sees the stale figure and none of the §9A
-   qualifications. §11 should be struck or annotated as superseded by §9A.
-2. **`RESEARCH.md` / `RESEARCH-3.md` are not self-labelling.** They quote
-   76,561 with **no** `IN-SAMPLE` caveat, **no** `NOT SEPARATED` verdict and
-   **no** −34.3% OOS number. A future agent reading RESEARCH.md alone gets the
-   pre-amendment picture. Add a one-line header pointing at DECISION §9A.
-
----
-
-## 3. The gate — two separate matrices (user-mandated)
-
-### 3a. The §9A.1 harness defect STILL REPRODUCES
-
-`python tools/model_matrix.py report /tmp/krb-verify/matrix-cand5.yaml` against
-the real 6-cell results file:
+### 1.1 `audit-verify`, both references, one invocation
 
 ```
-cells: 6 recorded, 3 valid (0 out-of-sample, 3 IN-SAMPLE), 3 INVALID
-
-INVALID CELLS (3) — excluded from every aggregate
-  0396722e7a1a  market_data_store=None, pages=1, seed=42  [n_bars=697 trades=575]
-      - n_bars:697<0.50x76538
-  d76622e63d7c  ... seed=43  [n_bars=697 trades=587]   - n_bars:697<0.50x76538
-  dfdd93543409  ... seed=44  [n_bars=565]              - n_bars:697<0.50x76538
-
-PER-TICKER SUMMARY            <- (empty)
-PER-CONFIG SUMMARY            <- (empty)
-PER-AXIS MARGINALS            <- (no valid cells)
-
-WHAT THIS SAMPLE SUPPORTS
-  - 3 of 3 valid cells are IN-SAMPLE ... and are excluded from every aggregate
-  - 6 recorded cells yielded 0 usable out-of-sample measurements.
+$ nix develop --command bash -c "python tools/audit_checks.py verify --prereg 069a826 --since 8cada4e"
+audit-verify  HEAD=a7a9cbe  prereg=069a826  since=8cada4e
+  measurement-track  MATCH  tools/model_matrix.py byte-identical to prereg 069a826
+  ast-proof          SELF-TEST OK  (8 mutants detected correctly)
+  executable-ast     MATCH  6/6 files unchanged since 8cada4e (docs+strings blanked)
+  suite              PASS  457 passed
+  width              SKIP  (no --frame)
+  RESULT             PASS
 ```
+Exit 0. **No `SELF-TEST BROKEN`** — the AST proof is trustworthy, so
+everything else it reports may be relied on. `MATCH 6/6` means nothing
+executable in the six guarded files moved since `8cada4e`.
 
-**No dispersion section is emitted at all. The gate never fires.** Mechanism
-confirmed at `tools/model_matrix.py:1059-1063`: `denominator = expected_bars
-or reference_bars`, and `reference_bars` is the ticker's largest observed
-`n_bars` (76,538), so the 0.5 guard demands ≥ 38,269 and the live arm's 697
-fails by **55×**. Exactly as §9A.1 describes. **Not fixed — deferred to Phase 7
-per user decision.** ✓
+### 1.2 Same command with a frame (adds the width fingerprint)
 
-### 3b. The two-matrix method WORKS
+```
+$ nix develop --command bash -c "python tools/audit_checks.py verify --prereg 069a826 --since 8cada4e --frame /tmp/rev/ohlcv_base.parquet"
+audit-verify  HEAD=a7a9cbe  prereg=069a826  since=8cada4e
+  measurement-track  MATCH  tools/model_matrix.py byte-identical to prereg 069a826
+  ast-proof          SELF-TEST OK  (8 mutants detected correctly)
+  executable-ast     MATCH  6/6 files unchanged since 8cada4e (docs+strings blanked)
+  suite              PASS  457 passed
+  width              MATCH  ohlcv_base.parquet features=49 start_index=24 usable=697 nonfinite=0
+                     (no --expect-obs/--expect-arr given: fingerprint only, not an assertion)
+  RESULT             PASS
+```
+Exit 0. **Read `features=49` as an artifact of MY frame, not as a
+shipped width — see §7.3 and F-15.** The frame I passed is a cached raw
+OHLCV parquet; `width_check.py` never calls `add_derived_ohlcv_features`,
+so the presence-gated trio is missing. 49 is not a state this repo ships.
 
-Each arm scored against its **own** `min_bar_ratio` reference, then the shipped
-`pooled_within_spread` (`tools/model_matrix.py:416`) and `dispersion_verdict`
-(`:444`) applied across the two replicate sets. No threshold invented —
-`DISPERSION_RATIO_THRESHOLD = 1.0` (`:376`) and
-`MIN_REPLICATES_FOR_A_CLAIM = 3` (`:258`) both read from the module.
+### 1.3 Bot suite, exact command from the brief
 
-**Step 1 — per-arm guard, own reference:**
+```
+$ nix develop --command bash -c "python -m pytest -q"
+457 passed, 24 warnings in 30.12s
+```
+Exit 0. Matches the expected 457. (`audit_checks` invokes
+`pytest tests/ -q` rather than `python -m pytest -q`; both were run and
+both report 457.)
 
-| arm | cells | observed `n_bars` | reference | 0.5× | survivors | OOS |
-|---|---|---|---|---|---|---|
-| LIVE | 3 | 697, 697, 697 | 697 | 348 | **3/3 VALID** | 0 (unpinned ⇒ IN-SAMPLE, correct) |
-| STORE | 3 | 76,538 ×3 | 76,538 | 38,269 | **3/3 VALID** | 0 (unpinned ⇒ IN-SAMPLE, correct) |
+### 1.4 `tools/width_check.py` — the width ladder, repo's own committed tool
 
-**Step 2 — ratios (ratio ≥ 1.0 ⇒ RESOLVED):**
+```
+$ python tools/width_check.py --frame /tmp/rev/frame_derived_only.parquet
+width-check  frame=frame_derived_only.parquet  bars=721  features=52  start_index=24  usable=697
+  nonfinite_obs_cells=0  arr_finite=True  insample_finite=True
 
-| metric | live median | store median | gap | live IQR | store IQR | pooled | **ratio** | **verdict** |
-|---|---|---|---|---|---|---|---|---|
-| `excess_return` (headline) | −3.23% | −19.48% | 16.24% | 0.0458 | **8.7345** | 4.3901 | **0.037** | **NOT SEPARATED** |
-| `total_return` | +4.07% | +225.13% | 221.06% | 0.0465 | 8.7346 | 4.3906 | **0.503** | **NOT SEPARATED** |
-| `sharpe` | +0.574 | +1.626 | 1.052 | 0.6524 | 0.8500 | 0.7512 | **1.400** | RESOLVED |
-| `max_drawdown` | +4.79% | +66.97% | 0.6218 | 0.0085 | 0.1073 | 0.0579 | **10.736** | RESOLVED |
+$ python tools/width_check.py --frame /tmp/rev/frame_backfilled.parquet
+width-check  frame=frame_backfilled.parquet  bars=721  features=60  start_index=24  usable=697
+  nonfinite_obs_cells=0  arr_finite=True  insample_finite=True
 
-**Reproduces DECISION §9A.2 exactly** (0.037 / 0.503 / 1.400 / 10.74). The
-method works and is the correct interim instrument.
-
-**`NOT SEPARATED` is a valid, non-failing outcome** — reported as-is, and the
-gate did its job: it refused to rank two arms whose gap sat inside their own
-spread.
-
-⚠ **But per finding (d) above, both RESOLVED rows and the headline yardstick are
-friction artifacts.** The store IQR of 8.73 is 873 pp of *unpriced churn*, not
-seed variance. This gate must be re-run with costs before any number in it is
-quoted as evidence.
+$ python tools/width_check.py --frame /tmp/rev/frame_baseline.parquet
+width-check  frame=frame_baseline.parquet  bars=721  features=60  start_index=24  usable=697
+  nonfinite_obs_cells=0  arr_finite=True  insample_finite=True
+```
 
 ---
 
-## 4. Integration test — **PASS** (magnitude clause satisfied)
+## 2. Integration-test matrix — backfilled vs baseline
 
-Both arms trained + backtested end to end, plus the pinned store arm with a
-disjoint split. `n_features == 60` and `start_index == 24` are hard asserts.
+The gate is that the bot now *sees* a live funding series instead of 2
+distinct values on 13/721 bars. Proven by running it, not by reading the
+diff. Both arms used `market_data_store: null` (live-fetch leg) and a
+scratch config differing in exactly one key (`funding_features_file`).
 
-| arm | model | `n_bars` (train) | **bars replayed** | `n_features` | **`start_index`** | **`num_trades`** | trades/bar | return | Sharpe | maxDD | buy&hold | excess | **scope label** |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **LIVE**, unpinned | `vLive` | 721 | **697 / 697** ✅ | **60** ✅ | **24** ✅ | **471** ✅ | 0.676 | +4.41% | 0.567 | 5.05% | +7.86% | −3.44% | `IN-SAMPLE` |
-| **STORE**, unpinned | `vStore` | 76,563 | **76,539 / 76,563** ✅ | **60** ✅ | **24** ✅ | **46,763** ✅ | 0.611 | +219.08% | 1.604 | 59.57% | +242.66% | **−23.59%** | `IN-SAMPLE` |
-| **STORE**, pinned 2020→2026 | `vPinned` | 36,804 | **15,749 / 15,773** ✅ | **60** ✅ | **24** ✅ | **11,866** ✅ | 0.752 | **−34.30%** | **−0.568** | 54.22% | −19.46% | −14.84% | `OUT-OF-SAMPLE` |
-
-**`start_index == 24` confirmed three independent ways:** every run reports
-`bars_replayed == n_bars − 24` (697 = 721−24; 76,539 = 76,563−24; 15,749 =
-15,773−24), and the feature pipeline reports `start_index = 24` directly
-(`first_tradable_index`, `features.py:173-203`).
-
-**Magnitude clause — satisfied.** No run silently replayed ~1 bar: 100.0%, 99.97%
-and 99.85% of each frame. Trade counts are 471 / 46,763 / 11,866, all far from
-the degenerate-cell floor. (`equity_curve` lengths 698 / 76,540 / 15,750
-corroborate the step counts.)
-
-**Disjoint train/eval confirmed in real output.** Log line:
-`data_window [2020-01-01T00:00:00+00:00, 2026-01-01T00:00:00+00:00) eval_split=0.7
-kept 52577 of 76563 bars` then
-`-> 15773 replayable bars (36804 training bars held out) — OUT-OF-SAMPLE`.
-15,749 + 36,804 + 24 = 52,577 ✓.
-
-**The scope label DOES appear in real output** — three surfaces, all verified:
-- machine: `"evaluation_scope_label": "OUT-OF-SAMPLE"`, `evaluation_is_out_of_sample: true`
-- `--json`: same keys, plus `n_train_bars` / `n_eval_bars` / `n_overlapping_bars`
-- human table + log stream: `Evaluation: OUT-OF-SAMPLE` and
-  `[OUT-OF-SAMPLE]: 15749/15773 bars replayed, return=-8.50% …`
-
-**§9A.3's honest-OOS table reproduces to the digit.** Mine vs §9A.3:
-`total_return` −34.295% vs −34.30% · `sharpe` −0.5682 vs −0.568 ·
-`max_drawdown` 54.22% vs 54.22% · `num_trades` 11,866 vs 11,866 ·
-replayed 15,749/15,773 vs 15,749/15,773 · buy&hold −19.46% vs −19.46% ·
-excess −14.84% vs −14.84%. **The builder's measurement was accurate.**
-
-**Pinned-without-store fails loudly and names the seed recipe** ✅. Exit 1, and
-the message contains: the requested range, the available span and bar count, the
-cause, Kraken's ~721-bar ceiling, and the remedy —
-`just store-plan` (zero-network dry run) then `just store-seed`, **~158s and
-~13MB** of Binance-archive monthly klines, plus the `store_mode == "market-data"`
-guard and the fallback-csv trap. Verbatim excerpt:
-
-> "Fix: seed the store and point market_data_store at it -- seed it with `just
-> store-plan` (a zero-network dry run) then `just store-seed` -- ~158s and ~13MB
-> of Binance-archive monthly klines for ETH/USD, BTC/USD, SOL/USD or XRP/USD at
-> 60-minute bars. `just store-seed` refuses to finish unless the report says
-> store_mode == "market-data"; a fallback-csv seed writes .csv that the store
-> reader (which globs *.parquet) cannot see, so the run would silently read ~721
-> live bars instead of years."
-
-### F3 (new) — `market_data_store: null` does not turn the store off
-
-My first attempt at the pinned-without-store test **succeeded when it should have
-failed** (exit 0). Cause: I ran it against `vStore`, whose *own* baked
-`config.yaml` carries `market_data_store: /tmp/krb-verify/store`, and passed a
-run config with `market_data_store: null`. The log shows it reading the store
-anyway: `Reading 60-minute ETH/USD bars from the market-data store at
-/tmp/krb-verify/store`. Confirmed directly against the shipped resolver
-(`backtest.py:282-307`, `_resolve_env_setting`):
-
-| run config | model config | resolved |
+| | **backfilled arm** | **baseline control** |
 |---|---|---|
-| `null` | `/m/store` | **`/m/store`** ← null is SKIPPED |
-| `/run/store` | `/m/store` | `/run/store` |
-| `null` | `null` | `None` |
+| signal file | `/tmp/rev/signals/eth_usd_funding.jsonl` (8,792 rec) | repo `signals/eth_usd_funding.jsonl` (1 rec) |
+| `n_features` (exported) | **60** | **60** |
+| training bars | **721** | **721** |
+| obs features (trained) | **60** | **60** |
+| **bars replayed** | **697 / 721** | **697 / 721** |
+| **trades taken** | **546** | **558** |
+| total return | **7.52 %** | **7.10 %** |
+| Sharpe | 0.987 | 0.827 |
+| max drawdown | 5.58 % | 6.57 % |
+| buy & hold | 6.44 % | 6.44 % |
+| excess return | 1.08 % | 0.66 % |
+| final equity | 10,751.58 | 10,709.55 |
+| evaluation | IN-SAMPLE | IN-SAMPLE |
 
-This is deliberate in code ("YAML `key: null` is how a config says *unset*, not
-*set to nothing*", `backtest.py:298-300`). **But one shipped remedy message
-advertises the opposite** — `data.py:267`, inside
-`MarketDataStoreUnavailableError`, is the only place in the tree that says *"Set
-market_data_store: null in the config to go back to the live paginated fetch
-(~721 bars)."* (verified by grep across `kraken_trading_bot/` and `tools/`;
-`PinnedWindowUnavailableError` does **not** carry it, and it is echoed in spirit
-by DECISION §10.3 and `configs/deep-history.example.yaml:11-12`).
+**Equivalence gate: PASS.** |Δ return| = **0.42 pts**, same sign, against
+the ~5-pt band. Not gated on exact equality — PPO is stochastic across
+runs even at a fixed seed.
 
-For a store-trained model that instruction **does not work**: the reader edits
-their run config, the resolver skips the `null`, the model's own
-`config.yaml` wins, and they silently keep 76k bars while believing they went
-live. It needs either a working override (honour an explicit sentinel such as
-`""` or a `--no-store` flag) or wording that names *the model's own* config as
-the thing to edit. Severity is bounded — reaching it requires a store-trained
-model plus a store that has since become unresolvable — but the message is the
-one place a user is told how to recover, and it does not work.
+**Both arms are IN-SAMPLE** (`data_window.since`/`until` both null, the
+shipped default). The bot says so itself on every run: *"this return
+describes the fit, not a prediction … no out-of-sample claim is
+supported."* Nothing here is an OOS result and it must not be quoted as
+one.
 
-### F6 (new) — the store has 157 missing hourly bars
+### 2.1 The magnitude clause — "completes without error" is NOT the claim
 
-Not previously reported anywhere. `/tmp/krb-verify/store` holds **76,563 bars**
-over a span of **76,721 hours → 157 missing**, across **28 gaps**, max single gap
-**39 hours**.
+A silent collapse to ~1 bar / 0 trades would pass a width guard while
+destroying the run. Recorded explicitly:
 
-| | |
+- **bars replayed 697/721 on BOTH arms** — equal to `usable_bars=697`
+  that `width_check` independently computes as `721 − first_tradable_index(24)`.
+  The gate's tradable window and the backtest's replayed window are the
+  same 697 bars, cross-checked from two different code paths.
+- **trades 546 and 558** — not 0, and not 1-per-bar-degenerate.
+- columns asserted **present by name**, not by width (§3).
+
+---
+
+## 3. Consumed-proof via `export-data` (the cheap proof)
+
+```
+$ kraken-trading-bot export-data --ticker ETH_USD --config /tmp/rev/cfg/backfilled.yaml --pages 6 --output /tmp/rev/export_backfilled.csv
+Built export frame: 721 bars, 72 columns (60 features, 2 signal)
+Exported 721 bars x 72 columns -> /tmp/rev/export_backfilled.csv
+  window:   2026-09-02T23:00:00Z -> 2026-10-02T23:00:00Z
+
+$ kraken-trading-bot export-data --ticker ETH_USD --config /tmp/rev/cfg/baseline.yaml --pages 6 --output /tmp/rev/export_baseline.csv
+Built export frame: 721 bars, 72 columns (60 features, 2 signal)
+Exported 721 bars x 72 columns -> /tmp/rev/export_baseline.csv
+  window:   2026-09-02T23:00:00Z -> 2026-10-02T23:00:00Z
+```
+
+**`n_features = 60` on both arms**, identical column lists, and — the
+control that makes the rest of this table meaningful — **both arms
+fetched the same window**, with `open/high/low/close/vwap` byte-equal
+across the two exports. (`volume` and `count` differ by a few ticks:
+Kraken's in-progress candle ticks up between the two calls two seconds
+apart. Prices did not move, so the feature comparison holds.)
+
+### 3.1 Columns present BY NAME
+
+All three required names are present in the exported frame **and** in the
+trained `normalization.npz` `feature_names` (60 entries, identical lists
+across arms):
+
+| column | in exported frame | in `normalization.npz` `feature_names` |
+|---|---|---|
+| `funding_rate` | yes | yes — index **50** |
+| `signal_observed` | yes | yes — index **54** |
+| `signal_age_hours` | yes | yes — index **53** |
+
+### 3.2 The claim itself, on the consumed artifact
+
+| column | backfilled: distinct / nonzero | baseline: distinct / nonzero |
+|---|---|---|
+| **`funding_rate`** | **721 / 721 (721/721)** | **2 / 13 (13/721)** |
+| `signal_observed` | 1 / 721 | 2 / 13 |
+| `signal_age_hours` | 1 / 0 | 14 / 720 |
+| `basis` | 1 / 0 | 2 / 13 |
+| `open_interest` | 1 / 0 | 2 / 13 |
+| `funding_rate_prediction` | 1 / 0 | 2 / 13 |
+| `vol24h` | 1 / 0 | 2 / 13 |
+| `spread` | 1 / 0 | 2 / 24 |
+
+**`funding_rate` goes from 2 distinct values on 13 of 721 bars to 721
+distinct values on 721 of 721 bars.** That is the gate, met, measured on
+the frame the agent actually consumes. Independently corroborated from
+the trained artifact: fitted **STD** of `funding_rate` is **0.02334**
+(backfilled) vs **0.00336** (baseline) = **×6.941**, matching DECISION
+§1's claimed ×6.9 from a completely separate route.
+
+**Non-finite cells in the exported frame: 0 on both arms.**
+
+---
+
+## 4. Persistence and coverage
+
+Seeded with the **production path** — the same invocation the hourly
+timer's `ExecStart` and `just funding-backfill` use
+(`nix run ~/Projects/kraken-funding-rates#kraken-funding-rates --`),
+which exercises the real recipe end to end:
+
+```
+$ just funding-backfill ETH/USD /tmp/rev/signals/eth_usd_funding.jsonl
+{"msg": "Kraken returned 8792 funding-history records for PF_ETHUSD spanning 2025-10-01T08:00:00+00:00 -> 2026-10-02T23:00:00+00:00"}
+{"msg": "Wrote 8792 funding records to /tmp/rev/signals/eth_usd_funding.jsonl"}
+Backfilled 8792 history record(s) for PF_ETHUSD to /tmp/rev/signals/eth_usd_funding.jsonl
+  earliest: 2025-10-01T08:00:00Z
+  latest:   2026-10-02T23:00:00Z
+```
+
+**A note on the command in my brief.** The brief specified
+`nix develop --command bash -c "kraken-funding-rates backfill …"`. That
+cannot work: `flake.nix` pins only `kraken-python` and `kraken-market-data`,
+so the sibling's console script is not on the dev-shell `PATH`
+(`which kraken-funding-rates` → not found). This is a **correction of the
+brief, not a deviation**: `nix run` is the production path, so the seeded
+artifact is byte-for-byte what the timer writes — stronger evidence than
+the command in the brief would have given.
+
+| property | measured (2026-10-02T23:39Z) |
 |---|---|
-| largest gap | `2026-08-31 23:00 → 2026-09-02 14:00` — **38 bars missing** |
-| next | 10 bars (2018-06-26), 10 bars (2019-05-15), 8 bars (2019-08-15), 7 ×2, … |
+| records | **8,792** |
+| span | **2025-10-01T08:00:00Z → 2026-10-02T23:00:00Z** |
+| distinct timestamps | 8,792 (no duplicates) |
+| keys per record | **14** |
+| file size | 3,047,379 bytes |
 
-Two consequences:
+The record count is **~8,800 and grows by roughly one record per day**
+(the ~366-day window is recomputed on every call). Any re-derived count
+must be dated: *8,792 measured 2026-10-02*.
 
-1. **The 38-bar hole is at the seed/live-append seam, in the most recent month**
-   — precisely the region a live deployment would trade. `2026-09.parquet` starts
-   at 2026-09-02 14:00; nothing covers 2026-09-01 00:00 → 2026-09-02 13:00.
-2. **Features are computed on bar counts, not wall-clock.** `return_{4}`,
-   `sma_24`, `rsi_24`, `obv_slope_{24}` and `start_index = 24` all assume
-   consecutive hourly bars. Across a 39-hour jump, `return_1` reports a 39-hour
-   return as though it were a 1-hour return, and the 24-bar warm-up consumes
-   24 *rows* that span more than a day. `store-verify` should surface gap count
-   and max gap; the store arm's provenance (`market_data_store_venue`) should
-   record that the seed and the live leg are **two venues joined without an
-   overlap check**.
+**14 keys, not the 13 §6 claimed** — F-12's superset, confirmed:
+`ask, basis, bid, funding_rate, funding_rate_prediction, index_price,
+mark_price, open_interest, relative_funding_rate, spot_pair, symbol,
+ticker, timestamp, vol24h`.
 
-**Also (F4): the "partial-month boundary bar" description is wrong.** All 4
-zero-volume bars are mid-month (`2019-06-07 21:00`, `2020-12-21 14:00`,
-`2021-02-11 03:00`, `2023-03-24 12:00`); 0 of 106 month-first bars have zero
-volume; and 2 of the 4 sit **immediately before a gap** (2020-12-21 14:00 → gap
-of 3; 2021-02-11 03:00 → gap of 1). They are **exchange-outage no-trade bars**,
-not archive-boundary artifacts — a materially different diagnosis, and one that
-points at data integrity rather than at the Binance monthly format.
+### 4.1 This pass recovers 1 of 6 columns — measured at the file, not inferred
+
+Every one of the 8,792 backfilled records carries:
+
+```
+null_counts = {'funding_rate_prediction': 8792, 'mark_price': 8792,
+               'index_price': 8792, 'basis': 8792, 'open_interest': 8792,
+               'bid': 8792, 'ask': 8792, 'vol24h': 8792}
+```
+
+`/historical-funding-rates` carries only `funding_rate` (plus
+`relative_funding_rate`). Confirmed downstream in §3.2: `basis`,
+`open_interest`, `funding_rate_prediction`, `vol24h`, `spread` are all
+**1 distinct value, 0 nonzero bars** after the backfill.
+
+**Net effect on the observation: 1 column gained a real distribution and
+5 lost theirs.** Fitted-STD census over the 60 trained features:
+
+| arm | zero-STD (degenerate) features |
+|---|---|
+| baseline | 3 — `price_ratio_sma_1`, `bb_width_1`, `bb_pctb_1` (structural) |
+| backfilled | **10** — the same 3, plus `signal_observed`, `signal_age_hours`, and `spread`, `basis`, `open_interest`, `funding_rate_prediction`, `vol24h` |
+
+`signal_observed` (= 1.0 always) and `signal_age_hours` (= 0.0 always) are
+*correct* constants on a dense hourly file, not defects. The other five
+are a genuine loss: the single live snapshot used to give them 13 real
+readings, and the backfill cannot.
 
 ---
 
-## 5. Answers to the brief's five questions, condensed
+## 5. The four re-derivations
 
-| item | answer |
+All four were re-derived on **one shared 721-bar OHLCV frame**
+(`2026-09-02T23:00Z → 2026-10-02T23:00Z`, hourly, **with `vwap` and
+`count`**), so the two arms differ only in the signal file. That shared
+frame is the control the two disagreeing agents lacked: with
+`market_data_store: null` a live fetch is not reproducible, so "builder"
+and "integrator" may have measured different bars.
+
+Frame labels used throughout, each the output of one named repo function:
+
+| label | produced by | policy |
+|---|---|---|
+| `ohlcv_derived` | `add_derived_ohlcv_features` | pre-merge |
+| `signals_post_fillna` | `merge_extra_features` | **after** `data.py:816` `fillna(0.0)` |
+| `computed` | `FeaturePipeline.compute` | pre-fill, pre-ffill |
+| `observed` | `computed.ffill().fillna(0.0)` | **the frame the policy sees** |
+
+### 5.1 F-9 / C8 non-finite cells — **RESOLVED: 684 and 0 are the same pipeline, two frames**
+
+| frame | baseline | backfilled |
+|---|---|---|
+| `ohlcv_derived` | 19 (`trade_count_zscore_20`) | 19 |
+| `signals_post_fillna` | 19 (`trade_count_zscore_20`) | 19 |
+| `computed` (full 721) | **964** (`spread` 708 + 256 warm-up) | **977** (`spread` 721 + 256) |
+| `computed`, **tradable slice only** (697) | **684** — *all* `spread` | **697** |
+| **`observed`** | **0** | **0** |
+
+**684 is arithmetically exact:** `first_tradable_index = 24`, so the
+tradable slice is `721 − 24 = 697` bars; `697 − 13` finite `spread`
+readings = **684**. Every indicator warm-up NaN lives inside the first 24
+bars, so on that slice `spread` is the *only* non-finite column — "all
+`spread`" and "684" are the same statement.
+
+So: **the builder measured `computed` restricted to the tradable slice;
+the integrator measured `observed`.** Not a disagreement — a frame
+mismatch. The integrator's **0 is the correct gate figure**, and it is the
+frame that matters three times over: it is what `width_check.py` hashes
+(`obs = feat.ffill().fillna(0.0)`), what `export-data` writes (§3.2
+measured 0), and what `TradingEnvironment` hands the policy.
+`width_check` independently reports `nonfinite_obs_cells=0` on all three
+frame states.
+
+**The builder's "identical in baseline and target" is wrong.** On the same
+tradable slice: baseline **684**, backfilled **697**. The backfilled arm
+is *higher*, because its file has no `bid`/`ask` anywhere, so `spread` is
+NaN on every tradable bar.
+
+**Restated criterion for C8:** *non-finite cells in `observed`
+(`FeaturePipeline.compute` output after `.ffill().fillna(0.0)`), on the
+tradable slice, must be 0 on every arm.* Both arms: 0.
+
+### 5.2 F-11 `spread` nonzero bars — **RESOLVED: 13 vs 24 is ONE arm, TWO frames**
+
+| frame | baseline | backfilled |
+|---|---|---|
+| `computed` | **13** (finite = 13) | **0** |
+| `observed` | **24** | **0** |
+
+Same arm, same file, same frame length. The difference is
+`observed = computed.ffill().fillna(0.0)`.
+
+**The right edge is the mechanism.** The single record sits at
+`2026-10-02T00:00Z`; the frame's right edge is `2026-10-02T23:00Z`, so
+the record is **23 bars back from the edge**. The 12 h carry runs
+*forward* from the record's own hour, so its 13 readings occupy offsets
+**−23 … −11** from the right edge (measured, exactly). The remaining
+**11 bars** to the edge then inherit them through `ffill`:
+**13 + 11 = 24.** The integrator's 24 is the post-`ffill` count and is the
+one the agent sees; the builder's 13 is the pre-`ffill` count. The
+builder's premise was right — one live record plus one 12 h carry — but it
+counted the pre-`ffill` frame.
+
+**The integrator's "byte-identical both arms" is wrong.** On the file I
+seeded, `bid`/`ask` are null in all 8,792 records, so the backfilled arm
+is **0 / 721**, not 24. Both arms cannot agree on `spread` unless both
+files carry quotes.
+
+### 5.3 F-8 width — **RESOLVED by measurement; do not assert the literals**
+
+Measured with `tools/width_check.py` (§1.4):
+
+| state | `n_features` |
 |---|---|
-| `python -m pytest -q` | **429 passed** (exact count), 24 warnings, 34.46 s |
-| `nix flake check --no-build` | **green** |
-| non-vacuity | 5 named guards proven non-vacuous; **compute seam vacuous + false claim**; 4 redundant-and-unpinned sites |
-| (a) inf coverage | **complete**, no unguarded site; hard check on both `fit` and `transform` ✓. **compute-seam docstring inaccurate; `return_1`/`log_return_1` dead-under-shipped-config confirmed** |
-| (b) width-neutrality | **PASS — byte-identical**, 60 features, `start_index` 24. No `models/` artifact invalidated |
-| (c) bar count | **RESOLVED: benign accumulation.** Store grows ~1 bar/run via the live upsert leg (`data.py:1349-1352`). 0 duplicates; pinned edge unmoved. But docs quote stale live counts inconsistently |
-| (d) +1800% seed | **MAJOR — degenerate friction artifact, NOT seed noise.** +2015% → −88% at taker costs; IQR 1961pp → 11.7pp across seeds; the gate's yardstick measures cost |
-| (e) wording | **PASS.** Required sentence present at `DECISION.md:537-539`; no "106× more training" anywhere. Two corrections: `DECISION.md` internal inconsistency, `RESEARCH*.md` not self-labelling |
-| two-matrix gate | §9A.1 defect **reproduces exactly**; two-matrix method **works**, reproduces §9A.2 ratios. Headline **`NOT SEPARATED`** |
-| integration | **PASS**, magnitude satisfied on all three runs; labels appear on all three surfaces; pinned-without-store names the recipe |
+| all three `*_features_file` keys null | **52** |
+| shipped default, funding channel live (either file) | **60** |
 
-## 6. Could not be completed
+**F-8's "3 low" is confirmed and its cause is now named.** §7.3's C1 (57)
+and C2 (49) were measured on a frame that lacked the presence-gated trio
+`vwap_dev` / `volume_per_trade` / `trade_count_zscore_20`. `8cada4e`'s own
+commit message records "n_features 57 → 57 UNCHANGED" — the 57 is that
+missing trio.
 
-- **Pinned-without-store against a store-trained model** — cannot be tested as
-  intended, because of F3: `market_data_store: null` in a run config cannot
-  override the model's own store. I tested the *correct* case instead (a model
-  trained without a store, `vLive`, backtested with a pinned window), which fires
-  correctly. F3 is reported as a defect instead.
-- **No `USD_SOL` arm.** Confirmed out of scope; the store is ETH_USD-only.
-- **Phase 7 harness fix** — deliberately not attempted (user decision 4).
+**F-13's correction is confirmed**: 52 is the *all-null* width; the
+shipped default composes **60**. Sane range **52–60** is right. This pass
+asserts **no width literal**; it asserts the two measured values and that
+the backfill does not move the width (60 → 60, delta 0).
 
-## 7. Reproduce
+There is a fourth number, **49**, which is **not a shipped state**: a raw
+OHLCV parquet with neither the derived trio nor the signal merge. It is
+what my §1.2 receipt printed. See F-15.
+
+### 5.4 F-10 `signal_age_hours` — **RESOLVED: the criterion is unachievable on the shipped shape**
+
+| arm | min | max | on newest bar | nonzero bars |
+|---|---|---|---|---|
+| baseline (shipped live-snapshot shape) | **−1.0** | **12.0** | −1.0 | 720 |
+| backfilled (dense hourly) | 0.0 | **0.0** | 0.0 | 0 |
+
+`−1.0` is `_NO_SIGNAL_AGE` (`data.py:136`), the "no live reading at all"
+sentinel. **Max = 12.0 on the baseline arm**, exactly as F-10 predicted:
+`signal_age_hours` is `ages.max(axis=1)` — the **stalest** column wins —
+and the single live record's `bid`/`ask`/`basis`/`open_interest`/
+`funding_rate_prediction`/`vol24h` ramp 0…23 and are masked at the bound,
+so the max lands on **the bound itself, 12.0**.
+
+**C12's "max ≤ 2.0" is unachievable on the shipped shape.** Shape
+measured: a live snapshot sitting on the **newest** bar region, carry
+running backwards, bound 12. It holds only on a densely backfilled file
+(where every bar's newest reading is 0 h old). This **confirms F-6 /
+DEV-2** — leaving the bound at 12 was right.
+
+---
+
+## 6. Baseline-comparison fairness
+
+The brief warns that live training windows are not reproducible while
+`market_data_store: null`, so **fitted STDs, never MEANs**, are the
+comparison for cumulative features. Measured on the two trained
+`normalization.npz` files:
+
+| cumulative / windowed feature | STD backfilled | STD baseline | ratio |
+|---|---|---|---|
+| `return_24` | 0.02202309 | 0.02202305 | 1.000 |
+| `sma_24` | 465.13563486 | 465.13563753 | 1.000 |
+| `ema_24` | 108.93579204 | 108.93580467 | 1.000 |
+| `rsi_24` | 10.36393516 | 10.36390490 | 1.000 |
+| `obv` | 21439.92313326 | 21439.92355364 | 1.000 |
+| `obv_slope_24` | 10979.82439122 | 10979.81604906 | 1.000 |
+| `volume_zscore_20` | 1.05574207 | 1.05573848 | 1.000 |
+| `atr_24` | 3.56875933 | 3.56875933 | 1.000 |
+| `vwap_dev` | 0.00236646 | 0.00236647 | 1.000 |
+| `volume_per_trade` | 0.29296251 | 0.29295780 | 1.000 |
+| `trade_count_zscore_20` | 1.11061833 | 1.11060949 | 1.000 |
+
+Largest deviation across all eleven: ratio **1.000** (|log ratio| < 1e-5).
+**The two arms fitted the same window**, so the §2 comparison is fair and
+the 0.42-pt return difference is attributable to the funding channel, not
+to a shifted price frame. (Both exports also landed on byte-equal
+`open/high/low/close/vwap` — §3.)
+
+The one quantity that genuinely differs is the one under test:
+`funding_rate` STD **×6.941**.
+
+---
+
+## 7. Non-vacuity of the new regression tests
+
+### 7.1 NON-VACUOUS — the producer-hint pin
+
+`aba7b9b` changed the funding channel's producer hint from
+`"just funding-backfill # then just funding-pull"` to
+`"just funding-backfill && just funding-pull"` and pinned it, including a
+dedicated `assert "#" not in err.producer`.
+
+Reverted **only that one string** in a `/tmp` copy (source only, tests
+kept at HEAD) and re-ran:
 
 ```
-nix develop --command bash -c "python -m pytest -q"          # 429
-nix flake check --no-build
-bash /tmp/krb-verify/vacuity/battery.sh                       # 12 reverts
-bash /tmp/krb-verify/vacuity/battery2.sh                      # cases 4/4b/4c, 2d/2e
-nix develop --command python /tmp/krb-verify/gate2.py         # two-matrix gate
-bash /tmp/krb-verify/integ.sh                                 # integration, 3 runs
-bash /tmp/krb-verify/seed44.sh && bash /tmp/krb-verify/friction3.sh   # friction
+>           assert err.producer == (
+                "just funding-backfill && just funding-pull"
+            ), leg
+E           AssertionError: live-fetch
+E             - just funding-backfill && just funding-pull
+E             + just funding-backfill # then just funding-pull
+tests/test_rl_signal_config_wiring.py:1040: AssertionError
+1 failed, 22 deselected
 ```
+
+Fails with the original symptom. **This test earns its place** — and it
+matters because the `#` failure is invisible to the width guard (the
+docstring's own point: `spread` collapses to constant-zero at unchanged
+width).
+
+### 7.2 VACUOUS *for this diff* — the two new characterisation tests
+
+`tests/test_rl_signal_config_wiring.py` also gained
+`test_the_history_recipe_must_run_both_legs_or_spread_goes_dead` and
+`test_the_freshness_bound_only_matters_while_the_file_is_shallow`.
+With `data.py` and `features.py` reverted to `069a826` and the tests kept
+at HEAD:
+
+```
+2 passed, 21 deselected in 0.56s
+```
+
+**Both pass without this pass's source change**, so as guards for *this*
+diff they prove nothing. That is not a defect in the tests — it is a
+property of the diff, verified with the repo's own tool:
+
+```
+kraken_trading_bot/rl/data.py      executable_ast 069a826==HEAD -> True
+kraken_trading_bot/rl/features.py   executable_ast 069a826==HEAD -> True
+```
+
+**This pass made zero executable change to the pipeline.** `069a826..HEAD`
+touches comments, docstrings, the justfile, config comments, the systemd
+timer, and one producer-hint string. There was no behaviour for a test to
+guard. The two tests remain legitimate as guards against a *future* seam
+regression (they would catch a merge that stopped carrying `bid`/`ask`),
+but they are documentation of a measured property, not coverage for this
+change. Reported as **F-14**.
+
+### 7.3 A caveat about my own §1.2 receipt
+
+`verify --frame` printed `features=49`. **49 is not a shipped width** — it
+is an artifact of the frame I handed it (a raw OHLCV parquet, from which
+`width_check.py` derives nothing). §1.4 and §5.3 carry the real ladder,
+52 → 60. **Do not paste §1.2 onward as a width record**; it reads as a
+60 → 49 regression and is one. Reported as **F-15**.
+
+---
+
+## 8. New findings for the lead to record
+
+I am read-only on source, so these are reported, not recorded. Both need
+appending to `DECISION.md` §7.8 or `just audit-findings` will refuse.
+
+**F-14 — the two new characterisation tests are vacuous for `069a826..HEAD`.**
+`test_the_history_recipe_must_run_both_legs_or_spread_goes_dead` and
+`test_the_freshness_bound_only_matters_while_the_file_is_shallow` both
+pass with `data.py`/`features.py` reverted to the pre-registration commit
+(§7.2). *Requested disposition:* **Accepted, not a defect.** The pass made
+no executable change (`executable_ast` identical on both files, verified),
+so no test could be non-vacuous for it. Recorded so a later reader does
+not mistake them for regression coverage of this diff. The genuinely
+non-vacuous test in this pass is the producer-hint pin (§7.1).
+
+**F-15 — `width_check.py` under-reports width by 3 on a frame lacking the derived trio, and `--frame` will happily print a non-shipped width as a gate figure.**
+`width_check.fingerprint` calls `FeaturePipeline.compute(df)` but never
+`add_derived_ohlcv_features`, so a raw OHLCV parquet drops
+`vwap_dev` / `volume_per_trade` / `trade_count_zscore_20` and reports 49
+where every shipped state is 52 or 60. My own §1.2 receipt is the
+demonstration. This is the same class as F-8 ("which axis did the fixture
+include?") and it is now a **tool** trap rather than a doc trap.
+*Requested disposition:* **Accepted — document in `width_check.py`'s
+module docstring** that `--frame` must be a post-`add_derived_ohlcv_features`
+frame, and that a `--frame` receipt is a fingerprint of the frame supplied,
+not of the shipped default. No behaviour change (a silent auto-call would
+change every historical fingerprint).
+
+---
+
+## 9. Verdict
+
+**PASS.**
+
+- Pre-registered threshold unmoved (`tools/model_matrix.py` byte-identical
+  to `069a826`); AST proof self-test clean; 6/6 guarded files
+  executably unchanged since `8cada4e`.
+- **457 passed**.
+- The claim is met on the consumed artifact: `funding_rate` **2 distinct
+  on 13/721 bars → 721 distinct on 721/721 bars**, at **unchanged width
+  60**, with fitted STD **×6.941**.
+- Magnitude clause satisfied with numbers, not with "no error":
+  **697/721 bars replayed** and **546 trades** (baseline 697 and 558).
+- Equivalence gate met: **|Δ return| 0.42 pts**, same sign, inside the
+  ~5-pt band.
+- **Both OPEN findings re-derived and resolved** (F-9 → frame mismatch,
+  exact arithmetic; F-11 → one arm, two frames, with the right-edge
+  mechanism), plus F-8 and F-10 confirmed and pinned to measured values.
+- Coverage and persistence proven from the **production seeding path**.
+
+Stated plainly, and not as a footnote: **this pass recovers 1 of 6
+columns**, 5 columns lose the 13 readings the single live snapshot gave
+them, `signal_observed` no longer distinguishes absence per column (F-2),
+and both arms are **IN-SAMPLE** so no predictive claim is supported.
