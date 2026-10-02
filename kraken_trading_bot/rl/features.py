@@ -267,12 +267,17 @@ def check_feature_width(
 ) -> None:
     """Assert a model's fitted feature names match a live frame's columns.
 
-    This is the width guard that ships with the 49 -> 55 widening.  It is
-    deliberately **non-self-referential**: ``expected_feature_names`` comes
-    from the artifact (the ``feature_names`` array inside
-    ``normalization.npz``), ``actual_columns`` from the columns
-    ``FeaturePipeline.compute`` just produced.  Neither side is derived
-    from the other, so a stale artifact cannot pass by construction.
+    This is the width guard that ships with the 49 -> 55 widening.  (For
+    the record: those numbers are the *widened* pair, and the width this
+    guard actually sees depends on ``feature_windows`` and
+    ``feature_groups`` as configured — the shipped ``configs/default.yaml``
+    composes 52, so re-derive the number from an artifact rather than
+    quoting it.)  It is deliberately **non-self-referential**:
+    ``expected_feature_names`` comes from the artifact (the
+    ``feature_names`` array inside ``normalization.npz``),
+    ``actual_columns`` from the columns ``FeaturePipeline.compute`` just
+    produced.  Neither side is derived from the other, so a stale
+    artifact cannot pass by construction.
 
     Comparison is by name, not merely by count, because a same-width
     mismatch (one column replaced by another) is just as silent as a

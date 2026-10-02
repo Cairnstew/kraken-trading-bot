@@ -275,6 +275,9 @@ def test_train_ticker_end_to_end(tmp_path):
         "ETH/USD",
         "ppo_train",
         manager=OneShotManager(),
+        config_path=_default_config_without_funding(
+            tmp_path / "default-no-funding.yaml"
+        ),
         pages=2,
         total_timesteps=150,
         seed=7,
@@ -355,6 +358,9 @@ def test_backtest_env_applies_loaded_normalization(tmp_path, monkeypatch):
         "ETH/USD",
         "ppo_norm",
         manager=OneShotManager(),
+        config_path=_default_config_without_funding(
+            tmp_path / "default-no-funding.yaml"
+        ),
         pages=2,
         total_timesteps=200,
         seed=5,
@@ -430,6 +436,29 @@ def test_load_train_config_empty_when_no_candidate_exists(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# the shipped default's funding channel
+# ---------------------------------------------------------------------------
+# `configs/default.yaml` configures
+# `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl`, and the
+# merge seam now refuses a *configured* path it cannot resolve — naming the
+# key, the value as written and the expanded path.  That is the intended
+# behaviour, but these tests are about the training orchestration, not about
+# the funding channel, so they are handed a copy of the shipped config with
+# that ONE key nulled (`null` = off = silent).  The funding channel is covered
+# for real — fake `HOME`, a `~`-spelled path, and the seam asserted to have
+# *consumed* the file — in `tests/test_rl_signal_config_wiring.py`.
+def _default_config_without_funding(dest: Path) -> Path:
+    """Write a copy of ``configs/default.yaml`` with funding_features_file null."""
+    repo = Path(__file__).resolve().parents[1]
+    cfg = yaml.safe_load(
+        (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
+    )
+    cfg["funding_features_file"] = None
+    dest.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return dest
+
+
+# ---------------------------------------------------------------------------
 # Gap-1 widening: n_features provenance, written and surfaced
 # ---------------------------------------------------------------------------
 def test_train_ticker_records_n_features_in_config(tmp_path):
@@ -454,6 +483,9 @@ def test_train_ticker_records_n_features_in_config(tmp_path):
         "ETH/USD",
         "ppo_width",
         manager=OneShotManager(),
+        config_path=_default_config_without_funding(
+            tmp_path / "default-no-funding.yaml"
+        ),
         pages=2,
         total_timesteps=150,
         seed=7,
@@ -504,6 +536,9 @@ def test_backtest_refuses_a_stale_width(tmp_path, monkeypatch):
         "ETH/USD",
         "ppo_stale",
         manager=OneShotManager(),
+        config_path=_default_config_without_funding(
+            tmp_path / "default-no-funding.yaml"
+        ),
         pages=2,
         total_timesteps=150,
         seed=5,

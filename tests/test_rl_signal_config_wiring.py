@@ -35,8 +35,14 @@ import pytest
 import yaml
 from kraken_api.models import Candle
 
-from kraken_trading_bot.rl import SignalTickerMismatchError, read_ohlc_dataframe
+from kraken_trading_bot.rl import (
+    SignalFileNotFoundError,
+    SignalTickerMismatchError,
+    read_ohlc_dataframe,
+)
 from kraken_trading_bot.rl.data import (
+    _resolve_config_path,
+    _resolve_store,
     add_derived_ohlcv_features,
     merge_extra_features,
 )
@@ -708,27 +714,323 @@ def test_all_six_activated_columns_reach_the_observation(tmp_path) -> None:
         assert name not in stats.feature_names
 
 
-def test_config_points_at_a_real_funding_file_with_a_12h_bound() -> None:
-    """The activation that keeps the three funding columns non-silent.
+# ---------------------------------------------------------------------------
+# G1 — the seam must actually READ the file the config points it at, and must
+# refuse BY NAME when it cannot.
+#
+# The test these replace asserted only that `funding_features_file` was a
+# non-empty string ending in ".jsonl".  It passed for
+# `/definitely/not/here/nope.jsonl`: it never called expanduser(), never asked
+# is_file(), and never called the seam — so the defect it was supposed to
+# police (a `~`-spelled path resolving against the CWD instead of $HOME, so
+# the merge silently returned the frame unchanged) was invisible to it.  Each
+# test below is stated so that it fails without the fix.
+# ---------------------------------------------------------------------------
 
-    A ``null`` ``funding_features_file`` means ``funding_rate_prediction``,
-    ``vol24h`` and ``spread`` exist in code and produce zero in
-    production.  The bound matters for the same reason: funding settles
-    ~8-hourly, so the null->1h default would mark most bars unobserved.
+
+def _funding_record(ticker: str = _PAIR) -> dict[str, Any]:
+    """One record in the shape ``kraken-funding-rates`` actually writes.
+
+    ``ticker`` is the SPOT pair (``ETH/USD``), matching what
+    ``ticker-news-signals`` and ``kraken-social-signals`` emit and what the
+    consumer's ``_canonical_ticker`` folds a config ``ticker`` to.  (The
+    futures symbol ``PF_ETHUSD`` folds to ``PFETHUSD`` and matches nothing,
+    which is why the producer emits the pair and not the symbol.)  The other
+    keys are ``FundingSnapshot.to_dict()``'s, kept because the seam must
+    ignore unknown columns rather than choke on them.
+    """
+    return {
+        "ticker": ticker,
+        "symbol": "PF_ETHUSD",
+        "spot_pair": ticker,
+        "timestamp": "2026-08-01T12:00:00Z",
+        "funding_rate": 0.0001,
+        "funding_rate_prediction": 0.0003,
+        "mark_price": 2000.1,
+        "index_price": 2000.0,
+        "basis": 0.00005,
+        "open_interest": 4200.0,
+        "bid": 2000.0,
+        "ask": 2000.4,
+        "vol24h": 42000.5,
+    }
+
+
+def _funding_frame(n: int = 6) -> pd.DataFrame:
+    """``n`` hourly ETH/USD bars from the shared 12:00Z anchor."""
+    return pd.DataFrame(
+        {
+            "open": 2000.0,
+            "high": 2001.0,
+            "low": 1999.0,
+            "close": 2000.0,
+            "vwap": 2000.5,
+            "volume": 10.0,
+            "count": 7.0,
+        },
+        index=pd.date_range("2026-08-01T12:00:00Z", periods=n, freq="h"),
+    )
+
+
+def test_a_tilde_spelled_funding_path_is_resolved_against_home(
+    tmp_path, monkeypatch
+) -> None:
+    """The seam CONSUMES a ``~``-spelled path under a fake ``$HOME``.
+
+    This is the non-vacuity proof, stated as a contrast:
+
+    * without ``expanduser()`` the merge looks for a directory literally
+      named ``~`` under the *current working directory*, finds nothing, and
+      returns the frame untouched — so ``signal_observed`` is **absent**
+      (not zero) and the ``in`` assertion below fails;
+    * ``configs/default.yaml`` spells this key with ``~``, so this is the
+      shipped spelling, not a synthetic one.
+
+    ``signal_observed.any()`` is the load-bearing assertion: the columns are
+    absent rather than zero when the file is not read, so asserting a value
+    (or counting columns) would pass on the broken behaviour.
+    """
+    home = tmp_path / "home"
+    (home / "signals").mkdir(parents=True)
+    signals = _write_signals(
+        home / "signals" / "eth_usd_funding.jsonl", [_funding_record()]
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    result = merge_extra_features(
+        _funding_frame(),
+        "~/signals/eth_usd_funding.jsonl",
+        ticker=_PAIR,
+        max_age_hours=12,
+        config_key="funding_features_file",
+    )
+
+    assert signals.is_file()
+    assert "signal_observed" in result.columns
+    assert result["signal_observed"].any()
+    assert "signal_age_hours" in result.columns
+    # And the funding values themselves arrived, not just the freshness pair.
+    assert result["funding_rate_prediction"].iloc[0] == pytest.approx(0.0003)
+    assert result["vol24h"].iloc[0] == pytest.approx(42000.5)
+
+
+def test_the_same_seam_silently_ignores_a_null_channel() -> None:
+    """The negative direction: ``null`` stays off, and stays silent.
+
+    A fresh clone with no sibling repos cloned must still run, so the null
+    channels must keep returning the frame untouched with nothing logged.
+    Without this, keying the refusal on "non-empty" rather than "non-null"
+    would look correct and break first-run UX.
+    """
+    frame = _funding_frame()
+    assert merge_extra_features(frame, None, ticker=_PAIR) is frame
+    assert merge_extra_features(frame, "", ticker=_PAIR) is frame
+
+
+def test_a_configured_but_unresolvable_path_raises_by_name(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Non-null + unreadable is a configuration error, named in full.
+
+    The refusal must carry everything needed to fix it without opening the
+    source: which key, the value **as written** (so a ``~`` that was never
+    expanded stays legible), the expanded path actually checked, and the
+    command that produces the file.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SignalFileNotFoundError) as excinfo:
+            merge_extra_features(
+                _funding_frame(),
+                "~/signals/eth_usd_funding.jsonl",
+                ticker=_PAIR,
+                config_key="funding_features_file",
+            )
+
+    err = excinfo.value
+    message = str(err)
+    assert err.config_key == "funding_features_file"
+    assert err.reason == "missing"
+    assert err.raw_value == "~/signals/eth_usd_funding.jsonl"
+    assert "~" in message
+    assert str(tmp_path / "home" / "signals") in message
+    assert "just funding-pull" in message  # the producer command
+    assert "null" in message  # and the documented way to turn it off
+    # The old behaviour logged this and carried on; it must not any more.
+    assert "skipping signal merge" not in caplog.text
+
+
+def test_a_present_but_empty_funding_file_also_raises(tmp_path, caplog) -> None:
+    """Zero records is a *producer* failure and must not read as ``null``.
+
+    An existing-but-empty log drops exactly the columns a null key does, so
+    treating it as a normal state is the indistinguishability this seam
+    exists to remove.  It is logged at WARNING before raising, so the
+    diagnosis survives a caller that catches.
+    """
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(SignalFileNotFoundError) as excinfo:
+            merge_extra_features(
+                _funding_frame(),
+                str(empty),
+                ticker=_PAIR,
+                config_key="funding_features_file",
+            )
+
+    assert excinfo.value.reason == "empty"
+    assert excinfo.value.path == str(empty)
+    assert any(r.levelname == "WARNING" for r in caplog.records)
+    assert "no records" in caplog.text
+
+
+def test_a_funding_file_with_no_overlap_stays_a_warning(tmp_path, caplog) -> None:
+    """Records present but none on this ticker is NOT fatal.
+
+    This is the legitimately-expected state of a young forward-only log, so
+    it keeps today's WARNING and returns the frame.  It is the one
+    unusable-looking state that must not become a hard failure.
+    """
+    stale = _funding_record()
+    stale["timestamp"] = "2020-01-01T00:00:00Z"  # outside the frame's window
+    signals = _write_signals(tmp_path / "old.jsonl", [stale])
+
+    with caplog.at_level("WARNING"):
+        result = merge_extra_features(
+            _funding_frame(),
+            str(signals),
+            ticker=_PAIR,
+            max_age_hours=12,
+            config_key="funding_features_file",
+        )
+
+    assert "signal_observed" in result.columns
+    assert not result["signal_observed"].any()
+    assert "No ETH/USD signal record overlaps" in caplog.text
+
+
+def test_the_producer_record_shape_arms_the_ticker_guard(tmp_path) -> None:
+    """A real funding record shape must trip a CROSS-ticker file.
+
+    ``kraken-funding-rates`` writes the spot pair on every record, so a file
+    whose records are all another pair is a mis-pointed key and must raise —
+    the same guarantee the two sibling producers already give.  Stated
+    against ``_funding_record()``, the shape the producer emits, rather than
+    a hand-written fixture that could drift from it.
+    """
+    other = _write_signals(
+        tmp_path / "sol.jsonl", [_funding_record(ticker="SOL/USD")]
+    )
+
+    with pytest.raises(SignalTickerMismatchError) as excinfo:
+        merge_extra_features(
+            _funding_frame(),
+            str(other),
+            ticker=_PAIR,
+            max_age_hours=12,
+            config_key="funding_features_file",
+        )
+    assert excinfo.value.requested == _PAIR
+    assert excinfo.value.found == ["SOLUSD"]
+
+
+def test_market_data_store_path_is_resolved_against_home(
+    tmp_path, monkeypatch
+) -> None:
+    """The second instance of the same defect, on the store root.
+
+    ``configs/deep-history.example.yaml`` spells ``market_data_store`` with a
+    ``~`` too, so the identical omission blocked it.  Proved by standing in
+    for the optional ``market_data.store`` package and capturing the path it
+    is constructed with.
+    """
+    import sys
+    import types
+
+    seen: list[Path] = []
+
+    class FakeStore:
+        def __init__(self, root):
+            seen.append(Path(root))
+
+        def upsert(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return pd.DataFrame()
+
+    module = types.ModuleType("market_data.store")
+    module.MarketDataStore = FakeStore
+    package = types.ModuleType("market_data")
+    package.store = module
+    monkeypatch.setitem(sys.modules, "market_data", package)
+    monkeypatch.setitem(sys.modules, "market_data.store", module)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    _resolve_store("~/Projects/kraken-market-data/store")
+
+    assert seen == [
+        tmp_path / "home" / "Projects" / "kraken-market-data" / "store"
+    ]
+
+
+def test_null_market_data_store_still_takes_the_live_pass_through(
+    monkeypatch,
+) -> None:
+    """``market_data_store: null`` must remain a pure pass-through.
+
+    The resolver change must not disturb the default-config path: a null
+    store delegates to the live paginated fetch and nothing else.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "kraken_trading_bot.rl.data.fetch_ohlc_dataframe",
+        lambda pair, **kwargs: calls.append(pair) or _funding_frame(),
+    )
+    frame = read_ohlc_dataframe(_PAIR, 60, market_data_store=None)
+    assert calls == [_PAIR]
+    assert len(frame) == 6
+
+
+def test_resolve_config_path_maps_off_to_none_and_expands_tilde(
+    tmp_path, monkeypatch
+) -> None:
+    """The shared helper's whole contract, in one place."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert _resolve_config_path(None) is None
+    assert _resolve_config_path("") is None
+    # A relative value is left alone — only ``~`` is this helper's business.
+    assert _resolve_config_path("signals/x.jsonl") == Path("signals/x.jsonl")
+    assert _resolve_config_path("~/x.jsonl") == tmp_path / "home" / "x.jsonl"
+    # Already-expanded and Path values round-trip unchanged.
+    absolute = tmp_path / "already.jsonl"
+    assert _resolve_config_path(absolute) == absolute
+    assert _resolve_config_path(Path("~/y.jsonl")) == tmp_path / "home" / "y.jsonl"
+
+
+def test_the_shipped_funding_key_is_tilde_spelled_and_bounded_at_12h() -> None:
+    """The activation contract, minus the part that was never checked.
+
+    The old assertion here ("the string is non-empty and ends .jsonl") held
+    for a path that does not exist, so it is replaced by the properties that
+    actually matter: the key is ``~``-spelled — which is why the seam must
+    expand it, and why the consumer-side expansion is load-bearing — and the
+    staleness bound is 12h because funding settles ~8-hourly.  Both shipped
+    configs must agree.
     """
     repo = Path(__file__).resolve().parents[1]
-    default_cfg = yaml.safe_load(
-        (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
-    )
-    funding = default_cfg["funding_features_file"]
-    assert funding, "funding_features_file must name a real path"
-    assert str(funding).endswith(".jsonl")
-    assert default_cfg["signal_max_age_hours"] == 12
-
-    deep_cfg = yaml.safe_load(
-        (repo / "configs" / "deep-history.example.yaml").read_text(
-            encoding="utf-8"
+    for name in ("default.yaml", "deep-history.example.yaml"):
+        cfg = yaml.safe_load((repo / "configs" / name).read_text(encoding="utf-8"))
+        funding = cfg["funding_features_file"]
+        assert funding, f"{name}: funding_features_file must name a real path"
+        assert str(funding).startswith("~/"), (
+            f"{name}: the shipped spelling is tilde-relative, and the seam "
+            f"expands it against $HOME"
         )
-    )
-    assert deep_cfg["funding_features_file"], "example config must agree"
-    assert deep_cfg["signal_max_age_hours"] == 12
+        assert str(funding).endswith(".jsonl")
+        assert cfg["signal_max_age_hours"] == 12, (
+            f"{name}: funding settles ~8-hourly, so a 1h bound marks most "
+            f"bars unobserved"
+        )

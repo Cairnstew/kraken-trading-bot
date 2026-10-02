@@ -110,6 +110,86 @@ _TICKER_ALIASES = {"XBT": "BTC"}
 # file (WARNING, still merged) for backwards compatibility.
 _TICKER_FIELD = "ticker"
 
+# The three exogenous channels in merge order, each paired with the command
+# that produces its file.  Both the fetch leg and the store leg iterate this
+# one list, so the two can never disagree about which key feeds which merge
+# or about the wording of a refusal — a disagreement that would show up as
+# one branch reading a file the other silently skipped.
+_SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
+    (
+        "extra_features_file",
+        "python ~/Projects/ticker-news-signals/cli.py pull --ticker <PAIR> "
+        "--output <path>",
+    ),
+    ("funding_features_file", "just funding-pull"),
+    (
+        "social_features_file",
+        "python ~/Projects/kraken-social-signals/cli.py pull --ticker <PAIR> "
+        "--output <path>",
+    ),
+)
+
+
+def _resolve_config_path(value: Any) -> Path | None:
+    """Expand a config-supplied path; ``None`` means "not configured".
+
+    ``yaml.safe_load`` preserves the ``~`` of a value like
+    ``~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl``, and
+    ``Path("~/x")`` looks for a directory *literally named* ``~`` under the
+    current working directory — so the shipped spelling resolved to nothing
+    from every CWD, and the consumer could not tell "not configured" from
+    "configured and broken".  ``backtest.py`` already got this right for
+    ``--config``; this helper is the single definition so the next instance
+    is a review question rather than an audit finding.
+
+    Args:
+        value: The raw config value: a path string, an ``os.PathLike``, or
+            a null-ish value meaning "off".
+
+    Returns:
+        The expanded ``Path``, or ``None`` for a null/empty value (an
+        ``expanduser()`` no-op on any value without a ``~`` prefix).
+    """
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def _signal_channels(*values: Any) -> list[tuple[str, Any, str]]:
+    """Pair each exogenous channel's config value with its key and producer.
+
+    Args:
+        *values: The three channel values **in merge order** — news,
+            funding, social — matching :data:`_SIGNAL_CHANNELS`.
+
+    Returns:
+        ``(config_key, value, producer_command)`` triples in merge order.
+        The value is passed through untouched, so a null channel stays
+        null here and is skipped downstream.
+    """
+    return [
+        (key, value, producer)
+        for (key, producer), value in zip(_SIGNAL_CHANNELS, values)
+    ]
+
+
+def _channel_producer(config_key: str | None) -> str | None:
+    """The command that produces ``config_key``'s file, for a refusal.
+
+    Naming the producer turns "your path is wrong" into a copy-pasteable
+    fix, which is the whole point of failing loudly instead of skipping.
+
+    Args:
+        config_key: A key from :data:`_SIGNAL_CHANNELS`, or ``None``.
+
+    Returns:
+        The producer command, or ``None`` for an unrecognised/absent key.
+    """
+    for key, producer in _SIGNAL_CHANNELS:
+        if key == config_key:
+            return producer
+    return None
+
 
 class NotEnoughDataError(ValueError):
     """Raised when the available OHLCV bars are too few to train/backtest.
@@ -153,6 +233,76 @@ class SignalTickerMismatchError(ValueError):
             f"(contains: {', '.join(self.found) or 'none'}); point the "
             f"signal file config key at a {requested} file or set "
             f"signal_require_ticker: false to merge it unfiltered."
+        )
+
+
+class SignalFileNotFoundError(ValueError):
+    """Raised when a *configured* exogenous-signal file cannot be used.
+
+    The three channel keys (``extra_features_file`` /
+    ``funding_features_file`` / ``social_features_file``) are two-state by
+    design.  A ``null`` or empty value means **off**: the merge does
+    nothing at all and says nothing at all, so a fresh clone with no sibling
+    projects cloned still runs cleanly on price alone.  A non-null value is
+    a *declared intent to use that channel*, which makes an unusable path a
+    configuration error rather than a first-run state.
+
+    Silently skipping it was the defect this class exists to stop.  The
+    skipped merge does not merely drop the source's own columns — it drops
+    ``signal_observed`` and ``signal_age_hours`` too, because those are
+    written by the same seam, so the diagnostic that would have made the
+    absence auditable *inside* the observation was itself absent.
+
+    Attributes:
+        config_key: The config key that named the file (e.g.
+            ``"funding_features_file"``), or ``None`` for a direct seam
+            call that passed no key.
+        raw_value: The value exactly as the config spells it, so a ``~``
+            that was never expanded stays legible in the message.
+        path: The expanded path that was checked.
+        reason: ``"missing"`` (no file at the path) or ``"empty"`` (the
+            file exists but parsed to zero records).
+        producer: The command that produces the file, when known.
+    """
+
+    def __init__(
+        self,
+        config_key: str | None,
+        raw_value: Any,
+        path: "Path | str",
+        *,
+        reason: str = "missing",
+        producer: str | None = None,
+    ) -> None:
+        self.config_key = config_key
+        self.raw_value = raw_value
+        self.path = str(path)
+        self.reason = reason
+        self.producer = producer
+
+        key = config_key or "the signal-file config key"
+        # Naming both spellings keeps a recurring tilde defect legible: the
+        # raw value is what the user wrote, the path is what was checked.
+        spelled = str(raw_value)
+        where = (
+            f"{self.path} (expanded from {spelled!r})"
+            if spelled != self.path
+            else self.path
+        )
+        if reason == "empty":
+            head = (
+                f"{key} is set to {spelled!r} and {where} holds no records — "
+                f"an empty log is a producer failure, not a first-run state"
+            )
+        else:
+            head = (
+                f"{key} is set to {spelled!r} but no file exists at {where}"
+            )
+        fix = f" Produce it with: {producer}." if producer else ""
+        super().__init__(
+            f"{head}.{fix} Or set {key} to null to run without this "
+            f"channel: a null key means off and is silent, a set key is a "
+            f"declared intent to use it."
         )
 
 
@@ -289,6 +439,7 @@ def merge_extra_features(
     ticker: str | None = None,
     max_age_hours: float | int | None = None,
     require_ticker: bool = True,
+    config_key: str | None = None,
 ) -> pd.DataFrame:
     """Merge exogenous per-(ticker, hour) signal vectors onto an OHLCV frame.
 
@@ -326,6 +477,18 @@ def merge_extra_features(
        row with no live reading is now marked ``signal_observed=False``
        with ``signal_age_hours=-1.0``; "no record" and "a genuine
        ``0.0``/balanced reading" are therefore distinguishable.
+    5. **Off is not the same as broken** — a null/empty
+       ``extra_features_file`` means "off" and returns ``df`` untouched and
+       *silently*, so a fresh clone with no sibling projects cloned still
+       runs.  A non-null value that does not resolve, or that resolves to a
+       file holding zero records, raises
+       :class:`SignalFileNotFoundError` naming the config key, the value as
+       written and the expanded path.  Skipping it silently was the defect:
+       the skipped merge drops the freshness pair too, so the diagnostic
+       that would have made the absence auditable inside the observation was
+       itself absent.  "Records present but none overlapping this ticker"
+       stays a WARNING — the expected state of a young forward-only log is
+       not a fault.
 
     Both the OHLCV bar index and the signal timestamps are floor-truncated
     to the hour before joining, so the merge is robust to minor timestamp
@@ -333,8 +496,9 @@ def merge_extra_features(
 
     Args:
         df: OHLCV DataFrame indexed by UTC ``DatetimeIndex`` (``time``).
-        extra_features_file: Path to the signal JSONL; ``None`` or empty
-            returns ``df`` unchanged.
+        extra_features_file: Path to the signal JSONL.  ``None`` or empty
+            returns ``df`` unchanged; a ``~``-spelled value is expanded
+            against ``$HOME`` (see :func:`_resolve_config_path`).
         ticker: The pair the frame is for, e.g. ``"ETH/USD"``; used to
             filter records.  ``None`` (a direct call that does not know
             the pair) skips the filter with a WARNING.
@@ -344,6 +508,9 @@ def merge_extra_features(
         require_ticker: Fail loudly on a ticker mismatch (default).  When
             ``False`` every record is merged and a mismatch only logs a
             WARNING.
+        config_key: The config key ``extra_features_file`` came from, used
+            only to name the key in a refusal.  The fetch and store legs
+            pass it via :func:`_signal_channels`; a direct call may omit it.
 
     Returns:
         The input DataFrame with the source's signal columns plus
@@ -354,18 +521,21 @@ def merge_extra_features(
         stalest one.
 
     Raises:
+        SignalFileNotFoundError: If a configured path does not resolve, or
+            resolves to a file holding zero records.
         SignalTickerMismatchError: If the file is ticker-tagged but holds
             no record for ``ticker`` and ``require_ticker`` is true.
     """
-    if not extra_features_file:
+    path = _resolve_config_path(extra_features_file)
+    if path is None:
         return df
-
-    path = Path(extra_features_file)
     if not path.is_file():
-        _LOGGER.warning(
-            "Extra features file not found: %s — skipping signal merge", path
+        raise SignalFileNotFoundError(
+            config_key,
+            extra_features_file,
+            path,
+            producer=_channel_producer(config_key),
         )
-        return df
 
     # ── read JSONL ────────────────────────────────────────────────────
     records: list[dict[str, Any]] = []
@@ -380,8 +550,23 @@ def merge_extra_features(
                 _LOGGER.warning("Skipping malformed JSONL line %d: %s", lineno, exc)
 
     if not records:
-        _LOGGER.debug("Extra features file %s is empty — skipping merge", path)
-        return df
+        # A file that exists but parses to nothing is a *producer* failure,
+        # not a first-run state, and it must not be indistinguishable from a
+        # null key: the same columns (including the freshness pair) are
+        # missing from the observation either way.  Logged at WARNING before
+        # raising so the diagnosis survives a caller that catches.
+        _LOGGER.warning(
+            "Signal file %s (%s) exists but holds no records — skipping merge",
+            path,
+            config_key or "unlabelled channel",
+        )
+        raise SignalFileNotFoundError(
+            config_key,
+            extra_features_file,
+            path,
+            reason="empty",
+            producer=_channel_producer(config_key),
+        )
 
     # ── build a small DataFrame from the signals ──────────────────────
     signal_df = pd.DataFrame(records)
@@ -850,13 +1035,16 @@ def fetch_ohlc_dataframe(
     # across page boundaries.  Presence-gated: a source without vwap/count
     # simply comes back at the narrower width.
     df = add_derived_ohlcv_features(df)
-    for signal_file in (extra_features_file, funding_features_file, social_features_file):
+    for config_key, signal_file, _producer in _signal_channels(
+        extra_features_file, funding_features_file, social_features_file
+    ):
         df = merge_extra_features(
             df,
             signal_file,
             ticker=pair,
             max_age_hours=signal_max_age_hours,
             require_ticker=signal_require_ticker,
+            config_key=config_key,
         )
     return df
 
@@ -1006,13 +1194,16 @@ def read_ohlc_dataframe(
     # Same derivation as the live leg above, so the store and the direct
     # fetch produce the identical column set — the two must never drift.
     df = add_derived_ohlcv_features(df)
-    for signal_file in (extra_features_file, funding_features_file, social_features_file):
+    for config_key, signal_file, _producer in _signal_channels(
+        extra_features_file, funding_features_file, social_features_file
+    ):
         df = merge_extra_features(
             df,
             signal_file,
             ticker=pair,
             max_age_hours=signal_max_age_hours,
             require_ticker=signal_require_ticker,
+            config_key=config_key,
         )
     return df
 
@@ -1026,7 +1217,9 @@ def _resolve_store(market_data_store: Any) -> Any:
 
     * a **path** (``str``/``os.PathLike``) to a store root — the sibling
       package is imported lazily and ``MarketDataStore(path)`` is built
-      (raises a clear error if it is not installed);
+      (raises a clear error if it is not installed).  A ``~``-spelled path
+      is expanded against ``$HOME``, which is how
+      ``configs/deep-history.example.yaml`` spells it;
     * a **store-like object** — used directly, which is what lets tests
       (and embedded callers) drive the seam without the sibling package.
 
@@ -1051,7 +1244,7 @@ def _resolve_store(market_data_store: Any) -> Any:
                 "or set market_data_store: null in config to use the live "
                 "paginated fetch."
             ) from exc
-        return MarketDataStore(Path(market_data_store))
+        return MarketDataStore(_resolve_config_path(market_data_store) or Path())
     raise TypeError(
         "market_data_store must be a store root path, a MarketDataStore-like "
         "object with upsert()/read(), or None (live fetch); got "
@@ -1132,6 +1325,7 @@ def _minimum_bars(features: FeaturePipeline) -> int:
 
 __all__ = [
     "NotEnoughDataError",
+    "SignalFileNotFoundError",
     "SignalTickerMismatchError",
     "candles_to_dataframe",
     "add_derived_ohlcv_features",

@@ -14,7 +14,9 @@ from unittest import mock
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 from kraken_api.models import Candle
+from pathlib import Path
 
 from kraken_trading_bot.cli import _build_parser, main
 from kraken_trading_bot.rl import train_ticker
@@ -103,6 +105,28 @@ class OneShotManager:
         return self.candles, 0
 
 
+def _default_config_without_funding(dest: Path) -> Path:
+    """Write a copy of ``configs/default.yaml`` with funding_features_file null.
+
+    The shipped config configures
+    `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl`, and the
+    merge seam now refuses a *configured* path it cannot resolve (naming the
+    key, the raw value and the expanded path).  That refusal is the intended
+    behaviour, but these tests are about the paper-trading loop, not the
+    funding channel, so the module-wide model is trained from the shipped
+    config with that ONE key nulled — ``null`` means off and is silent.  The
+    training config written to ``models/`` carries it forward, so the
+    paper-trade reads below are covered too.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    cfg = yaml.safe_load(
+        (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
+    )
+    cfg["funding_features_file"] = None
+    dest.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return dest
+
+
 @pytest.fixture(scope="module")
 def trained_model(tmp_path_factory):
     """A real, tiny trained PPO model + config.yaml + normalization.npz."""
@@ -116,6 +140,9 @@ def trained_model(tmp_path_factory):
         total_timesteps=150,
         seed=7,
         models_root=root,
+        config_path=_default_config_without_funding(
+            root / "default-no-funding.yaml"
+        ),
     )
     assert record.is_trained()
     return root, record

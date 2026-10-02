@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from .agent import RLAgent
-from .data import prepare_episode, read_ohlc_dataframe
+from .data import _resolve_config_path, prepare_episode, read_ohlc_dataframe
 from .data_window import resolve_data_window, training_frame
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
@@ -69,22 +69,44 @@ def pair_from_ticker_id(ticker_id: str) -> str:
 def load_train_config(config_path: str | Path | None = None) -> dict[str, Any]:
     """Load a training config from YAML.
 
+    An **explicitly passed** path is a declared intent to train from that
+    file, so a path that does not resolve raises instead of returning an
+    empty dict: silently training on CLI defaults because of a typo is the
+    failure the ``fee_rate``/``slippage`` echo on a backtest result exists
+    to make visible, and ``backtest._load_run_config`` already refuses the
+    same way.  The *implicit* default (``config_path=None``) stays silent
+    when absent, because the packaged console script imports this module out
+    of the Nix store where ``configs/`` is not installed — see
+    :func:`resolve_default_config_path`.
+
     Args:
         config_path: Path to a YAML config with the shape of
             ``configs/default.yaml``; defaults to the resolved shipped
-            config (see :func:`resolve_default_config_path`).
+            config (see :func:`resolve_default_config_path`).  A
+            ``~``-spelled value is expanded against ``$HOME``.
 
     Returns:
-        Config dict (empty when the file is absent).  Raises on
-        unparseable YAML.
+        Config dict (empty when the *default* config is absent).  Raises on
+        an explicitly passed path that does not exist, and on unparseable
+        YAML.
+
+    Raises:
+        FileNotFoundError: If ``config_path`` was given but does not exist.
     """
+    explicit = config_path is not None
     path = (
-        Path(config_path)
-        if config_path is not None
+        _resolve_config_path(config_path)
+        if explicit
         else resolve_default_config_path()
     )
     if not path.is_file():
-        return {}
+        if not explicit:
+            return {}
+        raise FileNotFoundError(
+            f"Train config not found: {path}. Pass --config with an existing "
+            f"YAML file (e.g. configs/default.yaml), or omit it to load the "
+            f"shipped default."
+        )
     with path.open(encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data if isinstance(data, dict) else {}

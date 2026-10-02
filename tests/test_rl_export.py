@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 from kraken_api.models import Candle
 
 from kraken_trading_bot.rl import NotEnoughDataError
@@ -25,6 +26,30 @@ from kraken_trading_bot.rl.export import (
 # 2026-08-01 12:00 UTC — the anchor the store tests already use.
 _BASE = 1785585600
 _HOUR = 3600
+
+
+# ---------------------------------------------------------------------------
+# the shipped default's funding channel
+# ---------------------------------------------------------------------------
+# `configs/default.yaml` names a machine-specific
+# `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl`.  The merge
+# seam now refuses a *configured* path it cannot resolve — naming the key,
+# the value as written and the expanded path — so any test that inherits the
+# shipped default fails for the right reason but about the wrong thing: these
+# tests are about the CSV export stages, not about the funding channel.  They therefore
+# run against the shipped config with that ONE key nulled, which is exactly
+# what `null` means (off, and silent).  The funding channel is covered for
+# real — fake `HOME`, a `~`-spelled path, and the seam asserted to have
+# *consumed* the file — in `tests/test_rl_signal_config_wiring.py`.
+def _default_config_without_funding(dest: Path) -> Path:
+    """Write a copy of ``configs/default.yaml`` with funding_features_file null."""
+    repo = Path(__file__).resolve().parents[1]
+    cfg = yaml.safe_load(
+        (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
+    )
+    cfg["funding_features_file"] = None
+    dest.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    return dest
 
 
 def _candles(n: int = 120, seed: int = 7) -> list[Candle]:
@@ -66,6 +91,24 @@ class FakeManager:
 @pytest.fixture()
 def manager() -> FakeManager:
     return FakeManager(_candles())
+
+
+@pytest.fixture(autouse=True)
+def _funding_channel_off(tmp_path, monkeypatch):
+    """Point default-config resolution at a copy with funding nulled.
+
+    Everything in this module reads the shipped config, and the shipped
+    config configures a funding file that does not exist here — which the
+    seam now refuses by name.  Redirecting the *default* resolution (rather
+    than passing ``config_path=`` at ten call sites) keeps each test's own
+    subject visible; the tests that do pass an explicit config are
+    unaffected, since an explicit path never consults the default.
+    """
+    import kraken_trading_bot.rl.train as train_module
+
+    cfg = _default_config_without_funding(tmp_path / "default-no-funding.yaml")
+    monkeypatch.setattr(train_module, "resolve_default_config_path", lambda: cfg)
+    return cfg
 
 
 def test_build_export_frame_stage_column_order(manager):

@@ -59,7 +59,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .data import _OHLCV_COLUMNS, prepare_episode, read_ohlc_dataframe
+from .data import _OHLCV_COLUMNS, _resolve_config_path, prepare_episode, read_ohlc_dataframe
 from .features import FeaturePipeline, first_tradable_index, normalize_ticker_id
 from .train import build_train_config
 
@@ -246,8 +246,16 @@ def build_export_frame(
 
 
 def default_export_path(ticker_id: str, root: str | Path = "exports") -> Path:
-    """Default CSV destination: ``{root}/{TICKER_ID}.csv``."""
-    return Path(root) / f"{normalize_ticker_id(ticker_id)}.csv"
+    """Default CSV destination: ``{root}/{TICKER_ID}.csv``.
+
+    ``root`` is resolved with the same shared helper the signal and store
+    seams use, so a ``~``-spelled ``--output`` root lands in the user's home
+    rather than in a directory literally named ``~`` under the CWD.
+    """
+    resolved = _resolve_config_path(root)
+    return (resolved if resolved is not None else Path("exports")) / (
+        f"{normalize_ticker_id(ticker_id)}.csv"
+    )
 
 
 def write_export_csv(frame: pd.DataFrame, path: str | Path) -> Path:
@@ -255,12 +263,14 @@ def write_export_csv(frame: pd.DataFrame, path: str | Path) -> Path:
 
     Args:
         frame: Frame from :func:`build_export_frame`.
-        path: Destination CSV path.
+        path: Destination CSV path; a ``~``-spelled value is expanded
+            against ``$HOME``.
 
     Returns:
         The path written to.
     """
-    destination = Path(path)
+    resolved = _resolve_config_path(path)
+    destination = resolved if resolved is not None else Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(destination, index=False)
     return destination

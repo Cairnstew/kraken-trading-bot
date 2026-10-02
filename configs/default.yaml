@@ -71,11 +71,24 @@ extra_features_file: null
 # timestamp-floor left-join.  Null/empty disables the feature.
 #
 # The path below is the one the systemd.user timer
-# (kraken-trading-bot-funding.{service,timer}, see nix/module.nix)
-# populates hourly (`just funding-timer`, or `just funding-pull` for a
-# one-off).  `--append` adds one hour-floored record per pull; a duplicate
-# inside the same hour is discarded at the merge seam.  Point a second
-# pair's model at its own file, e.g. signals/sol_usd_funding.jsonl.
+# (kraken-trading-bot-funding.{service,timer}) populates hourly.  Those
+# units are NOT declared in nix/module.nix — that is a NixOS module and
+# `systemd.user.*` is not in its option namespace, so it cannot carry
+# them.  Install them from the justfile, which templates the .service.in
+# into ~/.config/systemd/user/: `just funding-timer` (persistent,
+# hourly) or `just funding-pull` for a one-off.  `--append` adds one
+# hour-floored record per pull; a duplicate inside the same hour is
+# discarded at the merge seam.  Point a second pair's model at its own
+# file, e.g. signals/sol_usd_funding.jsonl.
+#
+# The path is `~`-spelled on purpose (it is machine-independent that way)
+# and the seam expands it against $HOME before checking it.  Because this
+# key is non-null it is a DECLARED INTENT to use the channel: if the file
+# is missing, or exists and holds no records, the read raises naming this
+# key, the value as written and the expanded path rather than quietly
+# dropping the funding columns — including `signal_observed`, which would
+# then be absent from the observation too.  Set it to null to turn the
+# channel off silently.
 funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
 
 # Path to a JSONL file of per-(ticker, hour) social/search-trend vectors
@@ -101,9 +114,15 @@ social_features_file: null
 # one hourly bar, which is enough to bridge a single missed pull.  Set an
 # int to widen it, or 0 for a strict per-hour match.
 #
-# 12 is set here because `funding_features_file` is now a real file:
-# kraken-funding-rates settles ~8-hourly, so at the null→1h default a
-# funding reading covers only 76 of 721 bars, versus 301 of 721 at 12.
+# 12 is set here because `funding_features_file` is a real, configured
+# file: kraken-funding-rates settles ~8-hourly, so at the null->1h
+# default most bars fall outside the freshness window and every one of
+# them reads as unobserved.  How many bars a bound covers is NOT a
+# constant — it moves with the read window (`--pages`) and the bar
+# interval — so it is deliberately not quoted as a ratio here.  (An
+# earlier revision of this comment claimed "76 of 721 bars at 1h, 301 of
+# 721 at 12"; that was measured against one particular window and reads
+# as a general figure it never was.)
 signal_max_age_hours: 12
 
 # Require every merged signal file to actually be this ticker's file.
