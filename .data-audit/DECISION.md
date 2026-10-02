@@ -695,3 +695,83 @@ If the cost-aware numbers show the strategy losing money in **both** arms — wh
 frictionless→taker swing suggests — the report **says so plainly**. No "store arm improved"
 language in either direction. What CAND-3a delivered remains: *an out-of-sample measurement
 became possible at all.*
+
+---
+
+## 14. COST-AWARE GATE RESULT (Phase 7) — and a correction to §13.1's own prediction
+
+Run by `reviewer-cost`. **Parameters applied unchanged**, as pre-registered: threshold read from
+the shipped module (`tools/model_matrix.py:376`) and `assert`ed equal to 1.0 at scoring time, not
+passed as a literal; cost basis `fee_rate: 0.0026` / `slippage: 0.0005`; estimator the shipped
+`pooled_within_spread` + `dispersion_verdict`; ticker `ETH_USD`, seeds 42/43/44, `timesteps` 10000;
+**no retraining** — only the backtest leg re-run. §9A.1 two-separate-matrices method.
+
+### 14.1 The gate, at Kraken taker costs
+
+| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
+|---|---|---|---|---|---|---|
+| `excess_return` (headline) | −12.44% | −341.22% | 3.97% | 328.79pp | **82.91** | **RESOLVED** |
+| `total_return` | −5.26% | −99.76% | 3.89% | 94.51pp | **24.29** | **RESOLVED** |
+| `sharpe` | −0.719 | −4.976 | 1.404 | 4.257 | **3.03** | **RESOLVED** |
+| `max_drawdown` | 8.51% | 99.85% | 1.69% | 91.34pp | **53.91** | **RESOLVED** |
+
+**§13.1's framing held:** `RESOLVED` here is a statement about **cost sensitivity**, not about
+model quality or data depth. Both arms are cost-dominated to a loss; the store arm's larger
+notional churn simply drives it further under the floor.
+
+### 14.2 The strategy loses money in BOTH arms, in all six cells
+
+| arm | seed | trades/bar | total return | final equity |
+|---|---|---|---|---|
+| live | 42 / 43 / 44 | 0.822 / 0.839 / 0.811 | −5.26% / −9.38% / −1.87% | $9,474 / $9,062 / $9,813 |
+| store | 42 / 43 / 44 | 0.606 / 0.700 / 0.878 | **−99.76% / −99.88% / −91.82%** | **$23.68 / $12.03 / $818.02** |
+
+The policy re-enters roughly every 1.2 bars in **both** arms. Notional cost at 31 bp on a $10,000
+book is ~$1.8 per live seed and $144–$208 per store seed; the store arm pays ~145× more in
+absolute cost while replaying 110× more bars.
+
+**Stated plainly, as §13.3 required: this strategy loses money after costs in both arms.** The
+store arm loses catastrophically (99.85% max drawdown — a wipeout, not a drawdown statistic).
+**No "store arm improved" claim is made in either direction.** What CAND-3a delivered is unchanged
+and orthogonal to these numbers: *an out-of-sample measurement became possible at all.*
+
+### 14.3 The two previously-RESOLVED rows, re-derived
+
+| metric | frictionless | cost-aware | survives as verdict? | survives as evidence? |
+|---|---|---|---|---|
+| `sharpe` | RESOLVED 1.298 | RESOLVED 3.033 | **yes** | **NO — the sign of the gap FLIPS** (+1.005 higher frictionless → 4.257 lower under costs; every cell negative) |
+| `max_drawdown` | RESOLVED 10.79 | RESOLVED 53.91 | **yes** | **NO — magnitude inflates 5× on a larger numerator, not more signal** |
+
+### 14.4 CORRECTION — §13.1's pre-registered magnitude prediction was wrong
+
+§13.1 predicted `excess_return` would land at ratio **≈1.4** (pooled IQR ~11.7pp against a
+16.24pp gap). Measured: pooled IQR **3.97pp**, gap **328.79pp** → ratio **82.91**, ~59× the
+prediction.
+
+**The error was mine, in the pre-registration itself:** §13.1 held the *gap* fixed at its
+frictionless value while swapping in a cost-aware *pooled IQR*. But the gap is the variable that
+moved most — 16.24pp frictionless → 328.79pp cost-aware, because the store arm's return travels
+−322pp. Holding one side of the ratio constant across a change that moves it 20× is not a valid
+projection.
+
+**The verdict is unaffected**: 1.4 and 82.91 sit on the same side of a threshold that was fixed
+and committed beforehand. **The threshold was not touched to reconcile this**, and the discrepancy
+is recorded rather than quietly adopting the smaller number. What the pre-registration did buy —
+the *direction* call, and the rule that `RESOLVED` is not a claim the store helps — both held.
+
+### 14.5 Frictionless control (labelled DIAGNOSTIC — not a seed-variance measurement)
+
+| metric | live median | store median | pooled IQR | gap | ratio | verdict |
+|---|---|---|---|---|---|---|
+| `excess_return` | −2.90% | −16.67% | 439.32% | 13.77pp | 0.031 | NOT SEPARATED |
+| `total_return` | +4.27% | +224.86% | 439.23% | 220.59pp | 0.502 | NOT SEPARATED |
+| `sharpe` | +0.620 | +1.625 | 0.774 | 1.005 | 1.298 | RESOLVED |
+| `max_drawdown` | 4.80% | 66.97% | 5.76% | 62.17pp | 10.79 | RESOLVED |
+
+Control fidelity vs §9A.2: the store arm reproduces almost exactly (+224.86 / +52.98 / +1800.10 vs
+recorded +225.13 / +53.17 / +1800.10; ratio 0.031 vs 0.037). **The live arm drifts slightly**
+(+4.27 / −1.14 / +8.65 vs +4.07 / −0.44 / +8.87) because it re-fetches a **rolling** REST window —
+`n_bars` held at 697 and trades within 2 of recorded, so the window rolled a bar or two.
+**A live-arm backtest cannot be replayed bit-identically across days; a store-backed one can.**
+Store `n_bars` drifted 76,538 → 76,540 (+2), the same direction as the 76,562/76,561 discrepancy
+and consistent with the live-upsert-leg hypothesis (F5).
