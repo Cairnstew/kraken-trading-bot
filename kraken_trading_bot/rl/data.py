@@ -72,6 +72,32 @@ _TRADE_COUNT_ZSCORE_WINDOW = 20
 # look-back window (max window + a small return/rolling cushion).
 _WARMUP_PAD = 6
 
+# Venue label for a read served by the local store.  "Kraken live REST" is
+# what an UNSEEDED store means: whatever is in it was appended by this
+# same live leg, so the bars are Kraken's.  A store seeded by the sibling
+# `kraken-deep-history` is Binance-*USDT spot, i.e. a DIFFERENT venue —
+# its basis against Kraken has been measured at +5.41 bp of level shift
+# against a 58.30 bp hourly sigma, which z-scoring removes but which must
+# still be LABELLED rather than silently assumed away.  The config key
+# `market_data_store_venue` overrides the default so the artifact's own
+# config.yaml states which venue the bars came from.
+DEFAULT_STORE_VENUE = "kraken-live-rest"
+SEEDED_STORE_VENUE = "binance-spot-archive-seeded"
+
+# How to fill an empty store, in the words the error has to use.  Kept as a
+# constant because the number is quoted in three places (the error, the
+# docs, and the justfile recipes' help) and a wrong figure in an error
+# message is worse than none: it has to be the recipe a reader can run.
+STORE_SEED_HINT = (
+    "seed it with `just store-plan` (a zero-network dry run) then "
+    "`just store-seed` -- ~158s and ~13MB of Binance-archive monthly "
+    "klines for ETH/USD, BTC/USD, SOL/USD or XRP/USD at 60-minute bars. "
+    "`just store-seed` refuses to finish unless the report says "
+    "store_mode == \"market-data\"; a fallback-csv seed writes .csv that "
+    "the store reader (which globs *.parquet) cannot see, so the run "
+    "would silently read ~721 live bars instead of years."
+)
+
 # Freshness/provenance columns written by :func:`merge_extra_features`
 # beside the signal values themselves.  They are part of the canonical
 # allow-list in ``features._SIGNAL_COLUMNS`` (imported above), so they ride
@@ -205,6 +231,41 @@ class NotEnoughDataError(ValueError):
         super().__init__(
             f"Not enough {what}: need at least {needed} bars "
             f"(max feature window + warmup), got {available}"
+        )
+
+
+class MarketDataStoreUnavailableError(ValueError):
+    """Raised when a configured ``market_data_store`` cannot be served.
+
+    A **subclass of** ``ValueError`` so every existing caller and test
+    that catches ``ValueError`` (or ``NotEnoughDataError``, which is also
+    a ``ValueError``) keeps working: the typing contract is unchanged, only
+    the message grew.  What it adds is the instruction.  The bare failure
+    this replaces -- "ValueError: market_data_store is configured but ..."
+    -- named a package and stopped, so the reader was left to guess
+    between installing a package, hand-building a parquet tree, and
+    pointing the key back at ``null``.  Now the error names the recipe to
+    run, what it costs, and what the run log must then say.
+
+    Attributes:
+        store_root: The configured root, as text, or ``None`` when the
+            config value was not a path (e.g. the sibling package is not
+            importable at all).
+        reason: Short machine-ish cause, e.g. ``"root does not exist"``.
+    """
+
+    def __init__(self, reason: str, store_root: str | None = None) -> None:
+        self.reason = reason
+        self.store_root = store_root
+        where = f" at {store_root}" if store_root else ""
+        super().__init__(
+            f"market_data_store is configured{where} but cannot be served "
+            f"({reason}). The bot only READS the store -- it cannot backfill "
+            f"years of history from Kraken, whose REST API serves up to 720 "
+            f"of the most recent candles and states outright that older data "
+            f"cannot be retrieved regardless of `since`. To fix: {STORE_SEED_HINT}"
+            f" Set market_data_store: null in the config to go back to the "
+            f"live paginated fetch (~721 bars)."
         )
 
 
@@ -1063,6 +1124,7 @@ def read_ohlc_dataframe(
     signal_max_age_hours: int | None = None,
     signal_require_ticker: bool = True,
     market_data_store: Any = None,
+    market_data_store_venue: str | None = None,
     market_data_source: Any = None,
 ) -> pd.DataFrame:
     """Read OHLCV through the local market-data store, or fall back to live.
@@ -1108,6 +1170,13 @@ def read_ohlc_dataframe(
         market_data_store: ``null`` (live fetch), a store root path, or a
             store-like object exposing ``upsert``/``read`` (see
             :func:`_resolve_store`).
+        market_data_store_venue: Provenance label for the store's bars
+            (the ``market_data_store_venue`` config key), logged once on
+            the store leg.  Defaults to :data:`DEFAULT_STORE_VENUE`
+            ("kraken-live-rest"), which is what an UNSEEDED store means:
+            the bars in it were appended by this same live leg.  A store
+            seeded by ``kraken-deep-history`` is a different venue and
+            must say so — see :data:`SEEDED_STORE_VENUE`.
         market_data_source: Fetch source for the upsert leg; defaults to
             ``manager``.  Anything exposing ``ohlc(pair, interval, since)
             -> (candles, last)`` works (a live ``KrakenManager``, the
@@ -1119,8 +1188,11 @@ def read_ohlc_dataframe(
         vwap, volume, count``).
 
     Raises:
-        ValueError: If a store *path* is configured but the sibling
-            package is not importable.
+        MarketDataStoreUnavailableError: If a store *path* is configured
+            but the sibling package is not importable, or the root holds
+            no parquet months to read.  A ``ValueError`` subclass whose
+            message names the ``just store-seed`` recipe, its cost, and
+            how to fall back to the live fetch.
         TypeError: If ``market_data_store`` is neither null, a path, nor a
             store-like object.
         NotEnoughDataError: If the read window is empty.
@@ -1161,6 +1233,29 @@ def read_ohlc_dataframe(
     # pass, not a feature-engineering rewrite (see
     # kraken-deep-history/INTEGRATION.md §5).
     store = _resolve_store(market_data_store)
+
+    # VENUE PROVENANCE, once per store leg.  A store-backed frame can
+    # come from two different venues and nothing else in the run log
+    # distinguishes them: an unseeded store holds exactly what this live
+    # leg appended (Kraken), a `kraken-deep-history` seed holds
+    # Binance-*USDT spot.  The basis between them has been measured at
+    # +5.41 bp of level shift against a 58.30 bp hourly sigma -- harmless
+    # for z-scored features, but it must be LABELLED, because a
+    # store-vs-live comparison therefore measures history AND venue
+    # together and can only be described that way.
+    venue = market_data_store_venue or DEFAULT_STORE_VENUE
+    if isinstance(market_data_store, (str, os.PathLike)):
+        where = str(_resolve_config_path(market_data_store))
+    else:
+        where = f"<{type(market_data_store).__name__}>"
+    _LOGGER.info(
+        "Reading %d-minute %s bars from the market-data store at %s "
+        "(venue: %s)",
+        interval,
+        pair,
+        where,
+        venue,
+    )
 
     source = market_data_source if market_data_source is not None else manager
     if source is None:  # deferred import: only needed for live fetching
@@ -1208,6 +1303,39 @@ def read_ohlc_dataframe(
     return df
 
 
+def _store_root_status(root: Path) -> str | None:
+    """Why ``root`` cannot serve bars, or ``None`` when it can.
+
+    The store reader globs ``{PAIR_ID}/{interval_min}/{YYYY-MM}.parquet``
+    and nothing else.  So a root that exists but holds no parquet months
+    is as unserviceable as a root that does not exist, and it is the more
+    dangerous one: a seed run that fell back to ``FallbackStoreWriter``
+    writes ``.csv`` that this reader cannot see, leaving a directory that
+    looks seeded.  Reporting "no parquet months here" is what turns that
+    silent ~721-bar run into a legible error.
+    """
+    if not root.exists():
+        return "the store root does not exist"
+    if not root.is_dir():
+        return f"the store root is not a directory ({root.name})"
+    has_parquet = False
+    has_csv = False
+    for path in root.rglob("*"):
+        if path.suffix == ".parquet":
+            has_parquet = True
+            break
+        if path.suffix == ".csv":
+            has_csv = True
+    if has_parquet:
+        return None
+    if has_csv:
+        return (
+            "it holds .csv files but no .parquet months -- that is a "
+            "fallback-csv seed, which the store reader cannot see"
+        )
+    return "it is empty -- no {PAIR_ID}/{interval_min}/{YYYY-MM}.parquet months yet"
+
+
 def _resolve_store(market_data_store: Any) -> Any:
     """Resolve the ``market_data_store`` config value to a usable store.
 
@@ -1223,11 +1351,21 @@ def _resolve_store(market_data_store: Any) -> Any:
     * a **store-like object** — used directly, which is what lets tests
       (and embedded callers) drive the seam without the sibling package.
 
+    A path root is also **checked for bars** before it is handed back:
+    a configured-but-empty (or csv-only) root would otherwise produce an
+    empty read and a ``NotEnoughDataError`` that says nothing about the
+    actual cause, or worse, a run that quietly served ~721 live bars.
+    :class:`MarketDataStoreUnavailableError` (a ``ValueError``) carries
+    the recipe to fix it.
+
     Returns:
         An object exposing the store's ``upsert``/``read`` contract.
 
     Raises:
-        ValueError: If the sibling package is missing for a path config.
+        MarketDataStoreUnavailableError: If the sibling package is missing
+            for a path config, or the configured root holds no parquet
+            months.  A ``ValueError`` subclass, so the pre-existing
+            catch contract is unchanged.
         TypeError: If the value is neither a path nor a store-like object.
     """
     upsert = getattr(market_data_store, "upsert", None)
@@ -1238,13 +1376,17 @@ def _resolve_store(market_data_store: Any) -> Any:
         try:  # deferred import: optional accent, not a hard dependency
             from market_data.store import MarketDataStore
         except ImportError as exc:  # pragma: no cover - env dependent
-            raise ValueError(
-                "market_data_store is configured but the sibling "
-                "`kraken-market-data` package is not importable; install it "
-                "or set market_data_store: null in config to use the live "
-                "paginated fetch."
+            raise MarketDataStoreUnavailableError(
+                "the sibling `kraken-market-data` package is not importable "
+                "in this interpreter -- run inside `nix develop` (which puts "
+                "the pinned store reader on PYTHONPATH), or install it",
+                store_root=str(market_data_store),
             ) from exc
-        return MarketDataStore(_resolve_config_path(market_data_store) or Path())
+        root = _resolve_config_path(market_data_store) or Path()
+        reason = _store_root_status(root)
+        if reason is not None:
+            raise MarketDataStoreUnavailableError(reason, store_root=str(root))
+        return MarketDataStore(root)
     raise TypeError(
         "market_data_store must be a store root path, a MarketDataStore-like "
         "object with upsert()/read(), or None (live fetch); got "
@@ -1324,7 +1466,11 @@ def _minimum_bars(features: FeaturePipeline) -> int:
 
 
 __all__ = [
+    "DEFAULT_STORE_VENUE",
+    "MarketDataStoreUnavailableError",
     "NotEnoughDataError",
+    "SEEDED_STORE_VENUE",
+    "STORE_SEED_HINT",
     "SignalFileNotFoundError",
     "SignalTickerMismatchError",
     "candles_to_dataframe",

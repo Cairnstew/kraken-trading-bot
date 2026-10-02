@@ -945,6 +945,12 @@ def test_market_data_store_path_is_resolved_against_home(
     ``~`` too, so the identical omission blocked it.  Proved by standing in
     for the optional ``market_data.store`` package and capturing the path it
     is constructed with.
+
+    The root is given a parquet month first because a path config now has
+    to be *serveable*: ``_resolve_store`` refuses a root that holds no
+    parquet months (see
+    ``tests/test_market_data_store_seeding.py`` for that refusal).  The
+    assertion under test — ``~`` expands against ``$HOME`` — is unchanged.
     """
     import sys
     import types
@@ -968,6 +974,9 @@ def test_market_data_store_path_is_resolved_against_home(
     monkeypatch.setitem(sys.modules, "market_data", package)
     monkeypatch.setitem(sys.modules, "market_data.store", module)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "home" / "Projects" / "kraken-market-data" / "store"
+    (root / "ETH_USD" / "60").mkdir(parents=True)
+    (root / "ETH_USD" / "60" / "2026-08.parquet").write_bytes(b"")
 
     _resolve_store("~/Projects/kraken-market-data/store")
 

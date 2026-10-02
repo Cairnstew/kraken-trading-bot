@@ -173,6 +173,7 @@ def build_export_frame(
         signal_max_age_hours=cfg.get("signal_max_age_hours"),
         signal_require_ticker=cfg.get("signal_require_ticker", True),
         market_data_store=cfg.get("market_data_store"),
+        market_data_store_venue=cfg.get("market_data_store_venue"),
     )
 
     features = FeaturePipeline(

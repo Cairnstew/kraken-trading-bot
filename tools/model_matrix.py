@@ -31,6 +31,13 @@ Nothing here imports the RL package: the harness drives the documented
 ``kraken-trading-bot train/backtest --json`` CLI contract, so it keeps
 working when the RL internals move.
 
+The report ADJUDICATES those comparisons, not just tabulates them: the
+CAND-5 dispersion gate scores each adjacent arm-pair by
+``|median_A - median_B|`` over the pooled within-group IQR and prints a
+RATIO.  ``NOT SEPARATED`` — the gap is smaller than the seed noise
+inside an arm — is a normal, non-failing outcome; see
+:func:`dispersion_verdict`.
+
 Spec shape (see configs/matrix.example.yaml for the worked example):
 
     name: my-matrix
@@ -74,6 +81,10 @@ _LOGGER = logging.getLogger(__name__)
 
 __all__ = [
     "BACKTEST_EXPRESSIBLE_KEYS",
+    "DISPERSION_NOT_SEPARATED",
+    "DISPERSION_RATIO_THRESHOLD",
+    "DISPERSION_RESOLVED",
+    "DISPERSION_UNDEFINED",
     "TRAIN_ONLY_CONFIG_KEYS",
     "Cell",
     "MatrixSpec",
@@ -86,6 +97,8 @@ __all__ = [
     "cmd_report",
     "cmd_run",
     "deep_merge",
+    "describe_dispersion",
+    "dispersion_verdict",
     "done_cell_ids",
     "expected_bars_for",
     "expand_cells",
@@ -94,6 +107,8 @@ __all__ = [
     "load_spec",
     "main",
     "materialize_configs",
+    "pooled_within_spread",
+    "replicated_groups",
     "split_cell_overrides",
     "span_bars_for",
     "summarize",
@@ -336,6 +351,193 @@ def summarize(values: Sequence[float]) -> dict[str, float | int | None]:
         "min": min(finite) if finite else None,
         "max": max(finite) if finite else None,
     }
+
+
+# ── CAND-5: the dispersion gate ────────────────────────────────────────────
+#
+# A median difference between two arms is not a finding.  What makes one
+# a finding is that the gap between the arms is large *relative to the
+# spread inside* an arm — the seed noise the replicates measure.  The gate
+# therefore compares a RATIO, never a boolean: ``gap / pooled``, where the
+# yardstick is the median within-group IQR over the groups that have
+# enough replicates to have an IQR worth quoting.
+#
+# Why the median and not the max:  with three replicates per arm, one arm
+# whose seeds happen to disagree badly (a crash-recovery run, a lucky
+# trade) drags a ``max`` yardstick past the gap and flips every verdict to
+# NOT SEPARATED.  That was measured, not hypothesised — the worked case 1
+# below (gap 4pp, pooled IQR 0.075pp, 53x) collapses to 0.21x under the
+# same data with a max.  The median is robust to that one group; ``mean``
+# is not.
+
+#: Ratio at or above which a pair is reported RESOLVED.  This is a
+#: JUDGEMENT CALL, not a fact: the ratio is the fact, and a reader who
+#: disagrees with the threshold can read the ratio off the same output.
+DISPERSION_RATIO_THRESHOLD = 1.0
+
+#: Verdict labels.  ``NOT_SEPARATED`` is a first-class, NON-failing
+#: outcome: it says the between-arm gap is smaller than the noise inside
+#: an arm, which is a measurement, not an error.  Nothing in this module
+#: exits non-zero because of it.
+DISPERSION_RESOLVED = "RESOLVED"
+DISPERSION_NOT_SEPARATED = "NOT SEPARATED"
+DISPERSION_UNDEFINED = "UNDEFINED"
+
+
+def replicated_groups(rows: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Rows whose replicate count clears :data:`MIN_REPLICATES_FOR_A_CLAIM`.
+
+    The keep-list for every dispersion number: a group below the count
+    gate has no IQR worth quoting (at n=2 the "IQR" is just the gap
+    between the two seeds), so counting it would let thin groups set the
+    yardstick that thick groups are then judged against.
+    """
+    kept = []
+    for row in rows or ():
+        summary = (row.get("summary") or {}) if isinstance(row, Mapping) else {}
+        try:
+            n = int(summary.get("n") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= MIN_REPLICATES_FOR_A_CLAIM:
+            kept.append(row)
+    return kept
+
+
+def _group_iqr(row: Mapping[str, Any]) -> float | None:
+    """One group's ``q3 - q1``, or None when either quartile is absent."""
+    summary = (row.get("summary") or {}) if isinstance(row, Mapping) else {}
+    q1, q3 = summary.get("q1"), summary.get("q3")
+    if not _finite(q1) or not _finite(q3):
+        return None
+    return float(q3) - float(q1)
+
+
+def pooled_within_spread(rows: Sequence[Mapping[str, Any]]) -> float | None:
+    """The dispersion-gate yardstick: MEDIAN within-group ``q3 - q1``.
+
+    Taken over the groups that clear :data:`MIN_REPLICATES_FOR_A_CLAIM`,
+    because that is the same set the gate is allowed to speak about.
+
+    Args:
+        rows: Group rows as produced by :func:`_group_summaries` (each
+            with a ``summary`` mapping holding ``n``/``q1``/``q3``).
+
+    Returns:
+        The pooled spread, or ``None`` when fewer than two such groups
+        exist (one arm has no yardstick to be measured against) or when
+        the median comes out at exactly ``0`` — a zero denominator would
+        make every ratio infinite, i.e. would bless whatever gap it was
+        handed.
+    """
+    spreads = [
+        iqr for iqr in (_group_iqr(row) for row in replicated_groups(rows)) if iqr is not None
+    ]
+    if len(spreads) < 2:
+        return None
+    pooled = median(spreads)
+    if pooled is None or not pooled > 0.0:
+        return None
+    return pooled
+
+
+def dispersion_verdict(
+    gap: float | None,
+    pooled: float | None,
+    *,
+    replicates: int | None = None,
+    threshold: float = DISPERSION_RATIO_THRESHOLD,
+) -> dict[str, Any]:
+    """Adjudicate one arm-pair against the pooled within-arm spread.
+
+    The gate sits BEHIND the count gate, and that placement is the whole
+    point.  At one replicate per arm a group has ``q3 - q1 == 0``, so a
+    ratio-of-gap-to-spread gate would report ``5pp / 0 = inf`` and call
+    the pair RESOLVED — blessing precisely the anecdote the surrounding
+    prose exists to kill.  So nothing is emitted until BOTH hold: the
+    contributing groups have ``n >= MIN_REPLICATES_FOR_A_CLAIM`` **and**
+    the pooled spread is positive.
+
+    Args:
+        gap: ``abs(median_A - median_B)`` between two adjacent arms.
+        pooled: :func:`pooled_within_spread` over the cohort, or None.
+        replicates: Smallest replicate count among the contributing
+            groups; ``None`` when unknown.
+        threshold: Ratio at/above which the pair reads RESOLVED.
+
+    Returns:
+        ``{"verdict", "ratio", "gap", "pooled", "replicates", "reason"}``.
+        ``ratio`` is ``None`` for UNDEFINED — no number is invented when
+        there is no yardstick.
+    """
+    reason = ""
+    if replicates is None or int(replicates) < MIN_REPLICATES_FOR_A_CLAIM:
+        reason = (
+            f"fewer than {MIN_REPLICATES_FOR_A_CLAIM} replicates in the "
+            "contributing groups"
+        )
+    elif pooled is None:
+        reason = (
+            "no positive pooled spread (needs >= 2 groups with "
+            f"n >= {MIN_REPLICATES_FOR_A_CLAIM}, and a non-zero IQR)"
+        )
+    elif not _finite(gap):
+        reason = "a missing arm median"
+
+    if reason:
+        return {
+            "verdict": DISPERSION_UNDEFINED,
+            "ratio": None,
+            "gap": float(gap) if _finite(gap) else None,
+            "pooled": pooled,
+            "replicates": replicates,
+            "reason": reason,
+        }
+
+    ratio = abs(float(gap)) / float(pooled)  # type: ignore[arg-type]
+    return {
+        "verdict": (
+            DISPERSION_RESOLVED if ratio >= threshold else DISPERSION_NOT_SEPARATED
+        ),
+        "ratio": ratio,
+        "gap": abs(float(gap)),
+        "pooled": float(pooled),  # type: ignore[arg-type]
+        "replicates": replicates,
+        "reason": "",
+    }
+
+
+def describe_dispersion(
+    lower: Mapping[str, Any],
+    upper: Mapping[str, Any],
+    pooled: float | None,
+    *,
+    replicates: int | None = None,
+    threshold: float = DISPERSION_RATIO_THRESHOLD,
+    kind: str = "pct",
+) -> str:
+    """One human line for an adjacent arm-pair, ratio first."""
+    gap = None
+    med_a = (lower.get("summary") or {}).get("median")
+    med_b = (upper.get("summary") or {}).get("median")
+    if _finite(med_a) and _finite(med_b):
+        gap = abs(float(med_a) - float(med_b))
+    result = dispersion_verdict(
+        gap, pooled, replicates=replicates, threshold=threshold
+    )
+    fmt = _fmt_for(kind)
+    pair = f"{lower.get('label')} vs {upper.get('label')}"
+    ratio = result["ratio"]
+    ratio_text = "ratio n/a" if ratio is None else f"ratio {ratio:.2f}x"
+    if result["verdict"] == DISPERSION_UNDEFINED:
+        return (
+            f"{pair}: UNDEFINED ({result['reason']}) — {ratio_text}; "
+            f"gap {fmt(gap)}, pooled within-group IQR {fmt(pooled)}"
+        )
+    return (
+        f"{pair}: {result['verdict']} ({ratio_text}; gap {fmt(gap)} vs "
+        f"pooled within-group IQR {fmt(pooled)})"
+    )
 
 
 def fmt_pct(value: float | None, digits: int = 2) -> str:
@@ -1951,6 +2153,28 @@ def _print_group_table(
             f"{indent}{text:<{width}}  {n_cell:>5}  "
             f"{fmt_iqr(row['summary'], kind)}"
         )
+    # The yardstick the dispersion verdicts used, printed with the table
+    # it was measured from: a reader comparing two rows above needs the
+    # within-group noise next to the between-group gap.
+    thick = replicated_groups(rows)
+    pooled = pooled_within_spread(rows)
+    fmt = _fmt_for(kind)
+    if pooled is not None:
+        print(
+            f"{indent}pooled within-group IQR (median over {len(thick)} group(s) "
+            f"with n >= {MIN_REPLICATES_FOR_A_CLAIM}): {fmt(pooled)} — the "
+            "dispersion gate's yardstick (its ratio threshold is a judgement "
+            "call, the ratio itself is a fact)"
+        )
+    else:
+        why = (
+            f"needs >= 2 groups with n >= {MIN_REPLICATES_FOR_A_CLAIM} and a "
+            f"non-zero IQR (have {len(thick)})"
+        )
+        print(
+            f"{indent}pooled within-group IQR: n/a ({why}) — the dispersion "
+            "gate is UNDEFINED for this table, so no pair is adjudicated"
+        )
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -2205,6 +2429,89 @@ def _compute_varying_keys(views: Sequence["_CellView"]) -> None:
         _VARYING_KEYS[key] = len(values) > 1
 
 
+def _dispersion_claims(oos: Sequence[_CellView]) -> list[str]:
+    """The CAND-5 block: adjacent arm-pairs scored against pooled noise.
+
+    One arm is a row of the per-config headline table; a *pair* is two
+    adjacent rows in that table's printed (median-descending) order,
+    which is the comparison a reader makes when they look at the table.
+    The gate reports a RATIO per pair and never fails the run.
+
+    ``NOT SEPARATED`` is printed as a finding in its own right, worded
+    as a measurement: the gap is smaller than the spread inside an arm,
+    so the two medians are not ordered by the data.  It is the outcome a
+    store-vs-live comparison is most likely to produce at n=3 seeds, and
+    burying it under a failure would make the harness lie about its own
+    result.
+    """
+    rows = _group_summaries(
+        oos,
+        lambda v: v.config_key,
+        _config_label,
+        HEADLINE,
+        "pct",
+    )
+    ordered = sorted(
+        (r for r in rows if _finite((r.get("summary") or {}).get("median"))),
+        key=lambda r: float(r["summary"]["median"]),
+        reverse=True,
+    )
+    thick = replicated_groups(rows)
+    pooled = pooled_within_spread(rows)
+    replicates = min(
+        (int(r["summary"]["n"]) for r in thick), default=None
+    )
+
+    lines: list[str] = []
+    if pooled is None:
+        lines.append(
+            "DISPERSION GATE: UNDEFINED — no positive pooled within-group "
+            f"IQR over the groups with n >= {MIN_REPLICATES_FOR_A_CLAIM} "
+            f"({len(thick)} such group(s)). Every pair below is left "
+            "UNADJUDICATED rather than scored against a zero denominator, "
+            "which would report every gap as infinite and call the "
+            "thinnest group the winner."
+        )
+        return lines
+
+    fmt = _fmt_for("pct")
+    lines.append(
+        f"DISPERSION GATE (CAND-5): pooled within-group IQR {fmt(pooled)} "
+        f"over {len(thick)} group(s) with n >= {MIN_REPLICATES_FOR_A_CLAIM}; "
+        "each pair below is |median gap| / that spread, so a ratio >= "
+        f"{DISPERSION_RATIO_THRESHOLD:g} clears seed noise. The ratio is a "
+        "FACT; the threshold is a JUDGEMENT CALL — read the ratio, not the "
+        "verdict. NOT SEPARATED is a finding, not a failure: it means the "
+        "gap is inside the noise, so those medians are not ordered by the "
+        "data."
+    )
+    resolved = 0
+    not_separated = 0
+    pairs = list(zip(ordered, ordered[1:]))
+    for lower, upper in pairs:
+        result = dispersion_verdict(
+            abs(float(lower["summary"]["median"]) - float(upper["summary"]["median"])),
+            pooled,
+            replicates=replicates,
+        )
+        if result["verdict"] == DISPERSION_RESOLVED:
+            resolved += 1
+        elif result["verdict"] == DISPERSION_NOT_SEPARATED:
+            not_separated += 1
+        lines.append(
+            "  " + describe_dispersion(lower, upper, pooled, replicates=replicates)
+        )
+    lines.append(
+        f"DISPERSION VERDICT: {resolved} RESOLVED, {not_separated} NOT "
+        f"SEPARATED across {len(pairs)} adjacent pair(s). At n="
+        f"{MIN_REPLICATES_FOR_A_CLAIM} a group IQR is the middle of two "
+        "order statistics, so this gate is NECESSARY, NOT SUFFICIENT: it "
+        "stops a noise-ranked difference being presented as a finding, it "
+        "does not manufacture power. More power is more seeds."
+    )
+    return lines
+
+
 def _build_claims(
     views: Sequence[_CellView],
     oos: Sequence[_CellView],
@@ -2274,12 +2581,15 @@ def _build_claims(
             "— PPO on one config has been measured replaying 576 trades and "
             "374 — so treat those medians as ordering hints, not evidence."
         )
-    else:
-        claims.append(
-            f"Every (ticker, config) group has >= {MIN_REPLICATES_FOR_A_CLAIM} "
-            "valid replicates, so the medians above are at least seed-stable. "
-            "They are still one market window, not a distribution."
-        )
+    # CAND-5: the count gate above is NECESSARY, not sufficient.  "Every
+    # group has >= 3 seeds" does not make a difference between two group
+    # medians a finding — it only makes the IQRs printable.  So the old
+    # "at least seed-stable, treat as a distribution" else-branch is
+    # REPLACED by the dispersion gate: each adjacent arm-pair is scored by
+    # |median_A - median_B| against the pooled within-group IQR.
+    claims.extend(
+        _dispersion_claims(oos)
+    )
 
     friction_free = [
         v

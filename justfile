@@ -177,6 +177,69 @@ matrix-run spec="configs/matrix.example.yaml" *ARGS="":
 matrix-report spec="configs/matrix.example.yaml" *ARGS="":
   {{dev}} 'python tools/model_matrix.py report {{spec}} {{ARGS}}'
 
+# ── Deep-history store (market_data_store) ───────────────────────────────
+# `market_data_store: null` in configs/default.yaml is a LIVE fetch, and
+# Kraken's REST API serves up to 720 of the most recent candles — older
+# data cannot be retrieved regardless of `since`. A seeded local store is
+# the only route past that ceiling. These four recipes seed and check it.
+#
+# They run the sibling `kraken-deep-history` seeder under THIS repo's dev
+# shell with its checkout on PYTHONPATH, because kraken-deep-history's own
+# dev shell carries only pytest (no pandas, no pyarrow). Seeding there
+# makes `_open_store` fall back to `FallbackStoreWriter`, which writes
+# `.csv` that `MarketDataStore.read` (which globs `*.parquet`) cannot see:
+# the seed reports success, the directory looks seeded, and the bot then
+# reads ~721 live bars. `store-seed` therefore pipes the report through
+# `tools/store_guard.py`, which REFUSES store_mode != "market-data"
+# instead of merely printing it.
+#
+# Cost: ~158s and ~13MB for the four mapped USDT pairs at 60-minute bars.
+# Deep bars buy normalization-sample size, regime diversity and a longer
+# out-of-sample span — NOT more gradient steps (--timesteps is unchanged).
+
+# Shared locations: the sibling seeder is not a flake input here, so it is
+# named by path and put on PYTHONPATH rather than built.
+store_root := env_var_or_default("KTB_STORE_ROOT", "~/Projects/kraken-market-data/store")
+deep_history_dir := env_var_or_default("KTB_DEEP_HISTORY_DIR", "~/Projects/kraken-deep-history")
+
+# Dry run: which monthly Binance-archive ZIPs a seed would download. No
+# network, no writes. Run this first — it is how you check the store path
+# and the symbol map before spending 158s.
+# e.g. just store-plan                       (ETH/USD since 2018)
+#      just store-plan "BTC/USD" "2021-01-01"
+store-plan ticker="ETH/USD" since="2018-01-01" interval="60" *ARGS="":
+  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli plan --ticker {{ticker}} --interval {{interval}} --from {{since}} --store {{store_root}} {{ARGS}}'
+
+# Seed: download + upsert into the store root. Fails (non-zero) unless the
+# report says store_mode == "market-data"; a fallback-csv seed is refused.
+# Re-running is safe — upsert dedupes on bar time, keeping the newest.
+# e.g. just store-seed                       (ETH/USD since 2018)
+#      just store-seed "SOL/USD" "2021-01-01" 60 "~/Projects/kraken-market-data/store"
+store-seed ticker="ETH/USD" since="2018-01-01" interval="60" store=store_root:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  report="$(mktemp -t ktb-seed-report.XXXXXX.json)"
+  trap 'rm -f "$report"' EXIT
+  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli seed --ticker {{ticker}} --interval {{interval}} --from {{since}} --store {{store}}' > "$report"
+  {{dev}} 'python '"$root"'/tools/store_guard.py '"$report"
+  echo "seeded {{store}}. Check it with: just store-stats && just store-verify"
+
+# Per-source summary of what is in the store: bar counts and the span of
+# each (pair, interval). Read the spans before pinning data_window — a
+# `since` older than a source's start clips to empty.
+store-stats *ARGS="":
+  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli stats --store {{store_root}} {{ARGS}}'
+
+# Gap-scan one source for missing bars. Exits non-zero when the window is
+# not contiguous, which is the check to run before trusting a pinned
+# window: a hole inside the training slice is a silent bias. Everything is
+# passed straight to the sibling CLI (which requires --ticker).
+# e.g. just store-verify --ticker ETH/USD --interval 60
+#      just store-verify --ticker ETH/USD --since 2020-01-01 --until 2026-01-01
+store-verify *ARGS="":
+  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli verify --store {{store_root}} {{ARGS}}'
+
 # ── Tests / checks ───────────────────────────────────────────────────────
 
 # Run the full pytest suite

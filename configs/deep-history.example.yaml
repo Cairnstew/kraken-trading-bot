@@ -4,19 +4,42 @@
 # turned on. Copy it to `models/{TICKER_ID}/{model_name}/config.yaml` (or
 # pass it with `--config` to a training run) only AFTER the store has been
 # seeded — the store must already hold deep bars, because the bot only
-# *reads* it; it cannot backfill years from Kraken (REST caps at ~720 bars).
+# *reads* it; it cannot backfill years from Kraken (REST caps at ~720 bars
+# and says outright that older data cannot be retrieved regardless of
+# `since`).
 #
-# Seed once with the sibling `kraken-deep-history` project, e.g.:
-#   (cd ~/Projects/kraken-deep-history && pip install -e ".[store]")
-#   python ~/Projects/kraken-deep-history/cli.py seed \
-#     --ticker ETH/USD --interval 60 --from 2018-01-01 --store ~/Projects/kraken-market-data/store
-#   python ~/Projects/kraken-deep-history/cli.py verify \
-#     --ticker ETH/USD --interval 60 --store ~/Projects/kraken-market-data/store
+# ── WHY `market_data_store` IS `null` IN configs/default.yaml AND NOT HERE ──
+# A non-null `market_data_store` whose root is missing (or holds no
+# `.parquet` months — which is what a fallback-CSV seed leaves behind)
+# raises `MarketDataStoreUnavailableError`, a ValueError, from
+# `_resolve_store`: the run FAILS rather than quietly degrading to ~721
+# live bars. So this file, which points at a path that exists on exactly
+# one machine, must be opted into deliberately — the shipped default
+# stays `null` so a fresh clone's first run is not an error on a store it
+# does not have. If you hit that error, the message names the fix; the
+# same fix is below.
+#
+# ── Seed once, hermetically (~158s, ~13MB for the four USDT pairs) ────────
+# `just store-plan` is a zero-network dry run (which monthly ZIPs a seed
+# would fetch); `just store-seed` does the download AND asserts the
+# report says store_mode == "market-data". Run them from THIS repo:
+#
+#   just store-plan
+#   just store-seed
+#   just store-verify
+#
+# Do NOT seed from a bare `python cli.py seed` in the sibling checkout.
+# kraken-deep-history's own dev shell carries only pytest — no pandas, no
+# pyarrow — so its `_open_store` catches ImportError, returns
+# FallbackStoreWriter, and writes `.csv` that `MarketDataStore.read`
+# (which globs `*.parquet`) cannot see. The seed then "succeeds", and the
+# bot reads ~721 live bars while the directory looks seeded. The recipes
+# above run the seeder under this repo's dev shell and refuse that mode.
 #
 # Which models would use it: every ticker with an entry in the seeder's
 # ticker map, i.e. ETH/USD, BTC/USD, SOL/USD, XRP/USD (the *USDT spot
 # family). DOGE/USD has no Binance mapping yet and is refused by the seeder
-# (add it to kraken_deep_history/utils.TICKER_SYMBOL_MAP to extend).
+# (add it to kraken_deep_history.utils.TICKER_SYMBOL_MAP to extend).
 # Per-model: keep the same `market_data_store` key in
 # models/{TICKER_ID}/{model_name}/config.yaml so backtest/paper-trade reads
 # (which load the model record's config) resolve the same store root.
@@ -79,6 +102,42 @@ signal_require_ticker: true
 # leg is optional now: a store-only read (source returning no candles)
 # degrades with a warning and serves seeded history.
 market_data_store: ~/Projects/kraken-market-data/store
+
+# Venue provenance, recorded into the model's config.yaml and logged once
+# on the store leg. `kraken-deep-history` seeds Binance-*USDT spot
+# archives, so these bars are NOT Kraken's: the basis has been measured
+# at +5.41 bp of level shift against a 58.30 bp hourly sigma (z-scoring
+# removes the level, but a store-vs-live comparison therefore measures
+# history AND venue together and has to be described that way). Leave this
+# key at the `kraken-live-rest` default only if you seeded nothing and are
+# reading the live leg's own append.
+market_data_store_venue: "binance-spot-archive-seeded"
+
+# --- Pinned window + out-of-sample split (REQUIRED here) -----------------
+# WHY THE PIN IS NOT OPTIONAL IN THIS FILE. With `since`/`until` null,
+# `data_window.has_split` is False by design — `eval_split` is inert
+# against an open-ended window, so `training_frame` and `evaluation_frame`
+# return the SAME object (identity, not a copy) and the backtest replays
+# the bars the model was fitted on. That is an in-sample number, and
+# `configs/default.yaml` says so in as many words. On the live leg the
+# consequence is mild (one month of bars either way); against a seeded
+# store it would throw away the entire point of the store.
+#
+# With the bounds below set, `train` keeps the leading 70% and `backtest`
+# replays only what follows it, so the two are disjoint. Clamp these dates
+# to what you actually seeded (`just store-stats` prints each source's
+# span): a `since` older than the store clips to EMPTY and raises
+# NotEnoughDataError naming the bar counts, which is the honest answer —
+# it is better than a silently shortened window.
+#
+# What the depth actually buys: more normalization samples, more regime
+# diversity, and a longer out-of-sample span. `--timesteps` is unchanged,
+# so the policy still takes ~13% of the store with resets — more BARS is
+# not more gradient steps.
+data_window:
+  since: "2020-01-01T00:00:00Z"   # inclusive
+  until: "2026-01-01T00:00:00Z"   # exclusive
+  eval_split: 0.7                 # train on the leading 70%, hold out the rest
 
 # --- Model metadata -----------------------------------------------------
 # Recorded in models/{ticker_id}/{model_name}/config.yaml at save time, so

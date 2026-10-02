@@ -36,6 +36,8 @@ from __future__ import annotations
 from .agent import RLAgent
 from .backtest import ActionSpaceMismatchError, BacktestResult, backtest_model
 from .data import (
+    DEFAULT_STORE_VENUE,
+    MarketDataStoreUnavailableError,
     NotEnoughDataError,
     SignalFileNotFoundError,
     SignalTickerMismatchError,
@@ -74,6 +76,8 @@ __all__ = [
     "ModelRecord",
     "list_models",
     "register_model",
+    "DEFAULT_STORE_VENUE",
+    "MarketDataStoreUnavailableError",
     "NotEnoughDataError",
     "SignalFileNotFoundError",
     "SignalTickerMismatchError",

@@ -158,7 +158,41 @@ signal_require_ticker: true
 # with the ready-to-copy `configs/deep-history.example.yaml` (covers the
 # ETH/USD, BTC/USD, SOL/USD, XRP/USD *USDT spot family; DOGE/USD is not
 # mapped yet). Consumer contract: `kraken-deep-history/INTEGRATION.md`.
+#
+# WHY THIS STAYS `null` IN THE SHIPPED DEFAULT. A non-null value whose
+# root does not exist (or holds no `.parquet` months) raises
+# `MarketDataStoreUnavailableError` from `_resolve_store` — a ValueError,
+# so it fails the run rather than degrading. Pointing the shipped default
+# at a store path would therefore turn every first run on a fresh clone
+# into an error, for a store that clone does not have. The flip belongs in
+# a per-model `config.yaml` or in `configs/deep-history.example.yaml`,
+# which is why those files carry the header explaining how to seed first.
 market_data_store: null
+
+# --- Store venue provenance (label only) ---------------------------------
+# Which venue the bars in the store came from. Read ONCE on the store leg
+# and logged with the store root, so a run log states it: nothing else in
+# the output distinguishes them.
+#
+#   kraken-live-rest              (default) an UNSEEDED store: every bar in
+#                                 it was appended by this run's own live
+#                                 fetch leg, so it is Kraken's.
+#   binance-spot-archive-seeded   a store seeded by `kraken-deep-history`,
+#                                 which is Binance-*USDT spot. Its basis
+#                                 against Kraken has been measured at
+#                                 +5.41 bp of level shift against a
+#                                 58.30 bp hourly sigma: harmless for
+#                                 z-scored features, but it must be
+#                                 LABELLED, because a store-vs-live
+#                                 comparison measures history AND venue
+#                                 together.
+#
+# Recorded in models/{ticker_id}/{model_name}/config.yaml beside
+# `n_features`/`n_bars`, i.e. on the artifact a reviewer already opens.
+# It lives here rather than in the seeder's `_meta.json` because this repo
+# consumes kraken-market-data as a PINNED flake input (rev 055d7f6): a
+# sibling edit would not reach `nix develop` without a lock bump.
+market_data_store_venue: "kraken-live-rest"
 
 # --- Data window (pinning + train/eval split) ---------------------------
 # WHY THIS EXISTS. `train` and `backtest` each fetched their own FRESH
@@ -194,9 +228,16 @@ market_data_store: null
 # `n_bars` on the backtest result reports the bars ACTUALLY replayed: a
 # run can finish with no error while replaying a handful of bars of a much
 # larger frame, so check it before trusting any return next to it.
-# Boundaries are applied as a clip on the fetched frame, not pushed into
-# the read, so a pinned window still needs `--pages` large enough to cover
-# it (and `eval_split` large enough to leave a tradable eval slice).
+# Boundaries are applied as a clip on the frame the read returned, not
+# pushed into the read, so on the LIVE leg a pinned window still needs
+# `--pages` large enough to cover it (and `eval_split` large enough to
+# leave a tradable eval slice). With a store-backed read the frame is
+# whatever the store already holds, so the pin is what selects the
+# window: an older `since` than the live leg could ever serve becomes
+# reachable — and a `since` older than the store clips to EMPTY, which
+# raises NotEnoughDataError naming the bar counts. That error is the
+# honest answer: pinning past your data is a configuration mistake, not
+# something to paper over with a shorter window.
 data_window:
   since: null
   until: null

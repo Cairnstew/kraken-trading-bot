@@ -416,6 +416,16 @@ def backtest_model(
                 record.config or {},
                 None,
             ),
+            # Provenance label only, same four sources: the model's own
+            # config is the record of what its training bars came from,
+            # so a run config may not contradict it silently.
+            market_data_store_venue=_resolve_env_setting(
+                "market_data_store_venue",
+                env_kwargs,
+                run_cfg,
+                record.config or {},
+                None,
+            ),
         )
     else:
         df = data
