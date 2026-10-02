@@ -1,565 +1,529 @@
-# RESEARCH-1 — gap G1: the signal seam that ships with an unreadable path
+# RESEARCH-1 — CAND-1: market microstructure, and what `/0/public/Trades` actually buys
 
-**Pass:** 2026-10-02 · **Role:** Researcher 1 (research only; no source/config/test files modified)
-**Target:** `kraken-trading-bot` @ `5aa9bd5` (branch `master`), plus four sibling repos read-only.
+**Pass:** audit-pipeline-1002 · **Role:** Researcher 1 (research only; no source/config/test files modified)
+**Gap:** CAND-1 (`AUDIT.md` §3) + the G2-R2 refutation in §2
+**HEAD at start:** `ddd293f` · **Measured against:** live Kraken Spot REST, keyless, 2026-10-02 ~12:51–14:10Z
 
-> **Two corrections to AUDIT.md's G1 that the architect must read first.**
-> 1. The shipped path in `configs/default.yaml:79` is
->    `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl` — **not**
->    `~/Projects/kraken-market-data/signals/...` as the task brief states. The defect is
->    identical either way; only the spelling differs.
-> 2. G1's central consequence claim — "12 allow-listed columns … are permanently zero" and
->    "`signal_observed == 0.0` on every bar" — is **measurably wrong in an important way**.
->    Measured: the observation is **52 columns wide**, the signal columns are **absent**, not
->    zero-filled, and `signal_observed` **is not in the observation at all**. See F4. The
->    corrected picture is *worse* for auditability and *different* for the fix.
+> **Slot reuse.** This file previously held the *prior* pass's G1 research
+> (signal seam), committed at `444fe1f`. The same slot was reused this run —
+> `RESEARCH-3.md` was overwritten identically at `ddd293f`. Prior content is
+> still in git history; nothing was deleted.
 
 ---
 
-## 0. Method
+## 0. The answer in five lines
 
-Read in full: `kraken_trading_bot/rl/{data,backtest,features,export,train,agent,registry,paper_trade}.py`
-(the cited regions and every `Path(`/`expanduser` site), `configs/*.yaml`, `systemd/*`,
-`nix/{module,default}.nix`, `justfile`, and the contract-assertion tests.
-
-Ran, live, from a **non-repo CWD** (`/tmp/g1-probe`, so nothing depends on where you stand):
-a real `merge_extra_features` call against a materialised real funding JSONL; a four-way
-observation-width comparison; a verbatim replay of the existing test body against deliberately
-broken config values; and `systemctl --user` / `ls` probes of the real filesystem.
-
-Every file I touched lives under `/tmp/g1-probe/`. Nothing in the repo was written except this
-file.
+1. **`/0/public/Trades` is keyless, paginable, and reaches each pair's entire listing
+   history** — XBT/USD to 2013-10-06, ETH/USD to 2015-08-07, SOL/USD to 2021-06-17.
+   Measured, not remembered. The floor is per-pair listing, *not* a retention clamp.
+2. **It is a strict superset of the OHLCV frame.** A fully-paged 1-hour ETH/USD bar,
+   deduplicated on `trade_id`, reproduces the candle's `volume`, `count` and `vwap` with
+   **delta exactly 0.0000000000**. There is no join-key, unit, or basis problem.
+3. **6 of the 7 derived features the audit named are point-in-time** (present on bar 0, zero
+   marginal warm-up) and need nothing but `/public/Trades`.
+4. **The 7th — realized spread — does not work on Kraken spot at any resolution I tested.**
+   Roll is undefined on 13/16 one-minute bars and absurd where defined; Corwin-Schultz is
+   negative (floored to 0) on 11/15. The quoted spread is **0.47 bps median**; the classic
+   estimators assume a market where that is large. Honest answer: **drop it**, or take it
+   forward-only from `/public/Spread` where it is *measured*, not estimated.
+5. **`/public/Spread` ignores `since` entirely** — stronger than the audit's "bounded". It is
+   not backfillable at all. So the answer splits: **tape = historical, spread + depth =
+   forward-only recorder.**
 
 ---
 
-## 1. FINDINGS
+## 1. Q1 — What is on `/0/public/Trades`?
 
-### F1 — The defect is real, reproduced, and CWD-independent
+### 1.1 Documented contract
 
-`kraken_trading_bot/rl/data.py:363`
+From `https://docs.kraken.com/api/docs/rest-api/get-recent-trades` (fetched 2026-10-02):
 
-```python
-path = Path(extra_features_file)          # :363  no expanduser()
-if not path.is_file():                    # :364
-    _LOGGER.warning(...)                  # :365-367
-    return df                             # :368  <- silent skip
-```
-
-The same file, read both ways, through the real seam (`merge_extra_features` on a real
-200-bar ETH/USD frame, real JSONL at the expanded path):
-
-| spelling passed to the seam | columns the merge added |
+| Property | Value |
 |---|---|
-| `~/Projects/.../eth_usd_funding.jsonl` (as shipped) | **`[]`** — nothing |
-| `/home/seanc/Projects/.../eth_usd_funding.jsonl` (same file, expanded) | `['funding_rate_prediction','vol24h','bid','ask','signal_observed']` |
+| Auth | `security: []` — **no API key, no signature, no tier** |
+| Row shape | `[<price>, <volume>, <time>, <buy/sell>, <market/limit>, <misc>, <trade_id>]` |
+| `buy/sell` | `b` / `s` (abbreviated — **not** `buy`/`sell`) |
+| `market/limit` | `m` / `l` (abbreviated) |
+| Page size | `count`, 1–1000, default 1000 |
+| `last` | *"ID to be used as `since` when polling for new trade data"* |
+| `since` | documented `type: string`, example `'1616663618'` |
 
-The only difference is the tilde. `yaml.safe_load` preserves `~`; `Path("~/x")` looks for a
-directory literally named `~` under the CWD, which does not exist and is not `.resolve()`d.
-This is not a CWD accident — it is wrong from **every** directory, including the repo root.
+### 1.2 Two traps the docs understate, both measured
 
-### F2 — It is a CLASS of three, not a one-off: three config-path sites omit `expanduser()`
+**Trap 1 — `last` is in NANOSECONDS.** Measured: `last = 1790945549598264546`;
+`/1e9 = 1790945579.934603` = 0.065 s before the `Date` header. So the cursor round-trips
+**only if you multiply by 1e9 on the way back in**. `kraken-python`'s
+`manager.recent_trades` returns it as a bare `str` (`manager.py:198`) and its own docstring
+implies seconds. Passing it back verbatim lands you in 1970 and re-fetches the pair's
+listing date.
 
-I enumerated every place a config-supplied path becomes a `Path`.
+**Trap 2 — rows are 7 fields, not 6.** `Trade.from_public_row` (`models.py:374-385`)
+reads indices 0-5 and **silently drops `trade_id`** — the single field a backfiller needs
+for idempotent dedup. Measured: 3656 rows collected across 4 pages carried only 3653 unique
+`trade_id`s (3 boundary duplicates), which inflated derived volume by exactly 7.278.
+Deduplicating on `trade_id` closed the gap to **0.0000000000**. This is the only
+correctness defect on the whole path.
 
-| site | config key | `expanduser()`? | blast radius |
+### 1.3 Retention — measured, exhaustively
+
+Probing `since` at ages 1 h → 12 y against live XBTUSD:
+
+| Age | Rows | Oldest returned | Reached `since`? |
 |---|---|---|---|
-| `data.py:363` | `extra_features_file` / `funding_features_file` / `social_features_file` | **NO** | **highest** — 12+ columns, every consumer |
-| `data.py:1054` | `market_data_store` | **NO** | **high** — silently downgrades deep history (G3) |
-| `train.py:82` | `--config` for `train` | **NO** | **medium** — see F3 |
-| `backtest.py:219` | `--config` for `backtest` | yes | correct reference |
-| `agent.py:50` | `models_root` | yes | correct |
-| `paper_trade.py:140` | `models_root` | yes | correct |
-| `registry.py:131` | models root (`models_root()`) | yes | correct |
-| `features.py:184`, `features.py:210` | normalization `.npz` | **NO** | low — built from `models_root` + join, so parent is already expanded |
-| `export.py:250`, `export.py:263` | export CSV root | **NO** | low — relative default, user-supplied |
-| `tools/model_matrix.py:434,450,1593` | spec / results / work_dir | yes | correct |
+| 1 h … 30 d | 1000 | as requested | yes |
+| 1 y / 2 y / 3 y | 1000 | as requested | **yes** |
+| 4 y … 15 y | 1000 | as requested | **yes** |
+| `since`=2013-01-01 | 1000 | 2013-01-01 01:44 | yes |
+| `since`=2011-06-01 | 1000 | **2013-10-06 21:34:16** | clamped |
+| `since`=2012-06-01 | 1000 | **2013-10-06 21:34:16** | clamped |
+| `since`=2013-10-07 | 1000 | 2013-10-07 20:50 | yes |
 
-**`data.py:1054` is a second, currently-latent instance of the identical bug**, and the audit
-missed it: `configs/deep-history.example.yaml:81` ships
-`market_data_store: ~/Projects/kraken-market-data/store`, and `_resolve_store` does
-`MarketDataStore(Path(market_data_store))` with no `expanduser()`. The moment anyone enables
-deep history, **G3's fix silently fails the same way** — and worse, `_resolve_store` raises a
-clear `ValueError` only when the *package* is missing, never when the path is wrong, so it
-would go straight to `store.upsert` against a directory it creates relative to the CWD.
+`since` is honoured exactly; 2011 and 2012 both clamp to the *same* instant, which is the
+archive floor for XBTUSD. Crucially the floor is **per-pair listing date, not a retention
+window** — every pair clamps to its own launch:
 
-Note also that `tools/model_matrix.py` — the harness, not the library — is the one component
-that gets this consistently right (three `expanduser()` sites), which is why the matrix runs
-never tripped over it.
-
-### F3 — The same class of bug produces an *opposite* asymmetry in `train` vs `backtest`
-
-`train.load_train_config` (`train.py:80-88`) returns `{}` when the path is not a file.
-`backtest._load_run_config` (`backtest.py:218-224`) raises `FileNotFoundError`. Both take a
-CLI `--config` that is a **plain string** (`cli.py:149-152`, `:250-256` — no `type=Path`, so
-argparse does not expand it either).
-
-So `kraken-trading-bot train --config ~/my.yaml` silently trains on **CLI defaults with no
-warning**, while `kraken-trading-bot backtest --config ~/my.yaml` refuses to run. Two paths,
-one flag, opposite failure modes. The backtest behaviour is the correct one — its docstring
-(`backtest.py:208-215`) says so explicitly: *"Silently running frictionless because of a typo
-in the config path is precisely the failure the `fee_rate`/`slippage` echo on the result exists
-to make visible — better to refuse the run."* That reasoning applies verbatim to G1 and was
-not applied to the signal seam.
-
-### F4 — CORRECTION: the failure mode is ABSENCE, not zero-fill — and `signal_observed` is itself absent
-
-AUDIT.md G1 says the 12 columns are "permanently zero" and that `signal_observed == 0.0` on
-every bar. Measured against the real pipeline with the real `configs/default.yaml`
-(`feature_windows: [1,4,24]`, all five `feature_groups`):
-
-| scenario | observation width | `_SIGNAL_COLUMNS` in the observation | `microstructure` |
+| Pair | Oldest trade on record | Pair | Oldest trade on record |
 |---|---|---|---|
-| **A** all three keys `null` | **52** | 3 / 18 — only `vwap_dev`, `trade_count_zscore_20`, `volume_per_trade` | produces nothing |
-| **B** configured, file missing (the shipped tilde path, as written) | **52** | 3 / 18 — identical to A | produces nothing |
-| **C** configured, file present, 1 record | **59** | 10 / 18 | produces `spread` |
-| **D** configured with a tilde, absent under that spelling | **52** | 3 / 18 | produces nothing |
+| XBTUSD | 2013-10-06 21:34:16 | ADAUSD | 2018-09-28 13:25:00 |
+| ETHUSD | 2015-08-07 14:03:25 | DOGEUSD | 2019-12-19 18:20:38 |
+| XRPUSD | 2017-05-18 15:46:56 | DOTUSD | 2020-08-18 17:02:07 |
+| | | SOLUSD | 2021-06-17 15:32:57 |
 
-Three consequences the architect needs:
+**Answer: Trades does NOT share the ~721-bar OHLC ceiling. It has no practical ceiling at
+all** — it goes back to the beginning of the market. This is the single most consequential
+measured fact in this document.
 
-1. **`B == A`, bit for bit.** A configured-but-unreadable seam is *indistinguishable from a
-   `null` seam*. `data.py:368` returns `df` unchanged; the columns never reach `df.columns`;
-   `_add_signals_features` (`features.py:604`, `if col in df.columns`) skips them. They are
-   **absent from the observation**, not zero.
-2. **`signal_observed` is not in the observation at all.** The freshness pair is written by the
-   same seam (`data.py:487`, `_combine_freshness`), which the missing file skipped. So the
-   mechanism designed to make absence *auditable inside the observation* is itself absent.
-   The agent is not told "no reading behind this"; it is told nothing at all. That is a
-   strictly worse diagnostic position than the audit describes, and it is why nothing
-   downstream could have flagged it.
-3. **The widths are 52 → 59, not 49 → 55.** The shipped default already carries the three
-   OHLCV-derived scalars (`vwap_dev`, `trade_count_zscore_20`, `volume_per_trade` —
-   `features.py:64-66`), which is the widening `features.py:270` calls "49 → 55". Activating
-   the funding channel adds **7** columns: `basis`, `funding_rate`, `funding_rate_prediction`,
-   `signal_age_hours`, `signal_observed`, `spread`, `vol24h` (measured set difference; note
-   `bid`/`ask` reach the frame but are correctly withheld from the observation per
-   `features.py:74-80`). Any doc, test or matrix cell that hardcodes 49 or 55 is wrong.
+### 1.4 Rate limits — documented *and* measured
 
-### F5 — The width guard CANNOT catch this, and the audit's reason for why is not the real one
+Documented (`https://docs.kraken.com/api/docs/guides/spot-rest-ratelimits`): tier-based call
+counter. **Starter (keyless) max 15, decay −0.33/sec.** Ledger/trade-history calls cost 2;
+all other calls cost 1 — so `Trades`/`Spread`/`Depth`/`OHLC` are all cost **1**.
 
-`features.check_feature_width` (`features.py:262-310`) compares the model's `.npz`
-`feature_names` against the live `compute()` columns **by name**, and is explicitly built to
-be non-self-referential (`features.py:244-259` explains it replaced a tautological count check).
+Measured, cache-busted with unique `since` values:
 
-The audit's claim — "it checks width, not NaN, so it PASSES while the data is absent" — is
-**half right and misses the point**. By-name comparison means the guard *would* fire on a
-52-trained model replayed against a 59-wide pipeline. So the guard is a real protection against
-the *asymmetry* (trained degraded, replayed live). It is **silent** on the thing we care about:
-**nothing records what width the shipped config is *supposed* to produce.** There is no
-"expected width for this config" anywhere, so a consistently-degraded 52 is indistinguishable
-from a correct 52. And with `models/` empty but for `.gitkeep` (measured), no model exists, so
-the guard is not even in the loop today.
-
-### F6 — The test that *should* have caught it is provably vacuous
-
-`tests/test_rl_signal_config_wiring.py:711-734`,
-`test_config_points_at_a_real_funding_file_with_a_12h_bound`. Docstring: *"The activation that
-keeps the three funding columns non-silent."* Full assertion body, replayed verbatim:
-
-```python
-assert funding, "funding_features_file must name a real path"   # :724  non-empty string
-assert str(funding).endswith(".jsonl")                          # :725  suffix check
-assert default_cfg["signal_max_age_hours"] == 12                # :726
-assert deep_cfg["funding_features_file"]                        # :733
-assert deep_cfg["signal_max_age_hours"] == 12                   # :734
-```
-
-Measured against four different values:
-
-| `funding_features_file` | test verdict |
+| Probe | Result |
 |---|---|
-| `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl` (shipped, broken) | **PASSES** |
-| `/definitely/not/here/nope.jsonl` | **PASSES** |
-| `/root/nope.jsonl` | **PASSES** |
-| `/tmp` (a directory, not a file) | fails — only because it lacks the `.jsonl` suffix |
+| 30 calls, no sleep, same URL | 30/30 OK — **Cloudflare served these** (`CF-Cache-Status: HIT`, `max-age=2`) |
+| 25 calls, unique `since` | 25/25 OK |
+| 60 calls, unique `since`, 0.1 s apart | **throttle at call 31** |
+| repeated burst | throttle at call **30**, **30** (reproducible) |
+| sustained 1 req/s × 20 | **20/20 OK** |
+| sustained 0.5 req/s × 20 | **20/20 OK** |
+| after 30 s idle | clean |
 
-It never calls `.expanduser()`, never calls `.is_file()`, never opens the file, and never calls
-`merge_extra_features` with the configured value. It constrains the *string shape*, not the
-*resolution*. Under the prior pass's hard requirement — a test that would pass without the fix
-proves nothing — this test is **vacuous** and is the proximate reason the defect shipped.
-
-Two further blind spots in the same family:
-- `tests/test_model_matrix.py:1416-1418` asserts on the **verbatim text of the bug's own
-  warning**: `"Extra features file not found: ... -- skipping signal merge"`, captured from a
-  real run. It pins the buggy behaviour as expected. It will need updating in lockstep.
-- `tools/model_matrix.py:494-500` records `base_config_present` for six keys, and
-  `:1322-1330` only ever checks presence of `data_window`/`fee_rate`/`slippage`. The three
-  signal keys are not in the presence list at all, and presence is not resolution.
-
-### F7 — The producer already creates the directory; the consumer never needs to
-
-- `kraken-funding-rates/kraken_funding_rates/export.py:140` and `:173` both
-  `path.parent.mkdir(parents=True, exist_ok=True)` before writing. `write_jsonl` is the exact
-  function behind `pull --output … --append` (`export.py:120-158`).
-- `kraken-social-signals/kraken_social_signals/export.py:140,148` — same.
-- **`ticker-news-signals/ticker_news_signals/export.py:120-127` does NOT** — `write_jsonl`
-  opens for write with no `mkdir`.
-
-Live filesystem state: `signals/` does not exist, but `.gitignore:65` ignores `signals/`, and
-git cannot track an empty directory — so **its absence is the correct state of a clean
-checkout**, not a defect. It is created by the first `funding-pull`. AUDIT.md G1 item 2
-overstates this. The real gap in that item is the second half: `systemctl --user is-enabled
-kraken-trading-bot-funding.timer` → **`not-found`** (confirmed live), `is-active` → `inactive`.
-
-### F8 — NEW, LATENT, AND SEVERE: the funding channel cannot trip the ticker guard at all
-
-`data._TICKER_FIELD = "ticker"` (`data.py:111`). `_filter_ticker` (`data.py:504-545`) falls
-through to *"treat it as a one-ticker file and merge every record"* with a WARNING when the
-field is absent (`data.py:537-545`).
-
-The **real** funding record shape, taken from the producer's own `to_dict`
-(`kraken-funding-rates/kraken_funding_rates/models.py:50-65`) and materialised live:
+**Verbatim throttle response — and it is a trap:**
 
 ```
-keys: ask, basis, bid, funding_rate, funding_rate_prediction, index_price,
-      mark_price, open_interest, spot_pair, symbol, timestamp, vol24h
-has 'ticker'? False
+HTTP/2 200        <-- NOT 429
+{"error":["EGeneral:Too many requests"]}
 ```
 
-News and social **do** emit it (`ticker-news-signals/.../models.py:96`,
-`kraken-social-signals/.../models.py:162`). **Funding alone does not.**
+Three consequences:
 
-So the one channel that is actually configured (`default.yaml:79`, non-null) is the one channel
-where `signal_require_ticker: true` (`default.yaml:118`) is inert. `configs/default.yaml:78`
-explicitly invites a second pair to be configured — *"Point a second pair's model at its own
-file, e.g. `signals/sol_usd_funding.jsonl`"* — and nothing in the code stops a SOL model being
-pointed at the ETH file. ETH funding would merge onto SOL bars, silently, with only a WARNING
-that most users will read once and never again. This is the exact class of defect
-`signal_require_ticker` was written to prevent (`data.py:132-140`, `default.yaml:109-117`).
+- `kraken-python` gets this right: `transport._request` checks the `error` array on a 200 and
+  `_RATE_LIMIT_MARKERS` includes `"EGeneral:Too many requests"` → raises `RateLimitError`
+  (`transport.py`, `errors.py`). **No fix needed there.**
+- But `KrakenTransport.__init__` defaults `min_interval=0.0` and its docstring says
+  *"~15-20 calls/s depending on tier"* — **that figure did not reproduce.** Measured ceiling
+  is ~30 burst, safe sustained ~1 req/s. A backfiller must set `min_interval` explicitly
+  (~0.8–1.0) or it will be throttled silently on a 30-call page burst.
+- `manager.recent_trades` has **no retry**. `CAND-4`'s finding (no retry/backoff on the read
+  path) applies verbatim to any tape backfiller.
 
-This is the one part of G1 whose root cause is genuinely on the **producer** side.
+### 1.5 Backfill cost — priced
+
+`OHLCV.count` reconciles exactly with the tape (§2.1), so trades/day is one call per pair
+from the OHLCV frame — no need to page the tape just to size the job:
+
+| Pair | trades/day | pages/day | 30 d @1 rps | 30 d @3 rps | 90 d @3 rps | 365 d @3 rps |
+|---|---|---|---|---|---|---|
+| XBTUSD | 111,666 | 111.7 | 55.8 h | 18.6 min | 55.8 min | 3.8 h |
+| ETHUSD | 54,340 | 54.3 | 27.2 h | 9.1 min | 27.2 min | 1.8 h |
+| XRPUSD | 44,029 | 44.0 | 22.0 h | 7.3 min | 22.0 min | 1.5 h |
+| SOLUSD | 40,907 | 40.9 | 20.5 h | 6.8 min | 20.5 min | 1.4 h |
+| LTCUSD | 17,741 | 17.7 | 8.9 h | 3.0 min | 8.6 min | 36 min |
+| ADAUSD | 14,525 | 14.5 | 7.3 h | **2.4 min** | 7.3 min | 30 min |
+| DOGEUSD | 13,377 | 13.4 | 6.7 h | 2.2 min | 6.7 min | 27 min |
+| DOTUSD | 12,133 | 12.1 | 6.1 h | **2.0 min** | 6.1 min | 25 min |
+
+**30 days of full-depth tape for ADAUSD is a 2.4-minute job.** This is a minutes-scale
+backfill, not a project.
+
+**Stated honestly:** this backfills *features*, not *bars*. CAND-3's ~721-bar training
+ceiling is untouched by any of this — `train` still only gets 721 OHLCV bars. The tape makes
+microstructure features available at any depth; whether a model can *train* on them is
+CAND-3's question. Two of them interact: a tape-derived store keyed on the tape's own
+timestamps could in principle carry a feature frame deeper than 721 bars, which would
+interact with CAND-3's store work rather than duplicate it.
 
 ---
 
-## 2. THE FULL SET OF PATH-RESOLUTION SITES (ranked)
+## 2. Q2 — Which derived features are worth building?
 
-| # | site | key | fix? | priority |
+### 2.1 First, the load-bearing fact: the tape *is* the OHLCV frame
+
+Full pagination of ETH/USD bar `2026-10-02 12:00Z`, deduplicated on `trade_id`:
+
+| Quantity | From tape | From candle | Delta |
+|---|---|---|---|
+| `volume` | 2681.28626882 | 2681.28626882 | **0.0000000000** |
+| `count` | 3653 | 3653 | **0** |
+| `vwap` | 2753.315371 | 2753.31 | exact at 2 dp |
+| `open` | 2745.72 | 2745.72 | exact |
+| `high` / `low` / `close` | 2765.75 / 2738.20 / 2755.00 | identical | exact |
+
+Every derived feature below is therefore **consistent by construction** with the frame the
+RL pipeline already loads. There is no basis, no unit conversion, no join key — the trade's
+timestamp and the bar's timestamp are the same integer.
+
+### 2.2 The feature table
+
+Measured on the same bar: `n=3653`, `V=2681.2863`, `vwap=2753.3154`,
+`O=2745.72 H=2765.75 L=2738.20 C=2755.00`, quote volume 7,382,426.70 USD.
+
+| # | Feature | Exact formula | Look-back | Warm-up | Measured |
+|---|---|---|---|---|---|
+| 1 | `signed_volume_imbalance` | `(Σ_{b}v − Σ_{s}v) / (Σ_b v + Σ_s v)` | none | **PIT** | **+0.008434** |
+| 2 | `vwap_close_gap` | `close / vwap − 1` | none | **PIT** | **+0.00061185** |
+| 3 | `trade_size_p50/p90/p99` | quantile of bar trade volumes | none | **PIT** | 0.0295 / 1.7892 / 12.3312 |
+| 4 | `trade_size_tail_ratio` | `p99 / p50` | none | **PIT** | **418.2×** |
+| 5 | `kyle_lambda` (per bar) | `Σ(p−p̄)·(q·v) / Σv²` , `q=+1/−1` | none | **PIT** | **−1.300e−02** |
+| 6 | `large_trade_fraction` | `Σ{v : v > 5·p50} / V` | none | **PIT** | **0.975688** |
+| 7 | `amihud_illiquidity` | `\|close/close₍ₜ₋₁₎ − 1\| / (V·vwap)` | 1 bar | 1 bar | quote-vol 7.38e6 |
+| 8 | `realized_spread` | *see §2.3* | — | **FAILS** | see below |
+
+**6 of 7 build, and 6 of 7 are point-in-time.** That is the answer to the question that
+mattered: **a point-in-time microstructure column can be present on bar 0.** Only `amihud`
+costs one bar, which is dominated anyway.
+
+### 2.3 The honest negative: realized spread does not work here
+
+The audit lists "realized spread" first among the Trades-derived families. It is the one
+that **fails**, and the reason is structural, not a data gap.
+
+The *effective* spread `2·|p − m|/m` needs a mid `m`. **Trades has no book** — it gives
+price, volume, side, type. And the mid is only available from `/public/Spread`, which
+(§3.2) **ignores `since`**. So the effective spread has no historical route.
+
+The two tape-only substitutes were tested at both 1-hour and 1-minute resolution:
+
+**Roll (1984)** — `S = 2·Var(Δp) / −Cov(Δp, Δq)`, `q` = trade sign, which Trades *does*
+provide:
+
+| Resolution | Bars where `Cov(Δp,Δq) < 0` (defined) | Value where defined |
+|---|---|---|
+| 1 h × 3 | **0 of 3** | undefined everywhere |
+| 1 min × 15 | 2 of 15 | **+260,551 bps** and **+13,450 bps** (2600 %, 134 %) |
+
+**Corwin-Schultz** — `S = 2(e^α−1)/(1+e^α)` from the tape's own per-bar H/L:
+
+| Resolution | Result |
+|---|---|
+| 1 h × 2 pairs | −106.25 bps, −95.04 bps → floor 0 |
+| 1 min × 15 | negative on **11 of 15** → floor 0 |
+
+**Why:** the quoted spread is currently **0.47 bps median** (`/public/Spread`, min 0.04 bps)
+on a 0.2759 tick. A 1-hour ETH bar spans ~98 bps, swamping the spread ~100×. Even 1-minute
+bars (~2–5 bps) are at the same order as the spread, where these estimators are known to be
+unstable. Both estimators assume a market where microstructure noise is a material fraction
+of the price variation. Kraken ETH/USD is not that market.
+
+**Recommendation: drop realized spread from the historical feature set.** If the architect
+wants a spread column at all, take the **quoted** spread forward-only from `/public/Spread`
+(or from `Depth`) — directly measured, no estimator, no failure mode. Note the codebase has
+already reserved the name for this at `features.py:96-98`: *"A future tick-level tape
+recorder must use `realized_spread_bps` instead of competing for this name"* — that comment
+is now shown to be aspirational, and the name is free to use for something else.
+
+### 2.4 What is already in the frame, for free
+
+Two of the four strongest items are **already computed** and just not consumed as
+microstructure:
+
+- `vwap_close_gap` ≡ the shipped `vwap_dev` (`data.py:859`). My measured +0.00061185 is
+  that column. **Zero new work**; it is already on the allow-list and in the observation.
+- `amihud_illiquidity`'s denominator is the quote volume the tape already reconciles.
+
+So the genuinely new, non-duplicating wins are **#1 (signed imbalance), #4 (size-tail ratio),
+#5 (Kyle's lambda), #6 (large-trade fraction)** — all point-in-time, all needing only the
+tape's `volume` and `side` columns.
+
+---
+
+## 3. Q3 — The three sources, compared honestly
+
+### 3.1 `/public/Trades` — keyless, historical, **the winner**
+
+- Auth: none. Rate cost 1. Shape: `[[price, vol, time, side, type, misc, trade_id], ...]` + ns cursor.
+- History: **full, per-pair from listing.** Backfillable today.
+- Reduces to a per-(ticker, timestamp) vector: yes — 6 scalars per bar.
+- Parsing: **already done.** `Trade.from_public_row` + `to_dict()` exist; the only gap is
+  the dropped `trade_id`.
+
+### 3.2 `/public/Spread` — keyless, **not backfillable at all**
+
+This **strengthens** the audit's G2-R2 correction. The audit says *"`since` accepted but
+bounded"*. Measured, the truth is stronger and simpler:
+
+| `since` passed (XBTUSD) | Rows | Oldest returned |
+|---|---|---|
+| *(none)* | 250 | 12:53:41 |
+| −30 m | 250 | **12:53:41** |
+| −1 h / −6 h / −1 d / −3 d / −7 d / −30 d / −90 d / −400 d | 250 | **12:53:41** |
+| −1 h in **seconds** | 250 | **12:53:41** |
+| −7 d in seconds | 250 | **12:53:41** |
+| 2013-01-01 in seconds | 250 | **12:53:41** |
+
+**`since` is accepted without error and completely ignored**, in either unit. Every response
+is the trailing ~250 change-driven samples — **24 s to 98 s of wall clock** depending on the
+pair's volatility (XBTUSD 38 s, DOTUSD 98 s, XRPUSD/XLMUSD 24 s). It is change-driven, not
+time-driven, so the window is not even a fixed duration.
+
+Also: **`Spread.last` is in SECONDS** (`1790945670`) while **`Trades.last` is in
+NANOSECONDS**. Two adjacent endpoints, same parameter name, incompatible units. A generic
+paginator over `manager.spread` and `manager.recent_trades` will corrupt one of them.
+
+→ **Requires a forward-only recorder + timer. Cannot be backfilled.**
+
+### 3.3 `/public/Depth` — keyless snapshot, **forward-only, and the only source for the
+dormant consumer's actual columns**
+
+No `since` in `client.depth` (`client.py:116-121`). Measured: passing `since=30 days ago` is
+**accepted silently and ignored** — Kraken drops unknown params rather than erroring, so this
+fails silently rather than loudly.
+
+`count` is honoured and goes deeper than the engine uses:
+
+| `count` | bids | asks |
+|---|---|---|
+| 1 | 1 | 1 |
+| 10 | 10 | 10 |
+| 100 (default) | 100 | 100 |
+| 500 | 500 | 500 |
+
+Rows are `[price, volume, timestamp]`. **`BookLevel` already models all three** with a
+comment *"0 when the API omits it"* — and it does omit it: measured `ask[0]` timestamp
+`1790945670` vs `bid[0]` `1790945702`, a 32 s gap **within one supposedly atomic snapshot**.
+Book-level timestamps are not coherent; do not build features on them.
+
+Feeding `features.py:586-590` directly (`bid_vol`, `ask_vol` summed over N levels):
+
+| Pair | `bid_vol` | `ask_vol` | → `order_book_imbalance` | quoted spread |
 |---|---|---|---|---|
-| 1 | `data.py:363` `merge_extra_features` | 3 signal keys | **no** | **P0 — G1** |
-| 2 | `data.py:1054` `_resolve_store` | `market_data_store` | **no** | **P0 — same bug, G3 blocker** |
-| 3 | `train.py:82` `load_train_config` | `--config` | **no** | **P1 — silent `{}`** |
-| 4 | `export.py:250,263` | export CSV root | no | P2 — relative default |
-| 5 | `features.py:184,210` | `.npz` | no | P3 — parent already expanded |
-| 6 | `backtest.py:219` | `--config` | yes | reference implementation |
-| 7 | `agent.py:50`, `paper_trade.py:140`, `registry.py:131` | `models_root` | yes | correct |
-| 8 | `tools/model_matrix.py:434,450,1593` | spec/results/work_dir | yes | correct |
+| ETHUSD | 34.007 | 64.211 | **−0.307520** | 0.036 bps |
+| ADAUSD | 46954.18 | 28744.17 | **+0.240560** | 1.396 bps |
+| DOTUSD | 11229.41 | 11048.74 | **+0.008110** | 3.261 bps |
 
-One shared helper covers 1, 2, 3, 4 and 5 and prevents the sixth instance tomorrow.
+The imbalances are non-degenerate and cross-pair-varied, so this is genuinely informative —
+**but it is a single instantaneous snapshot of resting orders.** The ETHUSD top-1 depth ratio
+was **144.6** (one 6.65-unit bid against a 0.046-unit best ask), which is a snapshot of one
+resting order, not a market state. And the merge seam will `ffill` it, so the observation
+will show a 10-level snapshot held constant for up to `signal_max_age_hours` (default 12).
+**That is how a noisy instantaneous quantity becomes a stale-looking feature** — the same
+failure mode as CAND-2's inert funding channel, one column-pair narrower.
+
+→ **Requires a forward-only recorder + timer. Genuinely useful, but it is the weaker source.**
+
+### 3.4 Verdict
+
+| | Historical? | Needs recorder+timer? | Yields | Verdict |
+|---|---|---|---|---|
+| **`/public/Trades`** | **YES — full** | no | 6 PIT scalars + 1 rolling | **Build this first** |
+| `/public/Spread` | **no** (`since` ignored) | yes | quoted spread (measured) | add later, forward-only |
+| `/public/Depth` | no | yes | `bid_vol`/`ask_vol` → imbalance | lights the dormant consumer, forward-only |
+
+The two forward-only sources are not alternatives to Trades; they are **complements for the
+one feature Trades cannot deliver**. That is the clean architectural split.
 
 ---
 
-## 3. BEHAVIOUR WHEN A CONFIGURED FILE IS MISSING vs EMPTY vs STALE
+## 4. Q4 — Keyless vs paid
 
-Current behaviour, all three, is a silent `return df`:
+**Everything in this recommendation is keyless. No paid tier, no API key, no account.**
 
-| condition | site | current | problem |
+- `/public/Trades`: OpenAPI `security: []`. Verified with **no `API-Key` header at all** —
+  every measurement in this document was made unauthenticated.
+- `/public/Spread`, `/public/Depth`, `/public/OHLC`: same, all verified keyless.
+- Documented Starter tier (keyless) counter: max 15, decay −0.33/s, cost 1 per market-data
+  call. Measured ceiling ~30 burst, ~1 req/s sustained safe.
+
+**Priced and rejected — Kraken L3 market data** (the `/api/v3/marketdata` "level3"
+channel, the only route to a *true* per-trade mid and hence a *true* effective spread, and
+`kraken-python`'s `websocket.py` already lists `level3` in `_CHANNELS`):
+
+- Requires a registered Kraken account and an authenticated WS v2 token
+  (`client.get_websockets_token`, which is a **private** call → `RateLimitError`-style
+  `AuthenticationError` without credentials).
+- Kraken gates L3 behind institutional/negotiated access; it is not a self-serve key toggle.
+- Kraken's REST API does **not** bill market data by call on the Spot endpoints, so there is
+  no metered price to compare against.
+- **Justification for rejecting:** the only thing it buys that Trades does not is a
+  per-trade mid, i.e. an effective spread — and §2.3 shows the spread family is not
+  actionable on these markets anyway (0.47 bps quoted). Paying institutional-gated access and
+  a credentialed runtime dependency to obtain a number that then fails its own sanity check
+  is not defensible.
+
+**Also noted, not priced (CAND-3's territory, not mine):** Kraken publishes downloadable
+OHLCVT CSV ZIPs — `https://support.kraken.com` article *"Downloadable historical OHLCVT
+(Open, High, Low, Close, Volume, Trades) data"*, last updated 2026-09-16, stating data is
+available *"from the beginning of each market up to the present"* at 1/5/15/30/60/240/720/1440
+minute intervals. Keyless bulk, **venue-consistent**, and it includes a Trades count — the
+natural cross-check on any tape backfiller. I did **not** verify the download URL or the
+archive's actual coverage; treat that as unconfirmed and let researcher 3 / the architect
+price it.
+
+---
+
+## 5. Q5 — Candidate records
+
+| Candidate | Status / last release | License | Auth | Rate limit | Output shape | Parsing needed? |
+|---|---|---|---|---|---|---|
+| **`/public/Trades`** (recommended) | Kraken production, actively served (OpenAPI v1.1.0, spot-rest.yaml) | venue ToS; no redistribution without agreement | **none** (`security: []`) | cost 1; Starter max 15, decay −0.33/s; measured ~30 burst / 1 rps sustained | **structured JSON**, array-of-arrays + ns `last` | **No** — `Trade.from_public_row` exists; add `trade_id` (1 line) |
+| `/public/Spread` | same | same | none | cost 1 | structured JSON, `[time, bid, ask]` + **seconds** `last` | No — `SpreadPoint.from_row` exists |
+| `/public/Depth` | same | same | none | cost 1 | structured JSON, `{asks:[[p,v,t]], bids:[...]}` | No — `OrderBook.from_kraken` / `BookLevel` exist |
+| Kraken WS v2 `trade` | same; `wss://ws.kraken.com/v2` is the **recommended** protocol per Kraken's own index | same | none for public channels | connection-based | streamed JSON | No — `WsTrade` exists; `kraken-python` already wraps it |
+| Kraken WS v2 `level3` | same | same | **token required** (private `GetWebSocketsToken`) | connection-based | streamed JSON | `WsBook` exists |
+| Kraken L3 REST | same | same | institutional-gated | cost-per-request | structured JSON | — |
+| Kraken OHLCVT CSV ZIPs | active (support article 2026-09-16) | same | none | n/a (bulk) | **CSV in ZIP — needs parsing** | **Yes** — real parsing, est. 40–80 lines |
+| `kraken-python` (repo-local wrapper) | 0.3.0, in-repo, last touched 2026-09-24 | in-repo | keyless for public | `min_interval` default **0.0** — must be set | typed dataclasses, `to_dict()`, JSON-safe | **No — already the house style** |
+| `krakenex` (PyPI) | 2.2.2, uploaded **2024-07-01** (~2 yr stale) | **LGPLv3** | none | as venue | dict | — |
+| `krakenapi` (PyPI, FuturBroke) | 1.0.2, uploaded **2024-02-17** (~2.5 yr stale) | **GPLv3+** | none | as venue | dict | — |
+| `ccxt` (PyPI) | **4.5.85, uploaded 2026-10-01** (current) | MIT | none | as venue | dict | — |
+
+**On the PyPI options:** all three are worse than the in-repo `kraken-python` for this job.
+The two Kraken-specific wrappers are GPL/LGPL and ~2 years stale; `ccxt` is current but it is
+an exchange-**abstraction** layer, so it would erase the exact endpoint-level detail (§1.2's
+ns cursor, the 7-field row, the seconds-vs-nanoseconds `last` split) that this feature
+depends on, and it would drag a very large dependency into a 6-dependency package. The
+house style is a first-party wrapper with typed dataclasses; extending `kraken-python` by
+one field is strictly cheaper than any of these.
+
+**On the OHLCVT CSVs:** the only candidate in this table whose output is *raw needing
+parsing*. `kraken-python` has nothing for it. If chosen it is a real CSV reader — zip
+extraction, per-pair/interval file discovery, header handling, decimal-safe float parse.
+Roughly 40–80 lines plus tests. Flagged for completeness; **not** recommended for CAND-1.
+
+---
+
+## 6. Scoring — reduction to what the RL pipeline consumes
+
+The brief asks me to score partly on how cheaply this reduces to a per-ticker,
+per-timestamp scalar or small vector. Measured:
+
+| Candidate | Reduces to | Parsing cost | Verdict |
 |---|---|---|---|
-| **missing** | `data.py:364-368` | WARNING + `return df` | looks like `null` (F4.1); nothing downstream distinguishes |
-| **empty (0 records)** | `data.py:382-384` | **`_LOGGER.debug`** + `return df` | a DEBUG-level line, invisible at default log level, and again identical to `null` |
-| **present but no ticker overlap** | `data.py:477-486` | WARNING with a good message | correct — the only one of the three that is loud |
-| **stale (records older than the bound)** | `data.py:457-459` | values zero-filled, `signal_observed=0` | correct by design; freshness pair is in the observation |
+| `/public/Trades` | **6 PIT scalars + 1 rolling per (ticker, bar)** | **0 lines** — typed models exist; add `trade_id` (1 line) | **A+** |
+| `/public/Depth` | 2 scalars (`bid_vol`,`ask_vol` → 1 imbalance) | **0 lines** — `OrderBook` exists | **B** (forward-only, snapshot-noisy) |
+| `/public/Spread` | 1 scalar (quoted spread, bps) | **0 lines** — `SpreadPoint` exists | **C** (forward-only, `since` ignored) |
+| WS v2 `trade` | same as Trades, streaming | **0 lines** — `WsTrade` exists | **B** (streaming is a different program; no history) |
+| OHLCVT CSVs | 7 columns/bar | **40–80 lines, new code** | **C** |
 
-Note the **inconsistency inside the seam itself**: "no records at all" is DEBUG, "records but
-none overlapping" is WARNING, "file absent" is WARNING. The two *uninformative* states are the
-loud-ish one and the silent one, in the wrong order.
+**Explicitly: none of the three REST endpoints need parsing.** Every one is structured JSON
+with a typed model already in `kraken-python`. The only code delta is adding the dropped
+`trade_id` field to `Trade` — one line in `models.py`, one in `to_dict()`. That is the
+whole reason Trades wins, and it is worth being blunt about: the audit's framing ("a richer
+feature family") undersells it. The cost is not "parse a raw feed", it is "read one more
+field off a dataclass that already exists".
 
-### Options, concretely
+### The consumer-side contract, verified
 
-**Option 1 — fail loudly (raise) on a configured-but-unresolved path.**
-`FileNotFoundError`/`SignalFileNotFoundError` when the key is non-null and the path does not
-resolve. Matches `backtest.py:218-224` exactly, and matches the repo's own stated philosophy in
-that docstring.
+I traced the exact wiring, because "zero consumer-code change" is the load-bearing claim:
 
-- *For*: the only option that makes this impossible to ship again silently; the failure surfaces
-  at the first `train`/`backtest`, not three passes later; kills the `missing == null`
-  indistinguishability permanently.
-- *Against*: hard-fails a first-time user who copies `default.yaml`, has no sibling repos cloned
-  yet, and just wants to train on price. Their first command exits non-zero. **This is the
-  real cost and it is not small** — the task's own framing asks for "the right default for a
-  *new* user".
-- *Mitigation that makes it acceptable*: make it **opt-in-by-absence-of-intent**. `null` =
-  off, silent. Non-null = **on, and the user has declared intent to use it**, so a
-  non-resolving path is a configuration error, not a first-run state. The three null channels
-  remain perfectly first-run-friendly; the one non-null channel fails loudly, which is exactly
-  where the author *declared* they wanted data.
+- `features._add_microstructure_features` (`features.py:577-590`) reads `spread` / `bid`,`ask`
+  / `bid_vol`,`ask_vol` **off the dataframe** — not off the signals allow-list.
+- `data.merge_extra_features` **allow-lists**: `available_cols = [c for c in _SIGNAL_COLUMNS
+  if c in signal_df.columns and c not in _SIGNAL_FRESHNESS_COLUMNS]` (`data.py:609-613`).
+  **A producer emitting `bid_vol`/`ask_vol` through the merge seam has them silently
+  dropped.**
+- `features._SIGNAL_COLUMNS` (`features.py:46-77`) currently contains `spread`, `bid`, `ask`
+  — and **`bid_vol` / `ask_vol` are absent.** Confirms the audit's grep result. The gate
+  itself is `features.py:586-590`.
+- **Adding a name to `_SIGNAL_COLUMNS` does two things at once**, which is the cheap part:
+  1. the merge seam forwards it to the frame;
+  2. it is automatically swept into `POINT_IN_TIME_EXOGENOUS_COLUMNS`
+     (`features.py:123-125`, defined as `frozenset(_SIGNAL_COLUMNS) | _SIGNAL_BUILDER_INPUT_COLUMNS`),
+     which `first_tradable_index` (`features.py:128`, windowed filter at `:150-152`) **excludes
+     from the warm-up gate**.
+- So the new signed-imbalance / size-tail / Kyle / large-trade columns, added to
+  `_SIGNAL_COLUMNS`, are declared point-in-time **automatically** — no second edit, and no
+  risk of a warm-up gate moving from 24 to 720 (the exact regression documented at
+  `features.py:132-148`).
 
-**Option 2 — warn-and-continue, loudly, and record it in the observation.** Keep `return df`,
-promote `data.py:382-384` DEBUG→WARNING, and additionally write a *degradation* marker onto
-the frame so the shortfall is machine-visible rather than log-visible.
+**Precedent to copy:** `data.add_derived_ohlcv_features` (`data.py:812-873`) is already the
+in-repo pattern for exactly this — presence-gated, writes on a copy, derives from columns the
+frame already carries, called on **both** read legs (`data.py:1037` and `data.py:1196`), and
+documented as *"presence-gated, not required-column, exactly like the microstructure
+builder"*. A tape-derived builder mirrors it line for line.
 
-- *For*: zero disruption to first-run; the information still lands somewhere a tool can read it.
-- *Against*: this is the option that already exists in spirit and it demonstrably did not work
-  — the current WARNING at `data.py:365` fires on **every** run of every model and has been
-  ignored through at least two audit passes. **Evidence that "warn" is not a control here.**
-  Adding a marker column is better, but it also widens the observation (see F4.3: every width
-  is a hardcoded expectation somewhere), and a constant-zero marker column would itself be
-  zero-filled by `_raw_feature_array` (`environment.py:487`) and z-scored to 0 — the marker
-  would need to be a *feature* (a fitted stat) or it carries no information.
+**One caveat on the seam:** `merge_extra_features` floors both indices to the hour
+(`data.py:603`, `data.py:625`) and forward-fills under an age bound. A **tape** producer is
+naturally per-**trade**-timestamp, not per-hour. Either aggregate to the bar interval in the
+producer (recommended — then it is per-(ticker, bar), point-in-time, and needs no carry at
+all), or let the floor do it and accept the `signal_max_age_hours` carry. **Producing one
+record per bar is strictly better** and removes the carry question entirely.
 
-**Option 3 — lazily create the directory on read.**
-- **Rejected on evidence, and this is a firm finding.** Both funding and social producers already
-  `mkdir(parents=True)` (`export.py:140`; `export.py:140,148`), and the consumer's own `justfile:140,156`
-  does `mkdir -p` before invoking them. A reader that creates a directory it does not write to
-  would be creating an empty `signals/` that makes the *next* run's `is_file()` check pass a
-  differently-shaped failure (present-but-empty → DEBUG) — i.e. it makes the diagnosis
-  **worse**, not better. It also papers over a genuinely misspelled path.
+### Costs the architect should price
 
-**Option 4 (recommended) — Option 1's semantics + Option 2's diagnosis, layered.**
-
-1. `null`/empty ⇒ off, silent. Unchanged. First-run UX preserved.
-2. non-null but unresolvable ⇒ **raise**, naming the key, the raw value, and the expanded value
-   (so the `~` bug is legible if it ever recurs), plus the fix (`just funding-pull` /
-   `just funding-timer`).
-3. non-null, resolves, but 0 records ⇒ raise too — a file that exists and is empty is a
-   *producer* failure and must not read as `null`.
-4. present with no overlap for this ticker ⇒ **keep today's WARNING** (`data.py:477-486`).
-   This is the legitimately-expected case for a young forward-only log (G6) and must not be
-   fatal.
-
----
-
-## 4. THE `systemd/` TIMER GAP
-
-**What exists** (`systemd/`, 3 files, one channel):
-
-- `kraken-trading-bot-funding.service.in` — the template (`@PAIR@`, `@OUTPUT@`).
-- `kraken-trading-bot-funding.service` — **`diff`-identical to a sed of the `.in` with
-  `ETH/USD` and `/home/seanc/Projects/kraken-trading-bot/signals/…` substituted.** Verified by
-  regenerating the substitution and diffing: empty diff. It was committed in `a39e184` as a
-  *rendered, machine-specific artifact*, with `ExecStart=` (`service:39`) and `Documentation=`
-  (`service:24`) hardcoding `/home/seanc/…`. A second user's checkout yields a unit that writes
-  into a path they do not own. **This file should not be in git as a rendered artifact**; the
-  template is the portable artifact.
-- `kraken-trading-bot-funding.timer` — `OnCalendar=*-*-* *:17:00`, `Persistent=true`,
-  `RandomizedDelaySec=120`. Sensible cadence, and the comment's justification (bid/ask and
-  vol24h move between the ~8h settlements, so hourly keeps `spread` fresh) is correct.
-
-**Installer:** `justfile:135-149` `funding-timer` — `mkdir -p` both the unit dir *and*
-`$root/$(dirname output)`, `sed` the template, `ln -sf` the timer, `systemctl --user
-daemon-reload`, `enable --now`. Correct. `justfile:152-158` `funding-pull` does the one-off.
-
-**The doc cross-reference is false.** `configs/default.yaml:73-74` tells the reader the timer
-is *"the `systemd.user` timer (kraken-trading-bot-funding.{service,timer}, **see nix/module.nix**)"*.
-`nix/module.nix` is a **NixOS** module: its whole implementation block (`module.nix:212-238`)
-sets exactly two things — `environment.systemPackages` and
-`systemd.services."kraken-trading-bot-env"` (the credentials oneshot). It contains **no timer,
-no `systemd.user.*`, and no reference to signals or funding**. The instruction sends a reader to
-a file that does not contain what it promises.
-
-**`systemd/user` vs `systemd/system` — and the trap.** The timer belongs in **`systemd/user`**,
-because:
-- the whole install path is user-scoped (`justfile:138` writes `$HOME/.config/systemd/user`);
-- the pull is keyless and needs no secrets, so a system unit buys nothing;
-- the output path is under `$HOME`;
-- `loginctl enable-linger` (`service:21`) is the documented way to fire it logged out.
-
-**Do NOT put it in `nix/module.nix`.** That module is a NixOS module
-(`{ config, lib, pkgs, ... }:`, keyed off `config.services.kraken-trading-bot`). `systemd.user.*`
-does not exist in a NixOS module's option namespace and will not evaluate. If it is ever to be
-Nix-managed it must be a **`systemd.user.services`/`systemd.user.timers` Home-Manager module**,
-which is a different module system entirely, and `nix/module.nix` cannot become one by
-accumulation. Recommendation: leave the timer as `systemd/` + `justfile` (the install path that
-already works) and **delete the false "see nix/module.nix" claim** from `default.yaml:73-74`.
-
-**Covering all three channels** needs, per channel: one `.service.in`, one `.timer`, one
-`just <ch>-timer` + `just <ch>-pull`, and one non-null config key. Two caveats that make this
-more than copy-paste:
-- `ticker-news-signals`' `write_jsonl` (`export.py:120-127`) does **not** `mkdir`, so the news
-  recipe's `mkdir -p` is load-bearing, not decorative (F7).
-- `ticker-news-signals` and `kraken-social-signals` expose `cli.py` at the repo root; funding
-  does **not** (it is a console script, as `configs/default.yaml:60-65` correctly documents).
-  The three `ExecStart` lines will not be uniform.
-- News/social are `pull --ticker ETH/USD --output …` per `configs/default.yaml:53-54,83-84`,
-  but neither `write_jsonl` takes an `append` flag the way funding's does — whether news/social
-  are append-only logs or overwrite-per-pull changes their G6 story and **I could not determine
-  this from a static read** (see §7).
+| Item | Cost |
+|---|---|
+| `Trade` gains `trade_id` | 1 line in `models.py` + 1 in `to_dict()` |
+| `_SIGNAL_COLUMNS` allow-list entries | 1 line each; auto-marks point-in-time |
+| Ticker-recorded `bid_vol`/`ask_vol` (Depth leg) | forward-only; needs recorder + timer |
+| `KrakenTransport(min_interval=…)` for the backfiller | **must be set** — default `0.0` and measured ceiling is ~30 burst |
+| Retry on `RateLimitError` | `manager.recent_trades` has none (same defect as CAND-4) |
+| A `systemd.user` timer | audit §4.8: the repo has exactly one timer, it is funding-only, it is **absent from `nix/module.nix`**, and it is **not installed on this host** — so the timer pattern is not yet proven here |
+| A new sibling repo | `kraken-funding-rates` is the working template: 8 modules, 3 test files, `pyproject.toml` + `flake.nix`, 3 commits |
 
 ---
 
-## 5. VERIFICATION STRATEGY — and whether each candidate is non-vacuous
+## 7. Recommendation
 
-The prior pass's hard requirement: *a test that would pass without the fix proves nothing.*
-Each candidate below is scored against that.
+**One gap, two sequenced halves. The first half is minutes of work and needs no timer.**
 
-**(A) A test that a configured seam path resolves.** **NON-VACUOUS. Recommended.**
-Force `monkeypatch.setenv("HOME", tmp)` (or `pathlib.Path.home` monkeypatch), set
-`funding_features_file` to `"~/signals/f.jsonl"`, materialise the file under the fake home, and
-assert the merge consumed it (e.g. `funding_rate_prediction` in the result, or
-`signal_observed` present). Fails on `data.py:363` today; passes only with `expanduser()`.
-*Non-vacuity proof: I replayed the existing test's body against four values and it passed for
-`/definitely/not/here/nope.jsonl` — this candidate is the one that does not.*
+**Phase 1 — backfillable, keyless, zero new parsing.** A `kraken-tape` sibling (or a
+`microstructure` builder beside `add_derived_ohlcv_features`) that pages
+`/public/Trades` with a `trade_id`-deduped cursor walk, aggregates **per bar interval**,
+and emits the six point-in-time columns:
 
-**(B) A startup/lint check over `configs/*.yaml` that every referenced path resolves.** **NON-VACUOUS for the tilde class, VACUOUS for "file not populated yet."**
-Catching `~` is mechanical: `assert "~" in v or Path(v).exists()`. But a *legitimately fresh
-install* has `default.yaml:79` pointing at a not-yet-created file, so "every path exists" cannot
-be a hard failure for `default.yaml` specifically. Recommended shape: **run it in
-`tools/model_matrix.py plan` and in a pytest, not as a blocking CLI preflight** — report as a
-`WARN` alongside the existing `base_config_missing_keys` warn (`model_matrix.py:1322-1330`),
-which is the same class of check and already has the right severity. Extend
-`base_config_present` (`model_matrix.py:494-500`) to the three signal keys *and* to resolution.
+`trade_signed_imbalance`, `trade_size_p50`, `trade_size_p90`, `trade_size_p99`,
+`trade_size_tail_ratio`, `kyle_lambda_bar`, `large_trade_fraction`
+(+ `amihud_illiquidity`, 1-bar warm-up).
 
-**(C) Making "the feature group is all zeros/empty" a visible failure.** **PARTIALLY
-NON-VACUOUS — and the trap is precise.**
-- The width guard as a mechanism: **non-vacuous for asymmetry, vacuous for degradation** (F5).
-  It catches 52-vs-59; it cannot catch a consistently-52. Keep it, do not rely on it.
-- A *constant-column* guard: **partially vacuous.** Under the shipped config the columns are
-  **absent**, not zero (F4), so a "all-zero columns" check fires on nothing. It only becomes
-  meaningful once (A)/(D) is fixed and a file *is* being merged but not overlapping. Worse,
-  `NormalizationStats.normalize` deliberately floors zero std so constant features normalise to
-  zero (`features.py:218-232`) — a "no constant columns" guard would **fail legitimately** on
-  `signal_observed` for any young log. Scoring this as a trap: **do not add a constant-column
-  guard without also requiring `signal_observed.any()`.**
-- The single best non-vacuous variant: **assert `signal_observed.any()` when a seam file is
-  configured.** Under the shipped config this fails (the column is absent); after the fix it
-  passes iff real data landed. It is falsifiable in both directions.
+Four of these are new information; `vwap_close_gap` ≡ the already-shipped `vwap_dev`.
+Backfill 30 days in **2–19 minutes per pair** depending on volume. No timer, no key, no
+credential, no new dependency. It works today against `HEAD`.
 
-**(D) A config-shape test (what exists today).** **VACUOUS.** Must be *replaced*, not amended —
-see F6.
+**Phase 2 — forward-only, only if a spread/depth column is wanted.** A recorder + timer
+writing `spread` (from `/public/Spread`, quoted and directly measured) and `bid_vol`/`ask_vol`
+(from `/public/Depth`, summing N levels) so the **existing dormant consumer at
+`features.py:586-590` lights up with zero consumer-code change** — which is CAND-1's actual
+headline claim. Cost: a timer the repo has not yet proven it can install, plus a real staleness
+discipline (10-level snapshots ffilled up to 12 h will look stale; sample frequently or set a
+tighter `signal_max_age_hours` for that channel).
 
-**(E) A round-trip test that a real producer record shape survives the seam.** **NON-VACUOUS,
-and it would have caught F8.** Build a record from the *actual* `FundingSnapshot.to_dict()` key
-set (asserted against `kraken-funding-rates`' model, not a hand-written fixture) and assert the
-ticker guard fires on a cross-ticker file. Currently the funding channel silently merges
-everything.
+**Do not build:** realized spread (fails, §2.3), and any of the paid/gated L3 routes (§4).
 
-**(F) `test_model_matrix.py:1416-1418` must be updated in lockstep.** It pins the bug's own
-warning text; leaving it would turn the fix into a red suite and invite a revert.
+**The strongest single argument, if only one line survives this document:** the trade tape
+reconstructs the OHLCV candle's `volume`, `count` and `vwap` to **zero** error, so
+microstructure features derived from it are consistent with the training frame by
+construction — and the consumer for them is already written, already gated on column names,
+and currently fed nothing.
 
 ---
 
-## 6. PRODUCER SIDE OR CONSUMER SIDE?
+## 8. Live checks I could not complete
 
-**Consumer side — this repo — for F1, F2, F3, F4 and the bulk of G1.** The producer is correct.
-`kraken-funding-rates` writes a well-formed, hour-floored, `append`-only JSONL with the right
-columns, and its `write_jsonl` already `mkdir`s the parent (`export.py:140`). It cannot fix the
-fact that `kraken-trading-bot` chooses to spell a config path as `Path(x)` and then treat a
-`False` `is_file()` as a normal outcome. A producer has no way to know its consumer's CWD, and
-no way to make a consumer call `.expanduser()`. The blast radius is also entirely internal: the
-audit's own evidence (`backtest.py:219` already does it) shows the correct pattern is present in
-this repo and was simply not applied. **This is an internal inconsistency, not an
-inter-project contract failure.**
-
-**Producer side — `kraken-funding-rates` — for F8 only, and it should be fixed there.**
-Its record omits `ticker` (`models.py:50-65`) while its two sibling producers emit it
-(`ticker-news-signals/.../models.py:96`, `kraken-social-signals/.../models.py:162`). The
-consumer documents a contract it cannot enforce on this channel (`default.yaml:109-117`) and
-papers over the absence at `data.py:537-545`. The right fix is for funding to emit `ticker`
-(`symbol` already carries the value, `models.py:40`), matching its siblings — the consumer's
-documented contract is already correct and already tested
-(`tests/test_rl_signal_config_wiring.py:226`). A consumer-side mitigation (accept `symbol` as an
-alias) is defensible as a stopgap but is the wrong layer and should not be the permanent fix.
-
-**Neither side:** the missing news/social timers and the un-installed funding timer are an
-**operations** gap in this repo — the producer CLIs exist and are keyless.
+| Check | Status |
+|---|---|
+| Behaviour of `/public/Trades` under a *very* old `since` > 15 y, e.g. 2013-09 for a pair listed 2013-10 | clamped to listing date; consistent, not separately re-confirmed per-pair beyond the 7 pairs in §1.3 |
+| Per-pair listing floors for pairs outside the 7 probed | inferred from the clamp being per-pair; not exhaustively swept |
+| Whether the Starter counter differs when an `API-Key` header *is* present | not tested (no key available); keyless path is what the recommendation uses |
+| Kraken L3 exact pricing / eligibility | not obtainable without an account; concluded "institutional-gated, no self-serve price" from the docs index and rejected on §4 reasoning |
+| OHLCVT CSV archive URL, coverage and format | article text confirmed; **URL and contents unverified** — flagged to researcher 3 / architect |
+| Whether `EGeneral:Too many requests` counter state persists across IPs/processes | single-process single-IP only |
+| Multi-resolution feature behaviour across all 8 feature_windows | not swept; §2.3 establishes the direction for the spread family only |
 
 ---
 
-## 7. RANKED RECOMMENDATION FOR G1
-
-### R1 (P0, ~4 lines) — one shared path resolver, applied at all five sites
-
-Add a single private helper in `kraken_trading_bot/rl/data.py` beside the other private
-helpers (`_resolve_store` is at `:1020`; `_filter_ticker` at `:504`):
-
-```
-_resolve_config_path(value) -> Path | None
-    None/"" -> None
-    Path(str(value)).expanduser()
-```
-
-Apply at: **`data.py:363`** (G1), **`data.py:1054`** (`market_data_store` — the same bug, and a
-silent blocker for G3), `train.py:82` (with `backtest.py:219`'s raise semantics), and
-`export.py:250,263`. One helper makes the seventh instance a code-review question rather than an
-audit finding.
-
-### R2 (P0, at `merge_extra_features`, `data.py:360-368`) — distinguish "off" from "broken"
-
-The gate becomes, in order:
-- `null`/empty ⇒ `return df`, silently. **Unchanged** — first-run UX preserved.
-- non-null but not a file ⇒ **raise** `SignalFileNotFoundError`, naming the config key, the raw
-  value *and* the expanded value, and the producer command. This is the option that makes the
-  defect impossible to ship silently again, and `backtest.py:218-224` is the in-repo precedent.
-- resolves but 0 records (`data.py:382-384`) ⇒ **raise** as well, and promote that line from
-  `DEBUG` to `WARNING` regardless. A present-but-empty file is a producer failure, not a
-  first-run state.
-- present with no overlap ⇒ keep today's WARNING (`data.py:477-486`) verbatim. Correct as-is;
-  the forward-only log makes it expected (G6).
-
-**Landing point, exactly:** the `if not extra_features_file:` / `path = Path(...)` /
-`if not path.is_file():` block at `data.py:360-368`, plus the `if not records:` block at
-`data.py:382-384`. **Config key: none added** — the change reads the existing
-`extra_features_file` / `funding_features_file` / `social_features_file` keys, which
-`data.py:853-860` and `data.py:1009-1016` already thread through both the live-fetch and
-store-backed branches. Symmetry is preserved automatically because both branches call the same
-function.
-
-### R3 (P0, replaces the test) — make the vacuous test non-vacuous
-
-Replace the body of `test_config_points_at_a_real_funding_file_with_a_12h_bound`
-(`tests/test_rl_signal_config_wiring.py:711-734`) with the §5(A) test: fake `HOME`, a `~` path,
-assert the seam *consumed* the file. Keep the `signal_max_age_hours == 12` assertions — they are
-fine. Then, in the same file, add §5(E) (real `FundingSnapshot` key set + a cross-ticker
-assertion).
-
-### R4 (P1) — correct the record
-
-`features.py:270`'s "49 → 55", `default.yaml:104-107`'s "301 of 721", and AUDIT.md G1's
-"49-wide … twelve columns constant zero" are all wrong about the current default. Measured:
-**52 as shipped, 59 with the funding channel live** (§F4). Any matrix cell, doc or test that
-hardcodes 49/55 will need revisiting. Also delete the false `see nix/module.nix` cross-reference
-at `default.yaml:73-74`.
-
-### R5 (P1) — operations, not code
-
-Enable the timer (`just funding-timer`, which already `mkdir -p`s the signals dir and the unit
-dir — `justfile:140`). Delete the committed rendered `systemd/kraken-trading-bot-funding.service`
-in favour of the `.in` template plus `just`. Add news + social `.service.in`/`.timer`/`just`
-recipes, remembering `ticker-news-signals`' `write_jsonl` does not `mkdir`
-(`export.py:120-127`) and that funding's CLI is a console script while the other two are
-`cli.py`.
-
-### R6 (P2, sibling repo) — add `ticker` to the funding record
-
-`kraken-funding-rates/kraken_funding_rates/models.py:50-65` — add `"ticker": self.symbol` to
-`to_dict()`. Matches both sibling producers and makes `signal_require_ticker` real for the only
-channel that is currently configured.
-
-**Sequencing note:** R1+R2 alone convert a silent 52-wide pipeline into a loud failure. That is
-the whole of G1's risk. R3 is what stops it recurring. R5 is what makes it produce data. R6 is
-orthogonal and belongs to another repo.
-
----
-
-## 8. WHAT I COULD NOT DETERMINE
-
-1. **Whether the news/social producers append or overwrite.** Funding's `write_jsonl` takes
-   `append: bool` (`export.py:120-158`); news's `write_jsonl` (`export.py:120-127`) and social's
-   (`export.py:120-148`) take no such flag. If news/social overwrite, their channels are
-   *state*, not a *log*, which materially changes their G6 story and whether a stale-but-present
-   file is possible. **Needs a live read of both CLIs' `pull` subcommands** — I did not execute
-   them (they are network calls).
-2. **Whether `kraken-funding-rates`' console script is reachable from a systemd `ExecStart`
-   without the `nix run` wrapper** used at `service:39`. The unit hardcodes
-   `/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-funding-rates#…`, which
-   embeds this machine's store paths. Whether a second machine's `nix run` resolves is a live
-   check.
-3. **Whether `systemctl --user daemon-reload && enable --now` actually succeeds here.** I probed
-   `is-enabled`/`is-active` (both `not-found`/`inactive`) and listed `~/.config/systemd/user/`
-   (no kraken units present) but did **not** install the timer — that mutates the host's user
-   systemd state and is outside a research role.
-4. **Whether any model was ever trained with a working funding file.** `models/` contains only
-   `.gitkeep`, so the width guard has never been exercised in this checkout and no trained
-   artifact needs invalidating. I cannot speak to other machines' `models/` directories.
-5. **The true `_SIGNAL_COLUMNS` width after *all three* channels activate.** My §F4 measurement
-   used the real funding producer key set. News and social would add
-   `sentiment_score`/`article_count`/`novelty_flag`/`stt_mention_count`/`stt_tilt`/`fng_index`,
-   but I did not run their CLIs to confirm the exact emitted set — so 59 is a *measured*
-   funding-only figure, not a ceiling.
-
-I am confident in F1–F8 (all reproduced or read directly). I am **less** confident in the exact
-49/55/52/59 arithmetic as a *documented* number, because it depends on `feature_windows` and
-`feature_groups`; my 52/59 figures used the shipped `default.yaml` values
-(`[1,4,24]`, all five groups) and should be re-derived if either changes.
-
----
-
-RESEARCH COMPLETE
+*Research only. No source, config, or test file was modified; nothing was committed or
+deleted. This file is the only write.*
