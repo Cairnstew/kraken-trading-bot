@@ -1083,12 +1083,15 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     ``avg_loss.replace(0, np.nan)`` guards the denominator.  Without it,
     ``rs`` is ``avg_gain / -0.0`` on any stretch carrying no down-bar --
     ``-inf`` where ``avg_gain`` is positive, and already NaN in the
-    both-sides-zero case where ``avg_gain`` is ``-0.0`` too -- and
+    both-sides-zero case where there are no gains either and so
+    ``avg_gain`` is ``+0.0`` (never ``-0.0``: ``gain`` is clipped at zero
+    below, so ``avg_gain`` cannot be negative) -- and
     ``100 - 100/(1 + -inf)`` collapses to **100.0** instead of the neutral
     **50.0** the trailing ``fillna`` supplies.  So the guard is
     **load-bearing** where there are gains but no losses (guarded 50.0,
     unguarded 100.0) and merely **cosmetic** in the both-sides-zero case,
-    where ``fillna`` gives 50.0 either way.
+    where ``0.0 / -0.0`` is already NaN and ``fillna`` gives 50.0 either
+    way.
 
     No infinity guard on ``avg_gain`` is needed, and the reason is worth
     stating exactly, because a previous version of this docstring got it
@@ -1113,10 +1116,10 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     NaN; and on any bar whose ewm memory holds **no down-bar at all** --
     a flat bar counts as a no-down-bar exactly as a gain does.  That
     second case is the same mechanism as the both-sides-zero guard
-    described above, and on the pinned test's frame it is the whole frame:
-    a monotonically rising ramp, so no down-bars anywhere and ``rsi_4``
-    is 50.0 on every bar it has.  On a frame that has losses the route
-    cannot fire.
+    described above, and on the pinned test's frame it covers every bar
+    after the first: a monotonically rising ramp with no down-bars
+    anywhere, so ``rsi_4`` reads 50.0 on all of them.  On a frame that has
+    losses the route cannot fire.
 
     So the residual hazard is real and this docstring does not make it
     unreachable.  A bar skipped by the ``ewm`` recursion leaves a *finite,
