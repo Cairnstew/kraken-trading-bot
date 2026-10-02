@@ -1468,21 +1468,72 @@ REAL_SIGNAL_FILE_REFUSED = [
 ]
 
 
-def test_a_refused_signal_file_is_a_process_failure_and_nothing_else():
-    """The new refusal must be reported, not mistaken for another cause.
+def test_a_refused_signal_file_is_named_and_not_mistaken_for_another_cause():
+    """The refusal gets its own reason, and never borrows another's.
 
     G1's message names a *config key* and a missing file, which is close
     enough to several things this classifier already matches on.  Pinning
     that it matches NONE of them is what stops a future rewording from
     silently reclassifying "your funding file is missing" as "your --config
     is missing" — two different fixes for the reader.
+
+    It carries ``signal_file_not_found`` rather than a bare
+    ``process_failed`` because that bare rc is the opaque case this
+    function exists to prevent, and the state is the *shipped* one:
+    ``configs/default.yaml`` sets ``funding_features_file`` non-null, so a
+    checkout without that file turns every cell of a matrix into this same
+    refusal.  One opaque code for the whole grid tells the reader nothing
+    about the single fix that would make all of them pass.
     """
     reasons = classify_process_failure(_real_errored(REAL_SIGNAL_FILE_REFUSED))
-    assert reasons == ["process_failed"]
+    assert reasons == ["process_failed", "signal_file_not_found"]
     for other in ("config_not_found", "action_space_mismatch", "no_tradable_bar"):
         assert other not in reasons
     # And it reaches the user as a named reason rather than a bare rc.
-    assert "process_failed" in assess_cell(_real_errored(REAL_SIGNAL_FILE_REFUSED))
+    cell = assess_cell(_real_errored(REAL_SIGNAL_FILE_REFUSED))
+    assert "signal_file_not_found" in cell
+    assert "process_failed" in cell
+
+
+def test_an_empty_signal_file_is_the_same_named_reason_not_a_different_one():
+    """Zero records is the same reader-facing cause as no file.
+
+    ``SignalFileNotFoundError`` words the two differently ("holds no
+    records" rather than "no file exists at"), and both open with the config
+    key.  They want the same action — run the producer — so they must not
+    drift into two codes that a report would print as two unrelated faults.
+    """
+    empty = [
+        "Error backtesting ETH_USD/mv_probe: funding_features_file is set to "
+        "'~/signals/eth_usd_funding.jsonl' and /home/seanc/signals/"
+        "eth_usd_funding.jsonl (expanded from '~/signals/eth_usd_funding.jsonl') "
+        "holds no records — an empty log is a producer failure, not a "
+        "first-run state. Produce it with: just funding-pull.",
+    ]
+    reasons = classify_process_failure(_real_errored(empty))
+    assert "signal_file_not_found" in reasons
+    assert "config_not_found" not in reasons
+
+
+def test_a_missing_config_is_still_not_confused_with_a_missing_signal_file():
+    """The two "your path is wrong" refusals must stay distinguishable.
+
+    Both name a nonexistent path, so a loose matcher here would send a
+    reader to write a YAML file when the actual fix is to run a producer
+    (or to set the key back to ``null``).  Guards the boundary in both
+    directions.
+    """
+    config_only = classify_process_failure(_real_errored(REAL_CONFIG_NOT_FOUND))
+    assert "config_not_found" in config_only
+    assert "signal_file_not_found" not in config_only
+
+    # And a bad --config must not be dragged into the signal reason by a
+    # model config that merely *mentions* a signal key somewhere.
+    assert "signal_file_not_found" not in classify_process_failure(
+        _real_errored(["Error backtesting ETH_USD/mv_probe: Backtest config "
+                       "not found: /nope.yaml. funding_features_file was "
+                       "never read."])
+    )
 
 
 def _real_errored(stderr_tail):

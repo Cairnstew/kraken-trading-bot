@@ -976,6 +976,56 @@ def test_market_data_store_path_is_resolved_against_home(
     ]
 
 
+def test_both_legs_label_the_key_and_the_producer_not_just_the_seam(
+    tmp_path, monkeypatch
+) -> None:
+    """``config_key`` must survive the leg, not just the direct call.
+
+    Every ``config_key=`` in this suite used to be a hand-written argument
+    to :func:`merge_extra_features`, so nothing pinned the two ``for`` loops
+    in ``read_ohlc_dataframe``/``fetch_ohlc_dataframe`` -- the only places a
+    *config-driven* refusal is actually raised from.  Drop ``config_key=``
+    from either loop and every existing test still passes while the refusal
+    degrades to naming "the signal-file config key" and naming no producer
+    command: still loud, no longer actionable, and only on whichever leg was
+    edited.  The two legs are otherwise identical code, which is exactly
+    why a drift between them is invisible until someone hits the other one.
+
+    So drive a configured-but-unresolvable funding path through BOTH legs and
+    assert the label survives each.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    missing = "~/signals/eth_usd_funding.jsonl"
+
+    class FakeStore:
+        """Duck-typed store: passes ``_resolve_store``'s upsert/read check."""
+
+        def upsert(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return _funding_frame()
+
+    legs = {
+        "live-fetch": dict(manager=FakeSource(_candles(60))),
+        "store-backed": dict(market_data_store=FakeStore()),
+    }
+    for leg, kwargs in legs.items():
+        with pytest.raises(SignalFileNotFoundError) as excinfo:
+            read_ohlc_dataframe(
+                _PAIR, 60, funding_features_file=missing, **kwargs
+            )
+        err = excinfo.value
+        message = str(err)
+        assert err.config_key == "funding_features_file", leg
+        # The producer command is the half that makes it a fix rather than a
+        # complaint: without config_key there is no key to look up.
+        assert err.producer == "just funding-pull", leg
+        assert "funding_features_file is set to" in message, leg
+        assert "just funding-pull" in message, leg
+        assert "the signal-file config key" not in message, leg
+
+
 def test_null_market_data_store_still_takes_the_live_pass_through(
     monkeypatch,
 ) -> None:

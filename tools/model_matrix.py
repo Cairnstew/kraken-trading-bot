@@ -148,6 +148,19 @@ REQUIRED_BACKTEST_FIELDS: tuple[str, ...] = (
 #: reported as its own reason code so the cause is legible.
 NULLABLE_BACKTEST_FIELDS: frozenset[str] = frozenset({"n_bars"})
 
+#: The RL config keys that name an exogenous-signal file.  Mirrors
+#: ``kraken_trading_bot.rl.data._SIGNAL_CHANNELS``, which is the definition
+#: on the producing side; a refusal from that seam always opens with one of
+#: these keys followed by " is set to" (see ``classify_process_failure``).
+#: Spelled out here rather than imported because this harness deliberately
+#: matches the *text the CLI prints*, not Python internals — the RL package
+#: is not a dependency of ``tools/model_matrix.py``.
+_SIGNAL_CONFIG_KEYS: tuple[str, ...] = (
+    "extra_features_file",
+    "funding_features_file",
+    "social_features_file",
+)
+
 #: Metrics that must be finite for a cell to count as a measurement.
 NUMERIC_METRICS: tuple[str, ...] = (
     "total_return",
@@ -883,6 +896,15 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
     had been feeding text containing ``FileNotFoundError`` and
     ``ActionSpaceMismatchError``. Both spellings are accepted here so a
     future traceback (or an uncaught raise) still classifies.
+
+    ``signal_file_not_found`` is the one that matters at scale. Before the
+    2026-10-02 signal-seam fix, a configured-but-unreadable signal file was
+    a WARNING and the run *succeeded* on narrower features; that fix made it
+    raise by name instead (see ``SignalFileNotFoundError``). Because the
+    shipped ``configs/default.yaml`` sets ``funding_features_file``
+    non-null, every cell of a matrix on a checkout without that file now
+    fails the same way — which is precisely the whole-matrix "why is
+    nothing working" shape that a bare ``process_failed`` cannot explain.
     """
     reasons: list[str] = []
     rc = (record.get("returncodes") or {}).get("backtest")
@@ -920,6 +942,21 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
         # A pinned window left no tradable bar (eval slice shorter than
         # the warm-up). It RAISES rather than returning n_bars: 0.
         reasons.append("no_tradable_bar")
+    # Real CLI text: "funding_features_file is set to '~/...' but no file
+    # exists at /home/... (expanded from '~/...').  Produce it with: just
+    # funding-pull."  -- the seam's own two-state refusal (a null key is
+    # silent, a SET key that cannot be used raises by name).  Matched on
+    # "<config_key> is set to", which is how every message from
+    # SignalFileNotFoundError opens, because that prefix is the one part
+    # guaranteed to carry the key; the traceback spelling carries the class
+    # name instead.  Deliberately NOT folded into config_not_found: a
+    # missing --config and a missing signal file are different fixes (write
+    # a YAML file vs run the producer), and conflating them would send a
+    # reader to the wrong one.
+    if "SignalFileNotFoundError" in text or any(
+        f"{key} is set to" in text for key in _SIGNAL_CONFIG_KEYS
+    ):
+        reasons.append("signal_file_not_found")
     return reasons
 
 

@@ -305,6 +305,7 @@ clothes. A harness that averages it in is worse than no harness.
 | an **action-space mismatch** — the model's recorded `action_space` disagrees with the run's | a policy bound to the wrong space emits actions it never learned to emit |
 | a pinned window left **no tradable bar** | the eval slice is shorter than the warm-up; it *raises* rather than returning `n_bars: 0` |
 | the `--config` path does not exist | deliberately raises, so nobody silently falls back to a zero-cost model config |
+| a **configured** signal file (`funding_features_file` / `extra_features_file` / `social_features_file`) is unreadable or empty | `signal_file_not_found`; a `null` key is silent, a **set** key is a declared intent to use it, so it raises by name. The shipped `configs/default.yaml` sets `funding_features_file`, so this is the *whole-grid* failure on a checkout without that file — which is exactly why it is named rather than a bare `rc=1` |
 
 Those RL-side refusals are **classified by name** (`classify_process_failure`)
 so `run` reports *why* rather than an opaque `rc=1`. They are surfaced and
