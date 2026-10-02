@@ -269,6 +269,87 @@ class MarketDataStoreUnavailableError(ValueError):
         )
 
 
+class PinnedWindowUnavailableError(NotEnoughDataError):
+    """Raised when a pinned ``data_window`` does not overlap the bars that exist.
+
+    The one diagnosable shape of "not enough data", and the failure mode
+    the whole ``data_window`` block was built to be worth using for.
+    ``data_window.since``/``until`` is the documented way to get a
+    genuinely out-of-sample run, and against Kraken's REST leg it clips
+    to **zero** bars: that API serves up to 720 of the most recent
+    entries and says outright that older data cannot be retrieved
+    *regardless of* ``since``.  The bare failure this replaces was
+    ``NotEnoughDataError("Not enough OHLC bars: need at least 1 bars
+    (max feature window + warmup), got 0")`` -- which states how many
+    bars were wanted and how many arrived, and nothing whatsoever about
+    why.  A reader who has just spent 160 seconds training has no way to
+    tell "the pair is illiquid" from "you asked for 2020 and nothing
+    before 2026 exists on this feed".
+
+    A **subclass of** :class:`NotEnoughDataError` (itself a
+    ``ValueError``), so every caller and test that already catches
+    either keeps working unchanged -- the hierarchy is the same, only the
+    message grew, which is the house pattern
+    (:class:`MarketDataStoreUnavailableError` does the same for the store
+    leg).  Deliberately *not* fired for an ordinary short frame: a
+    frame that overlaps the pinned window but holds too few bars keeps
+    raising plain :class:`NotEnoughDataError`, because "widen
+    ``--pages``" is the right advice there and "seed the store" is not.
+
+    ``NotEnoughDataError.__init__`` is bypassed on purpose: it composes
+    its own one-line message, and this class owns the whole sentence.
+    ``needed``/``available`` are still set, so any existing reader of
+    those attributes is unaffected.
+
+    Attributes:
+        reason: Short machine-ish cause, e.g. ``"pinned window is
+            entirely outside the available bars"``.
+        window: :meth:`DataWindow.describe` text of the pin.
+        requested_range: Human ``since``/``until`` the pin asked for.
+        available_span: Human span of the bars that were actually read,
+            or ``None`` when the read returned nothing at all.
+        n_available: Bars actually read before the clip.
+        needed: Inherited from :class:`NotEnoughDataError`; always ``1``.
+        available: Inherited from :class:`NotEnoughDataError`; mirrors
+            ``n_available``.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        window: str,
+        requested_range: str,
+        available_span: str | None,
+        n_available: int,
+    ) -> None:
+        self.reason = reason
+        self.window = window
+        self.requested_range = requested_range
+        self.available_span = available_span
+        self.n_available = int(n_available)
+        self.needed = 1
+        self.available = int(n_available)
+        span = available_span or "nothing at all (the read returned 0 bars)"
+        # `reason` is written as a clause, not a sentence; terminate it
+        # here so the concatenated paragraph reads as prose.
+        clause = reason if reason.endswith(".") else reason + "."
+        ValueError.__init__(
+            self,
+            f"Pinned data_window {window} does not overlap the "
+            f"{self.n_available} bar(s) that were actually read: requested "
+            f"{requested_range}, available {span}. The overlap is EMPTY, so "
+            f"the pin left 0 bars and the run cannot start. Cause: {clause} "
+            f"Kraken's REST OHLC endpoint serves up to ~721 recent bars and "
+            f"states that older data cannot be retrieved regardless of "
+            f"`since`, so a `since` older than the trailing window can never "
+            f"reach it. Fix: seed the store and point market_data_store at it "
+            f"-- {STORE_SEED_HINT} Or widen/clear the window: set "
+            f"data_window.since/until to null for the unpinned default, or to "
+            f"dates inside the span above."
+        )
+
+
 class SignalTickerMismatchError(ValueError):
     """Raised when a signal file holds no record for the requested pair.
 
@@ -1469,6 +1550,7 @@ __all__ = [
     "DEFAULT_STORE_VENUE",
     "MarketDataStoreUnavailableError",
     "NotEnoughDataError",
+    "PinnedWindowUnavailableError",
     "SEEDED_STORE_VENUE",
     "STORE_SEED_HINT",
     "SignalFileNotFoundError",
