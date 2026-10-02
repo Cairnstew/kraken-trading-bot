@@ -1,791 +1,569 @@
-# RESEARCH-3 — CAND-3 (the ~721-bar ceiling), CAND-4 (no retry), CAND-5 (no dispersion gate)
+# RESEARCH-3 — Gap G3: no retry / backoff / rate-limit handling on the OHLCV fetch path
 
-**Pass:** PHASE 2 research, `audit-pipeline-1002`, agent `researcher3`
-**HEAD researched:** `ca107fa` ("docs: data-pipeline pass 2026-10-02 — Phase 1 audit artifact")
-**Reads:** `AUDIT.md` §2 rows G3/G8, §3 CAND-3/CAND-4/CAND-5
-**Mode:** read-only except this file. No code written, nothing committed, nothing deleted. All
-measurement done in `/tmp/krb-cand3/`.
-
-Every number below is measured on this host unless it is quoted from a first-party document, in
-which case the source is named. Nothing is estimated.
+**Role:** Researcher 3, Phase 1 data-pipeline audit. **READ-ONLY** — the only file this pass
+writes is this one. Task `task_murj290u_0004_g9uh2j`.
+**Checkout:** `/home/seanc/Projects/kraken-trading-bot` @ `4fd3b77`; sibling
+`/home/seanc/Projects/kraken-python` @ `81de597`.
+**Scope:** AUDIT.md §5 Q3 — *where should the retry live?* — plus the library/pattern survey
+that answers it, and the visibility half of the gap (`engine.py`'s bare `except`).
 
 ---
 
-## 0. Executive answer
+## 0. Verdict up front
 
 | Question | Answer |
 |---|---|
-| Store build cost | **158 s wall-clock, 13 MB, 3 commands, zero code.** `market_data_store` is a pure config flip — **proved**: `read_ohlc_dataframe` returned **76,561 bars in 0.48 s** from a seeded store with no code change. |
-| Kraken OHLCVT vs Binance archive | Kraken publishes a real, keyless, venue-consistent archive. **It is still the wrong source, and the reason is publication lag, not basis.** Binance monthly + Kraken-REST forward accumulation beats it on every axis that matters to this pipeline. |
-| Cross-venue basis | Measured on 2,184 real common hourly bars: **+5.41 bps mean, 6.52 bps std, drifting −0.7 → +13.4 bps across the quarter.** The level offset is harmless (everything is z-scored). The *liquidity* gap is not: **18.6× notional, 126× trade count.** |
-| `since`/`until` push-down | **~15 lines, and worth almost nothing on its own.** `since` is a no-op on the non-store leg — Kraken's own OpenAPI says *"older data cannot be retrieved, regardless of the value of `since`."* With a store it is an efficiency win only. **Do not lead with it.** |
-| CAND-4 | **~40 lines, no new dependency needed** — the retrying client is already shipped in the sibling (`market_data.client.KrakenClient`). Plus a 2-line cursor-advance guard that kills a **measured 5-of-6 wasted API calls**. |
-| CAND-5 | **~50 lines, all inputs already computed and printed.** A count gate cannot distinguish a resolved effect from a noise-ranked one; the harness already holds the numbers that can. |
-| Do 4 and 5 gate the others? | **CAND-5 gates every claimed effect, including CAND-3's.** CAND-4 does **not** gate the G3 push-down — nothing gates the push-down. See §7. |
+| Where does the retry go? | **`data.py:_page_candles` now; upstream `transport.py` as a separate, later change.** (c) is the correct *end state*; (a) is the only *effective today*. |
+| Which library? | **No new dependency.** `urllib3.Retry` for transport-level status/connection retries (already installed transitively) **+ a hand-rolled full-jitter resume loop in `_page_candles`** for the envelope-level case. `tenacity` is the right answer *if* a dependency is acceptable. |
+| Why hand-rolled and not `tenacity`/`urllib3` alone | **Kraken signals a rate limit with HTTP 200 and an `{"error": [...]}` body.** `urllib3.Retry` is status-code-driven only and can never see it. Verified: `urllib3/util/retry.py:424-442` (`is_retry(self, method, status_code, has_retry_after)` — no body inspection anywhere). |
+| How does the failure become visible? | A `RateLimitExhaustedError(ValueError)` in `data.py` beside the existing three, plus a `_reason` code on the engine's tick dict. `errors.py` is the wrong home — it re-exports the sibling's hierarchy verbatim. |
+| Hard blocker for any fix | `EAPI` vs `EService` vs HTTP-429 currently produce **three different exception types** out of the wrapper. A retry keyed on `RateLimitError` alone silently misses two of the three. |
 
 ---
 
-## 1. Store build cost, precisely (Q1)
+## 1. New evidence beyond the lead's verified list
 
-### 1.1 Measured: it is three commands and under three minutes
+The lead's list is correct and I re-confirmed every line. These four items are **additional**
+and each one changes the shape of the fix.
 
-The store root `~/Projects/kraken-market-data/store` does not exist (confirmed: `ls` → *No such
-file or directory*). I built a real one under `/tmp/krb-cand3/store2` and measured it.
+### 1.1 The throttle is off by default — `min_interval` defaults to `0.0`
 
-```
-# The sibling store's own dev shell (pandas 3.0.4, pyarrow 24.0.0, market_data 0.1.0)
-cd ~/Projects/kraken-market-data
-nix develop --command bash -c \
-  "PYTHONPATH=$HOME/Projects/kraken-deep-history:$HOME/Projects/kraken-market-data \
-   python $HOME/Projects/kraken-deep-history/cli.py seed \
-     --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store2"
-```
+`kraken-python` has *a* rate-limit mechanism, and it is a no-op in the shipped configuration:
 
-| Ticker | Range | Months requested | Months downloaded | Bars | Wall clock | On disk |
-|---|---|---|---|---|---|---|
-| `ETH/USD` | 2018-01-01 → now | 106 | 104 | 75,840 | **57.9 s** | 4.6 MB |
-| `BTC/USD` | 2018-01-01 → now | 106 | 104 | 75,840 | **~60 s** | 4.4 MB |
-| `SOL/USD` | 2020-09-01 → now | 74 | 72 | 52,565 | **~40 s** | 4.0 MB |
-| **total** | | | **280** | **204,245** | **~158 s** | **13 MB** |
+* `/home/seanc/Projects/kraken-python/kraken_api/transport.py:108` — `min_interval: float = 0.0`
+* `kraken_api/auth.py:73` — `min_interval = float(_env(ENV_MIN_INTERVAL) or 0.0)`
+* `kraken_api/auth.py:42` — `ENV_MIN_INTERVAL = "KRAKEN_MIN_INTERVAL"`
+* `nix/module.nix:149-153` — `minInterval` is `lib.types.nullOr lib.types.str`, **`default = null`**
+* `nix/module.nix:205` — the env line is `lib.optional (cfg.settings.minInterval != null)`, i.e. absent by default
+* `.env.example:10-11` — `# KRAKEN_MIN_INTERVAL=0.1`, **commented out**
 
-Cost per bar: **60 bytes** (parquet, month-sliced). Cost per month: **~0.56 s**, ~42 KiB. All
-three seeds report `"store_mode": "market-data"` — i.e. real parquet, readable by the bot.
+Both fetch legs build their manager with `KrakenManager.from_env()` (`data.py:1174-1177`,
+`data.py:1359-1362`), which routes through `auth.py:83-90`. So `_throttle()`
+(`transport.py:181-186`) returns immediately at `transport.py:181-182` and **the deployed bot
+sends zero inter-call spacing**. The gap is worse than "fixed spacing instead of adaptive":
+there is no spacing at all, and no retry.
 
-A 12-month ETH/USD seed for comparison: **9.3 s, 956 KB** (that run fell into `fallback-csv`
-because I had not put `kraken-market-data` on `PYTHONPATH` — see §1.3).
+> Consequence for the fix: an upstream-only "make the throttle adaptive" change would be a
+> **no-op** for this repo as configured unless `nix/module.nix`'s `minInterval` default or the
+> recipe wiring also moves. Worth calling out to the architect.
 
-### 1.2 `plan` is free and the on-disk shape is stable
+### 1.2 Three distinct failure shapes leave the wrapper, and a `RateLimitError` catch misses two
 
-```
-python cli.py plan --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store
-# -> 106 monthly URLs, 1.4 s, zero network
-```
-`plan` emits `https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1h/ETHUSDT-1h-YYYY-MM.zip`.
+`transport.py` produces rate-limit information through three different channels, and only one
+of them is a `RateLimitError`:
 
-Measured on-disk shape after the seed — **exactly** what `INTEGRATION.md` documents:
-
-```
-/tmp/krb-cand3/store2/
-├── _meta.json                     # {"schema":1,"cursors":{"ETH_USD:60":{"since":1788217200,"updated_iso":"..."}}}
-├── ETH_USD/60/2018-01.parquet      # 104 files for ETH_USD/60, 42.5 KiB avg
-└── ...                            # XBT_USD/60/, SOL_USD/60/
-```
-
-Read back:
-
-```
-MarketDataStore('/tmp/krb-cand3/store2').read('ETH/USD', 60)
-  shape (75840, 8)
-  time int64 | open/high/low/close/vwap/volume float64 | count int64
-  index: DatetimeIndex tz=UTC, name='time'
-```
-
-### 1.3 The one build trap: `store_mode` silently degrades to `fallback-csv`
-
-`kraken-deep-history`'s own `nix develop` has **only pytest** — no pandas, no pyarrow, and
-`market_data` is not importable (verified: `ModuleNotFoundError: No module named 'market_data'`).
-`_open_store` (`seeder.py:409-418`) catches `ImportError` and silently returns
-`FallbackStoreWriter`. The JSON report then says `"store_mode": "fallback-csv"` — and that mode
-writes **`.csv` files**, which `MarketDataStore.read` cannot see (it globs `*.parquet`).
-
-I hit this on my first run without noticing the field. **The report's `store_mode` key is the
-only signal**, and it is easy to miss. Two ways out, both fine:
-- run the seed from `kraken-market-data`'s dev shell with `PYTHONPATH` covering both repos (what
-  I did), or
-- seed in `fallback-csv` and then `kraken-market-data backfill --pair X --interval 60 --csv …`
-  (`store.py:423` `upsert_csv`).
-
-This is a 1-line-of-documentation fix in `kraken-deep-history/README.md`, not a code change.
-
-### 1.4 Is `market_data_store` a config flip? **Yes — proved end to end.**
-
-The bot's dev shell *already* carries the sibling (`flake.nix:62,74` →
-`"sibling deps: kraken-market-data, pyarrow, requests"`). No install work. And the store leg is
-already wired (`data.py:1052-1208` `read_ohlc_dataframe`, `data.py:1211` `_resolve_store`).
-
-Measured, against the store I just seeded, from `~/Projects/kraken-trading-bot`:
-
-```python
-read_ohlc_dataframe('ETH/USD', interval=60, pages=1,
-                    market_data_store='/tmp/krb-cand3/store2')
-# shape (76561, 11) elapsed 0.48 s
-# index 2018-01-01 00:00:00+00:00 -> 2026-10-02 12:00:00+00:00
-# cols  time open high low close vwap volume count
-#       vwap_dev trade_count_zscore_20 volume_per_trade
-```
-
-**76,561 bars — 106× the 721-bar ceiling — from one config value, 0.48 s, zero code changes.**
-(76,561 > 75,840 because the `pages=1` live-append leg upserted the current 721 bars on top of the
-seed: fetch → upsert → read, exactly as documented.)
-
-### 1.5 Read/write contract, measured
-
-| | |
-|---|---|
-| `read(pair, interval, since=None, until=None)` | inclusive `since`, exclusive `until`, on bar-bucket start; globs only the months the window touches (`store.py:168-169`); empty window → empty frame with the same columns, caller decides |
-| `upsert(pair, interval, candles)` | dedupes on bar `time`, **keeps last** (re-poll overwrites the still-forming bar with Kraken's revision) |
-| `set_cursor` / `cursor` | `since`-cursor sidecar per `(PAIR_ID, interval)` in `_meta.json`; this is what makes the forward poller append-only |
-| whole-store read | 75,840 rows × 5 reads = **0.71 s** → 0.142 s/read |
-| windowed read (2 months) | **0.010 s** — 14× faster, because it touches 2 parquet files instead of 104 |
-
-**Answers:** yes, it is a config flip once seeded. **There is no code work on the bot side at
-all.** The whole of CAND-3's store half is: seed once (158 s, 13 MB, `/tmp`-safe), set one YAML
-key. `INTEGRATION.md §5` already lists the *follow-on* code (honour `since`/`until`, train/eval
-split, walk-forward) — see §4 for which of those are worth doing now.
-
----
-
-## 2. Kraken's OHLCVT archive vs Binance's — the central judgement (Q2)
-
-### 2.1 What Kraken actually publishes
-
-Source: <https://support.kraken.com/hc/en-us/articles/360047124832-Downloadable-historical-OHLCVT-Open-High-Low-Close-Volume-Trades-data>
-("Last updated: September 16, 2026"). Quoted and measured:
-
-| Fact | Value | How verified |
-|---|---|---|
-| Coverage | "each pair from its first trade on Kraken through **30 June 2026**" | page text |
-| Increments | "at the end of each **quarter**", single ZIP, no reassembly | page text |
-| Complete dataset | 5 parts × `2097152000` B = **10,485,760,000 B ≈ 10.5 GB**, all 1,399 pairs | `curl -I` `content-length` on `.part00` |
-| Reassembled ZIP sha256 | `fc81b54cba6e12af3e9422dde9416179e6ef76af4831d48d839fbdb43018eaa4` | page text |
-| Per-part sums | `https://assets.kraken.com/marketing/institutions/OHLCVT_Full_PARTS_SHA256SUMS.txt` | fetched, 515 B, 5 lines |
-| Incremental ZIP | `Kraken_OHLCVT_2026Q2.zip` = **537,866,903 B ≈ 538 MB** | `curl -I` |
-| Throughput (this host) | **~21 MB/s** single-stream (40 MiB range GET × 2) | `curl -r 0-41943039` |
-| ⇒ full-archive time | ~500 s one stream, ~100–170 s across 5 parallel parts | arithmetic |
-| ⇒ incremental time | ~26 s | arithmetic |
-| Rate limits | **None published.** No `x-ratelimit`, no `retry-after` header on `assets.kraken.com`; `cache-control: public,max-age=86424`, `last-modified: 2026-09-14` | `curl -I` |
-| Auth | none | — |
-| Terms | Kraken's general ToS / legal disclosures. Nothing in the article restricts redistribution or automated download; it says "These materials are for general information purposes only." | page text |
-
-I read the real archive rather than the marketing page. `Kraken_OHLCVT_2026Q2.zip` central
-directory (ranged GET of 589,176 B at offset 537,277,705) parses to **9,795 entries**; its
-`MANIFEST.json` (extracted via ranged GET):
-
-```json
-{"product":"ohlcvt","schema_version":1,"release":"r1",
- "columns":["timestamp","open","high","low","close","volume","trades"],
- "has_header":false,
- "coverage":{"start":"2026-04-01","end":"2026-06-30"},
- "pairs":1399,"files":9793,"rows":35247327,"generated":"2026-08-17"}
-```
-
-Real extracted data (`ETHUSD_60.csv`, 2,184 rows, flat, no directories):
-
-```
-1775001600,2103.25,2115.26,2095.55,2112.38,1259.76951889,761
-1775005200,2113.11,2113.56,2090.14,2091.15,1216.79762041,785
-```
-
-Five hard facts fall out of this that the audit did not record:
-
-1. **No `vwap` column.** `columns` is 7 long; the store contract is 8 (`time, open, high, low,
-   close, vwap, volume, count`, `store.py:63`). Kraken's own REST `OHLC` row schema *does* carry
-   `vwap` (Kraken OpenAPI `tickData`: `[time, open, high, low, close, vwap, volume, count]`). So
-   the bulk archive is **strictly poorer than the REST endpoint on shape**. Consequence measured in
-   §2.4.
-2. **No header row** (`has_header: false`), so a CSV writer that assumes one silently misreads.
-3. **Gaps are not zero-filled** — "Only intervals in which trades occurred are included". At 60 m
-   this is a non-issue for liquid pairs: ETHUSD_60 has exactly 2,184 rows = 91 d × 24, i.e.
-   perfectly dense for Q2. It bites at 1 m/5 m.
-4. **The article's interval list contradicts its own MANIFEST.** The intro says "1, 5, 15, 30,
-   60, 240, 720 and 1440"; the "About the data" section and every actual filename is
-   `1/5/15/60/240/720/1440` — **30 is absent** (see `0GEUR_1.csv … 0GEUR_720.csv`, no `_30`).
-   A reader built from the intro paragraph would request a file that does not exist.
-5. **Naming is Kraken's WS notation**: `{PAIR}_{INTERVAL}.csv`, e.g. `XBTUSD_60.csv` — note
-   **XBT, not BTC**, and it does *not* match the bot's `normalize_ticker_id`. A reader needs the
-   same alias table the bot already has (`data.py:105` `_TICKER_ALIASES`, `XBT↔BTC`).
-
-### 2.2 The killer: publication lag, not basis
-
-| | Binance archive | Kraken OHLCVT |
-|---|---|---|
-| Cadence | **monthly** (only the incomplete current month 404s) | **quarterly**, ~6-week publish lag |
-| Newest data available today (2026-10-02) | 2026-09 | **2026-06-30** (`coverage.end`), `generated: 2026-08-17` |
-| Staleness at the newest bar | ~3–30 days | **~94 days** |
-
-Measured on my own seed: the ETH seed reported
-`months_downloaded: 104, months_requested: 106, skipped: ["2026-09: … 404", "2026-10: … 404"]`.
-
-**A Kraken-archive-only store is three months stale, and Q3-2026 has not been published at all.**
-So a Kraken-native reader does not replace the store poller — it *joins* it, and you would still
-need a Kraken REST forward leg to cover the gap. Which means the cross-venue basis is **not
-eliminated by using Kraken's own archive**: the tail of your training data comes from REST either
-way, and any seam where a Binance-seeded month meets a Kraken-REST week is a cross-venue seam.
-
-**The correct architecture is the one already in the repo:** deep backfill from Binance (cheap,
-monthly, 2018→) **+ forward accumulation from Kraken REST** (the `kraken-market-data` poller,
-which the store's `update()` already implements and which writes the same `_meta.json` cursor).
-Deep past is cross-venue and *doesn't need to be venue-exact*; the tail — the part the policy is
-actually evaluated on, and the part `backtest.py` replays — is Kraken's.
-
-### 2.3 What the cross-venue basis actually costs — measured, 2,184 real bars
-
-Kraken `ETHUSD_60` vs Binance `ETHUSDT-1h`, Q2-2026 (2026-04-01 → 2026-06-30), both extracted
-from the real archives, joined on bar time. **2,184 of 2,184 matched — zero missing on either
-side.**
-
-**Price level** (close, basis = `(binance − kraken)/kraken`):
-
-| statistic | value |
-|---|---|
-| mean | **+5.41 bps** |
-| median | +4.22 bps |
-| std | 6.52 bps |
-| min / max | −9.28 / +21.48 bps |
-| mean \|diff\| | 6.63 bps |
-| \|diff\| > 5 bps | **48.4 %** of bars |
-| \|diff\| > 10 bps | **29.2 %** of bars |
-| \|diff\| > 25 bps | 0.00 % of bars |
-
-**It is not zero-mean noise — it is a slow level drift** (this is USDT appreciating against USD
-over the quarter):
-
-| period | mean daily basis |
-|---|---|
-| 2026-04 | **−0.72 bps** |
-| 2026-05 | **+6.63 bps** |
-| 2026-06 | **+9.97 bps** |
-| 2026-06-30 (last day) | **+13.38 bps** |
-| weekly series | +3.05 → −2.85 → +3.41 → **+14.12** → +6.34 → **+14.03** → +14.85 bps |
-
-**The two books are genuinely different, not just offset:**
-
-| microstructural fact | value |
-|---|---|
-| bars where Binance `high` > Kraken `high` | **81.3 %** |
-| bars where Kraken's H/L range does **not** contain Binance's close | **11.3 %** |
-| notional traded, Binance ÷ Kraken (median) | **18.6×** |
-| trades per bar, Binance ÷ Kraken (median) | **126×** (97,298 vs 792) |
-| OHLC max abs diff | `open` 21.9 bps, `high` 34.0 bps, **`low` 923 bps** (a Kraken flash-move artefact), `close` 21.5 bps |
-
-**But the quantity the policy trades on is nearly identical:**
-
-| statistic | value |
-|---|---|
-| hourly-return correlation | **0.999081** |
-| hourly-return std | Kraken **58.29 bps** vs Binance **58.30 bps** (indistinguishable) |
-| bars disagreeing on the **sign** of the 1 h return | **2.06 %** |
-| bars where return magnitude differs by >50 % | **3.89 %** |
-| 24 h return correlation | **0.999931** |
-| 24 h return mean \|diff\| / p95 / max | **2.4 / 6.3 / 14.5 bps** |
-| 24 h return sign disagreement | **0.37 %** |
-
-### 2.4 The judgement (not hedged)
-
-**Do not build a Kraken OHLCVT reader. Use Binance for the deep backfill and Kraken REST for the
-forward tail — which is what the repo already does.**
-
-The reasoning, in the order that actually decides it:
-
-1. **The level basis costs nothing here.** Every observation column is z-scored
-   (`environment.py:488-496`), so a *constant* multiplicative offset cancels exactly. And the
-   measured +5.4 bps mean is **9 % of the 58 bps hourly-return std** — it does not compete with
-   the signal. Even the drift (−0.7 → +13.4 bps across a quarter, i.e. ~14 bps total) is 0.24× one
-   hourly sigma.
-2. **The liquidity basis costs a lot, and no source fixes it.** The 18.6× notional and 126×
-   trade-count gap means every volume- and count-normalised feature is measuring a different
-   thing on Binance bars than on Kraken bars: the `volume` group's 6 columns, plus
-   `volume_per_trade` and `trade_count_zscore_20` (`data.py:812-873`). But this is **inherent to
-   venue, not to archive choice** — Kraken's own OHLCVT carries Kraken's own (tiny) trade counts
-   because it is a different book. The pipeline would need a venue handle either way; the
-   honest fix is to *label* the venue per store (`_meta.json` is already where that belongs), not
-   to pay 10.5 GB for the privilege of a second data source.
-3. **The 11.3 % out-of-range bars and 2.06 % sign disagreements are the real cost, and they are
-   irreducible.** No archive makes two venues the same venue. A Kraken reader would remove the
-   basis from the *deep past* while the *tail* — where the policy is scored — stayed cross-venue
-   against the REST poller anyway (§2.2).
-4. **Kraken's archive is strictly poorer on shape.** **No `vwap` column** (`MANIFEST.columns` is 7
-   long vs the store's 8). Consequence, measured on the next line of code:
-   `add_derived_ohlcv_features` (`data.py:846`) gates on `"close" in df.columns and "vwap" in
-   df.columns` — a frame without `vwap` **silently loses `vwap_dev`**, one of the 52 bare
-   observation columns, and the docstring is explicit that "Nothing here raises or warns when the
-   inputs are absent — silently narrower is the honest answer." So a Kraken-OHLCVT store buys you
-   years of bars at the cost of a **silently narrower observation**, which is precisely the failure
-   mode AUDIT §4.5 already flags ("The observation width is a function of runtime file contents,
-   not config"). Adding 7 years to a 51-column observation to lose a column in exchange is a bad
-   trade.
-5. **Cost.** Kraken reader: ~10.5 GB (or 538 MB/quarter) + a new ZIP central-directory reader +
-   `XBT`/alias translation + headerless-CSV handling + a sparse-gap policy + quarterly
-   re-download orchestration. Binance route: **already implemented, tested, and 158 s.**
-6. **Cadence.** Binance monthly vs Kraken quarterly-with-6-week-lag (§2.2).
-
-**One thing the cross-venue route genuinely does not give you, and it should be written down
-rather than argued away:** `Kraken_OHLCVT_Full_2026Q2.zip` is the only venue-exact route to
-*pre-2018-free* history for 1,399 pairs including pairs Binance never listed. If the roadmap ever
-needs a pair outside `TICKER_SYMBOL_MAP`, Kraken's archive is the fallback — and a ranged GET of
-the central directory makes a targeted `ETHUSD_60.csv` extraction 54 KB, not 538 MB. I verified
-that trick works. It is a footnote, not a plan.
-
-**Recommended accompanying change (cheap, and it discharges the audit's caveat properly):** write
-the venue into the store's `_meta.json` alongside the cursor, and surface it in `read_ohlc_dataframe`'s
-log line. Six lines. It converts an unstated data context into a stated one, which is what
-`kraken-deep-history/INTEGRATION.md §6` already promises and does not deliver.
-
----
-
-## 3. The `since`/`until` push-down (Q3)
-
-### 3.1 `since` is a no-op on the non-store leg — this is the headline
-
-Kraken's own OpenAPI description for `GET /0/public/OHLC`, verbatim:
-
-> "Returns up to 720 of the most recent entries (**older data cannot be retrieved, regardless of
-> the value of `since`**)."
->
-> `since`: "Return OHLC entries since the given timestamp (**intended for incremental updates**)"
-
-Measured live against the real endpoint, four different `since` values:
-
-| `since` | rows | `last` | range returned |
-|---|---|---|---|
-| `None` | 721 | 1790938800 | 2026-09-02 12:00 → 2026-10-02 12:00 |
-| now − 30 d | 720 | 1790938800 | 2026-09-02 13:00 → 2026-10-02 12:00 |
-| now − 2 y | **721** | 1790938800 | **2026-09-02 12:00** → 2026-10-02 12:00 |
-| 2018-01-01 | **721** | 1790938800 | **2026-09-02 12:00** → 2026-10-02 12:00 |
-
-Identical `last`, identical range. `since` is an **incremental-update cursor, not a history seek**.
-721 is a **hard REST ceiling** and I am stating that plainly because it changes what the store is
-*for*: **the store is not an optimisation of the REST read, it is the only way to reach bars older
-than 30 days, full stop.** Any design that treats `pages` or `since` as a depth lever is wrong.
-
-### 3.2 `pages` is worse than inert — it is a replay loop (new finding)
-
-`_page_candles` (`data.py:946-956`) breaks on `last == 0` or an empty batch. Kraken never returns
-`last == 0` on a live pair; it returns the *forming* bar's timestamp, which is non-zero. So the
-break never fires and `cursor = last` never advances past page 1. Measured:
-
-```
-pages=1 ->   721 raw candles (721 unique), 1 API call, 0.2s
-pages=2 ->   723 raw candles (721 unique), 2 API calls, 0.1s
-pages=3 ->   725 raw candles (721 unique), 3 API calls, 0.1s
-pages=6 ->   731 raw candles (721 unique), 6 API calls, 0.3s
-```
-
-Instrumented call-by-call for `pages=6`:
-
-```
-call 1 (since=None):              721 rows, last=1790942400, NEW bar times=721
-call 2 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
-call 3 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
-call 4 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
-call 5 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
-call 6 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
-TOTAL: 6 API calls, 721 new bar times, 10 duplicate rows discarded by data.py:1031
-```
-
-**Calls 2–6 are byte-identical requests.** The default `pages=6` (`data.py:962`, `data.py:1056`)
-buys 5 wasted API calls and 0 extra bars per read, on every `train`, `backtest` and `paper-trade`
-tick. A `if last == cursor: break` guard is the whole fix (and belongs in CAND-4 — see §6.2).
-
-### 3.3 Sizing the push-down
-
-| | |
-|---|---|
-| Change | `train.py:215-226` and `backtest.py:400-419` gain `since=`/`until=` from `resolve_data_window(cfg)`, converted to epoch seconds |
-| Plumbing that already exists | `read_ohlc_dataframe(since=, until=)` (`data.py:1057-1058`) → `store.read` (`data.py:1191`). `resolve_data_window` already parses ISO-8601 bounds into `pd.Timestamp` (`data_window.py:100+`). Nothing in the seam needs touching. |
-| Sibling to copy | `paper_trade.py` and `backtest.py` already read `market_data_store` from run config (`backtest.py:414-419`) — same pattern, same line |
-| Non-store leg | **Still `fetch_ohlc_dataframe` and still 721 bars.** `fetch_ohlc_dataframe` accepts `since` and forwards it to `_page_candles` (`data.py:964,1021`) — where §3.1 proves it does nothing. So the push-down must be documented as store-only, or it will read as a fix that isn't one. |
-| Diff size | **~15 lines** across two files |
-| Risk if done without a store | **None** (verified inert) but also **no benefit**, and it invites the reader to believe `since` works on REST. |
-
-### 3.4 Is it correctness or efficiency? **Efficiency — measured.**
-
-With a seeded store, `data_window.clip_to_window` (the post-hoc clip both callers use today)
-produces **the same bars as the pushed-down read**:
-
-```
-post-hoc clip   : 2158 bars 2021-01-01 00:00 -> 2021-03-31 23:00
-pushed-down read: 2158 bars 2021-01-01 00:00 -> 2021-03-31 23:00
-IDENTICAL bar times: True
-```
-
-One real difference, found by comparing NaN counts rather than values:
-
-```
-NaN counts, post-hoc clip : vwap 1, vwap_dev 1, trade_count_zscore_20 0,  volume_per_trade 1
-NaN counts, pushed-down    : vwap 1, vwap_dev 1, trade_count_zscore_20 19, volume_per_trade 1
-max abs diff where both defined: 1.46e-13
-```
-
-Pushing `since` in means `trade_count_zscore_20`'s 20-bar rolling window has **19 bars of warm-up
-inside the returned frame instead of reaching back across the window boundary**, so those 19 bars
-become NaN → `ffill().fillna(0.0)` → a 0.0 z-score instead of a real one. Beyond bar 20 the two
-agree to 1.5e-13. So the push-down is a small *regression* at the leading edge, in exchange for:
-
-| | whole store | pinned window |
-|---|---|---|
-| `read_ohlc_dataframe` | 0.42 s (76,561 bars) | **0.187 s** |
-| `FeaturePipeline.compute` | 0.12 s | **0.04 s** |
-
-**Verdict: worth ~15 lines, but only as a documented store-only efficiency change, and only
-after the store is seeded. It is not a prerequisite for anything else and should not be led
-with.** If a `since`-aware walk-forward (CAND-7) ever needs per-episode bounded reads, the same
-15 lines become the enabling seam — so the cheap thing is to land them *with* CAND-3's store, not
-as a separate claim.
-
-**One genuine correctness win that *does* need the push-down, and is worth naming:** with a store,
-`read_ohlc_dataframe` currently reads the **whole store** and then clips. The audit's claim that
-"`data_window` is only a post-hoc mask on a trailing fetch" is *true of the non-store leg* and
-**mildly overstated for the store leg** — with the store there is no clipping-to-empty failure
-mode, only wasted work. The real `NotEnoughDataError` risk (`data.py:1297-1298`) is confined to
-runs **without** `market_data_store`.
-
----
-
-## 4. CAND-4 — retry / backoff / partial salvage (Q4)
-
-### 4.1 The gap, restated exactly
-
-`data.py:946-956`:
-
-```python
-collected: list[Any] = []
-cursor: int | None = since
-for _ in range(pages):
-    batch, last = manager.ohlc(pair, interval=interval, since=cursor)   # no try
-    if batch: collected.extend(batch)
-    if last == 0 or not batch: break
-    cursor = last
-return collected
-```
-
-No `try`, no retry, no backoff, no sleep, no salvage. Pages 0..k−1 are discarded and the exception
-propagates through `fetch_ohlc_dataframe` → `read_ohlc_dataframe` → `train_ticker` →
-`cmd_train`'s blanket handler (`cli.py:511-516`), which prints `Error training …` and returns 1.
-
-### 4.2 What already exists — this is the whole answer to "which library"
-
-The repo's dependency set is `kraken-python, pandas, numpy, gymnasium, pyyaml` plus sibling
-`kraken-market-data, pyarrow, requests` (`flake.nix:62,74`). **No `tenacity`. No
-`HTTPAdapter`/`urllib3.Retry` mounting.** But:
-
-| layer | retry? | backoff? | throttle? | where |
+| # | Kraken signal | Path through `transport.py` | Exception the caller sees | `isinstance(exc, RateLimitError)`? |
 |---|---|---|---|---|
-| `kraken_api/transport.py:_request` | **no** — `raise_for_status()` then bare `raise` | no | `_throttle()` (`min_interval`, **default `0.0`**) | `transport.py:179-217` |
-| `kraken_api` error classification | yes — `RateLimitError` on `_RATE_LIMIT_MARKERS = ("EAPI:Rate limit exceeded", "EGeneral:Too many requests")` | — | — | `transport.py:45-48, 249-250` |
-| **`market_data.client.KrakenClient._public`** | **YES** | **YES** — `backoff_seconds(attempt, base=retry_backoff)` | **YES** — `RateLimiter(min_interval)` | `client.py:114-147`, `utils.py:180-211` |
-| `data._page_candles` | no | no | no | `data.py:946-956` |
+| 1 | `EAPI:Rate limit exceeded` in a 200 body | `transport.py:249-250` (marker `_RATE_LIMIT_MARKERS`) | `RateLimitError` | **yes** |
+| 2 | `EService: Throttled: [UNIX timestamp]` in a 200 body | `transport.py:249-251` — marker miss | `APIError` | **NO** |
+| 3 | a genuine HTTP 429 | `transport.py:205-206` → `raise_for_status()` → `transport.py:210-221` logs and re-raises | `requests.HTTPError` | **NO** |
 
-**The retrying client is already written, already tested, already a dependency of the bot, and
-already implements the exact duck type `_page_candles` consumes** (`ohlc(pair, interval, since) ->
-(candles, last)`). Its knobs are env-overridable (`KRAKEN_RETRY_BACKOFF`) and it defaults to
-`retry_backoff=0.5`, `timeout=20.0`.
+Evidence:
 
-So the options, cheapest first:
+* `transport.py:45-48` — `_RATE_LIMIT_MARKERS = ("EAPI:Rate limit exceeded", "EGeneral:Too many requests")`.
+  **`EService` appears nowhere** in the whole package — `grep -rn "EService\|Throttled\|Retry-After\|retry_after\|429" kraken_api/` returns **no hits**.
+* Kraken's current docs (fetched live, see §4) list **`EService: Throttled: [UNIX timestamp]`
+  "Try again after [timestamp]"** as one of two official rate-limit errors. It is the *only*
+  one that tells the client when to come back, and the wrapper does not recognise it.
+* `EGeneral:Too many requests` is in the marker tuple but does **not** appear anywhere in
+  current Kraken documentation. It is a stale marker.
+* A real HTTP 429 dies at `response.raise_for_status()` (`transport.py:205`), i.e. *before* the
+  error-envelope branch that raises `RateLimitError`. `requests.HTTPError` escapes through the
+  `except requests.RequestException` handler at `transport.py:210-221`, which **logs and re-raises**.
 
-1. **Swap the source — 1 line per call site.** `read_ohlc_dataframe` already has
-   `market_data_source` (`data.py:1066, 1165`) documented as "Anything exposing
-   `ohlc(pair, interval, since) -> (candles, last)` works (a live `KrakenManager`, **the store's
-   own thin client**, or a fake in tests)." Passing `market_data_source=market_data.client.KrakenClient.from_env()`
-   buys retry+backoff+throttle for free. **This is the recommendation** — it is house-style
-   (duck-typed seam already declared), needs no new dependency, and is testable with the existing
-   fake-source pattern in `tests/test_rl_data_store.py`.
-2. **`HTTPAdapter(max_retries=urllib3.Retry(...))` on the session** — `requests` and `urllib3` are
-   both already present transitively. Fine, but it puts the policy inside a third-party object where
-   the repo's structured-logging convention (`log_event`) cannot see it, and it cannot do
-   **partial salvage** (which is the more valuable half).
-3. **`tenacity`** — a new dependency. The retry logic here is ~15 lines; adding a dependency for
-   it is not worth it, and it would be the only one in the repo.
+> **This is the single most important finding for the implementer.** The obvious fix —
+> `except RateLimitError: backoff_and_retry(...)` — is **wrong**, and silently so: it catches
+> case 1 and neither of the others. Any caller-side retry must catch on
+> `(RateLimitError, APIError, requests.RequestException)` or, better, be keyed on a
+> predicate that inspects the message.
 
-### 4.3 Rate limits: published, and they did not reproduce — reported honestly
+### 1.3 `EService: Throttled` carries a retry-after timestamp, and it is Kraken's `Retry-After`
 
-Kraken's published spot REST limits (`docs.kraken.com/api/docs/guides/spot-rest-ratelimits`):
-Starter **max counter 15, decay −0.33/sec** (≈ one call per 3 s sustainable); Intermediate 20 /
-−0.5/s; Pro 20 / −1/s. Error strings: `"EAPI:Rate limit exceeded"` and
-`"EService: Throttled: [UNIX timestamp]"` — the latter **carries a retry-after timestamp**.
-"If the rate limits are reached, additional calls will be restricted for a few seconds (or
-possibly longer if calls continue to be made while the rate limits are active)."
+Kraken does **not** use an HTTP `Retry-After` response header. It embeds a UNIX timestamp in
+the error string: `EService: Throttled: [UNIX timestamp]` — see §4 for the doc quote. That is
+the functionally equivalent signal, and it is currently thrown away twice over: the wrapper
+does not match the marker, and even if it did, `RateLimitError(errors, endpoint=path)`
+(`/home/seanc/Projects/kraken-python/kraken_api/errors.py:31`) carries the raw list with no
+parsed field.
 
-**Measured: a burst of 16 rapid keyless `/public/OHLC` calls from this host returned 16/16 OK, and
-8 calls at 2.5/s returned 8/8 OK.** No throttle. The counter is documented as per-API-key
-("Each API key's counter is separate"), and the RL read path is keyless. So:
+So the correct `wait` is **not** a pure exponential schedule — it is
+`max(exponential_full_jitter, parsed_retry_after - now)`. That is a genuinely better retry than
+any library gives you out of the box, and it is the one Kraken asked for.
 
-- **Refinement of the audit's implicit framing:** rate limiting is **not** the observed exposure on
-  the keyless public path. Transient network failure and 5xx are. CAND-4 should be scoped as
-  *resilience*, not *rate-limit compliance*.
-- **The retry parser should still handle `EService: Throttled: [UNIX timestamp]`** (honour the
-  timestamp) and `EAPI:Rate limit exceeded` (back off). Both are cheap and both are the documented
-  behaviour if a key or a higher tier is ever introduced.
-- **The 5-wasted-calls finding (§3.2) is the concrete rate-limit win** available today: it takes
-  the default read from 6 calls to 1 with no behaviour change.
+### 1.4 Upstream is a pinned flake input — an upstream-only fix would be invisible to `just`
 
-### 4.4 Proposed shape (~40 lines, no new dependency)
+This decides §5 Q3, so it is evidence rather than argument:
 
-`_page_candles` gains three things, all inside the one function:
+* `flake.nix:6` — `kraken-python.url = "github:Cairnstew/kraken-python"` — a **flake input**.
+* `flake.lock` pins `rev = "81de5974ded7c17586eedc78158d1293d2f74c66"`, which is **exactly the
+  local checkout's HEAD** (`git -C /home/seanc/Projects/kraken-python log --oneline -1` →
+  `81de597`). The local tree and the pin are the same commit *today*.
+* `nix/default.nix:17-61` builds it as a Nix package; `flake.nix:24,50` pass
+  `kraken-python.outPath` into the dev shell that `{{dev}}` in the `justfile` uses.
+* The `.venv`, by contrast, has it **editable**: `__editable___kraken_python_0_4_0_finder.py`
+  maps `kraken_api` → `/home/seanc/Projects/kraken-python/kraken_api`.
 
-```python
-_RETRYABLE = (KrakenError, requests.RequestException, OSError, TimeoutError)
-_CAND4_MAX_ATTEMPTS, _CAND4_BACKOFF = 4, 0.5        # base seconds; cap 8.0
-
-for page in range(pages):
-    for attempt in range(_CAND4_MAX_ATTEMPTS):
-        try:
-            batch, last = manager.ohlc(pair, interval=interval, since=cursor)
-            break
-        except _RETRYABLE as exc:
-            if attempt == _CAND4_MAX_ATTEMPTS - 1 or not collected:
-                raise                       # nothing to salvage -> fail loud
-            delay = backoff_seconds(attempt, base=_CAND4_BACKOFF, cap=8.0)
-            if isinstance(exc, RateLimitError):   # honour "EService: Throttled: <ts>"
-                delay = max(delay, _retry_after(exc) - time.time())
-            _LOGGER.warning("ohlc page %d attempt %d/%d failed (%s); retrying in %.1fs",
-                            page, attempt + 1, _CAND4_MAX_ATTEMPTS, exc, delay)
-            time.sleep(delay)
-    if last == 0 or not batch or last == cursor:   # <-- the cursor-advance guard
-        break
-    cursor = last
-```
-
-Five behaviours, and the reasons each earns its lines:
-
-1. **Retry with capped exponential backoff** — `backoff_seconds` is already in the sibling
-   (`utils.py:205`), so the house primitive is reused rather than reinvented.
-2. **Fail loud on page 0, salvage after.** A failure on page 0 has nothing to salvage. A failure on
-   page *k* with pages 0..k−1 already collected should **return what it has and WARN** — this is
-   precisely `engine.py:57-74`'s pattern, and it is why the audit's contrast is the right standard.
-   Note that because of §3.2 the salvage is almost always sufficient: pages 2+ are byte-identical
-   replays of page 1, so **any single successful call already yields the full 721 bars.**
-3. **Parse `EService: Throttled: [UNIX timestamp]`** and honour it — the only documented
-   retry-after signal Kraken emits.
-4. **`if last == cursor: break`** — kills the replay loop, 1 line, and turns `pages=6` into 1 call.
-5. **Gap detection on the way out.** `fetch_ohlc_dataframe` de-dupes by timestamp
-   (`data.py:1031`) but never checks for **missing bars**. A one-line
-   `(df.index.to_series().diff() > interval).sum()` log line — not an error, a measurement —
-   would make the salvage path honest: "I gave you 480 of 721 bars and here is the hole."
-
-Lines-to-value: **~40 lines, zero new dependencies, zero data cost, and it removes both the
-abort-on-transient failure and the 5× API amplification.** This is the best value-per-line item in
-the whole audit.
-
-### 4.5 Contrast with `engine.py:57-74`
-
-`engine.py` is the correct model and should be quoted as such: three independent `try/except
-Exception` blocks, each degrading to `_LOGGER.warning` and a *partial* dict
-(`data["candles"] = candles[-100:] if candles else []`, `engine.py:66`). Three differences worth
-copying deliberately:
-
-- `except Exception` is broader than my `_RETRYABLE` — right for `engine.py`, because a *strategy*
-  must never die on a market-data hiccup. For `_page_candles` a narrower tuple is better, because
-  a `ValueError` from `manager.ohlc` (bad interval, bad pair — `manager.py:172-175`) is a
-  programming error that retrying cannot fix.
-- `engine.py` degrades each key independently; `_page_candles` must degrade *as a whole*, because
-  a partial candle list that silently loses its tail is worse than a loud failure — unless it is
-  logged with the bar count, which is why item 5 above is in scope.
+So editing upstream is *immediately* live under pytest and *silently absent* from
+`just bench`, which builds through Nix from `flake.lock`. An upstream-only fix would appear to
+work in the test suite and never run in the recipe the user actually types. That asymmetry is
+the whole reason the minimal fix must land in `data.py`.
 
 ---
 
-## 5. CAND-5 — the matrix gates on replicate *count*, never on observed *dispersion* (Q5)
+## 2. The library survey
 
-### 5.1 The gap, restated exactly
+All facts below verified from PyPI's JSON API, the projects' own GitHub API metadata, and —
+for `urllib3` — the **installed 2.8.0 source in this repo's `.venv`**, which is the version that
+would actually run.
 
-| Fact | Where |
-|---|---|
-| `MIN_REPLICATES_FOR_A_CLAIM = 3`, used **only** as a count | `model_matrix.py:243`; seeds `:1276-1283`; groups `:1339-1347`; claims `:2259-2280` |
-| The dispersion machinery is **already computed** and printed, never compared | `summarize()` → `q1`/`q3`/`min`/`max` (`:328-339`); `quartile()` (`:310-325`); `fmt_iqr()` (`:363-365`); rendered `:1952`, `:2094` |
-| `is_valid()` checks only process failure, required fields, `n_bars` vs a denominator, `num_trades`, NaN metrics | `is_valid` `:963-978` → `assess_cell` `:786-878` |
-| The docstring's own framing ("separated from noise") is never operationalised | `:241-242`, `:1281-1282` |
-| Motivating measurement in-repo: two fetches of the same pair "disagree by 16% on the fitted std of `rsi_24`" | `data_window.py:5-8` |
+### 2.1 Summary table
 
-The prose in `_build_claims` (`:2208-2340`) is genuinely good and already says the right thing in
-words — *"a median cannot be separated from seed noise"*, *"PPO on one config has been measured
-replaying 576 trades and 374"*, and the whole `n=1 → anecdote` branch. **It never checks.** The
-report tabulates `median [q1, q3]` per group and lets a reader eyeball it. Nothing computes
-whether two arms separate.
-
-### 5.2 What a count gate cannot see — demonstrated with the harness's own functions
-
-Run against `model_matrix.summarize` / `fmt_iqr` / `MIN_REPLICATES_FOR_A_CLAIM` as they stand:
-
-| # | arms | median | IQR `[q1, q3]` | n | count gate | pooled IQR | gap | dispersion gate |
+| Library | Latest | Last release | Repo state | License | Zero deps? | Rate-limit capable? | Full jitter? | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| 1 | control / treatment | +2.00% / +6.00% | `[+2.00,+2.05]` / `[+5.95,+6.05]` | 3 / 3 | **ok** | 0.075 pp | 4.00 pp = **53×** | **RESOLVED** |
-| 2 | control / treatment | +30.00% / +33.00% | `[+16.00,+35.00]` / `[+18.00,+37.50]` | 3 / 3 | **ok** | **19.25 pp** | 3.00 pp = **0.16×** | **NOISE** |
-| 3 | control / treatment | +2.00% / +4.00% | `[+1.60,+3.75]` / `[+3.50,+5.75]` | 3 / 3 | **ok** | 2.20 pp | 2.00 pp = **0.91×** | **NOISE** |
-| 4 | A(576 trades) / B(374 trades) | +2.00% / −3.00% | `[+2.00,+2.00]` / `[−3.00,−3.00]` | 1 / 1 | FAILS | **0.00 pp** | 5.00 pp = **∞** | **UNDEFINED** |
+| `tenacity` | **9.1.4** | 2026-02-07 | active (commit 2026-10-01), 8.8k★, 67 open | Apache-2.0 | yes (`requires_dist` empty) | **yes** (`retry_if_exception_type`, predicate retries) | **yes** — `wait_random_exponential` cites the AWS post by name | **Strongest library.** One new dep. |
+| `urllib3` | **2.8.0** | 2026-09-15 | very active (commit 2026-10-02), 4.1k★ | MIT | yes | **partial** — status codes + connection errors only | **no by default** (`backoff_jitter=0.0`); what it has is *additive*, not full | **Already installed.** Right tool for HTTP-level only. |
+| `backoff` | 2.2.1 | **2022-10-05** | **`archived: true`**, last default-branch commit 2023-01-20, 64 open | MIT | yes | yes (via giveup/wait) | yes (`expo`, `jitter`) | **Disqualified — archived.** |
+| `httpx` | 0.28.1 | 2024-12-06 | repo pushed 2026-10-02, last default-branch commit 2026-02-23, 15.5k★ | BSD-3-Clause | no (`anyio`,`httpcore`,`certifi`,`idna`) | **no** — see §2.4 | no | **Disqualified.** Would mean swapping the HTTP stack. |
 
-Case 2 is the whole argument: a **3 pp difference with a 19 pp within-group spread** sails through
-`len(seeds) >= 3` and is tabulated as `+30.00% [+16.00%, +35.00%]` vs `+33.00% [+18.00%,
-+37.50%]` — two intervals that overlap over almost their entire length. Case 3 is the realistic
-middle: a 2 pp effect against 2.2 pp of seed spread, which the count gate reports and a reader
-should not believe.
+### 2.2 `tenacity` — the strongest candidate, and it documents the jitter argument itself
 
-**Case 4 is a design constraint I hit while building this, and it must be respected by the fix:**
-when every arm has `n == 1`, `q3 − q1 == 0`, so a pooled-IQR gate is **degenerate** and would
-report `5.00 pp = ∞ → RESOLVED`, i.e. it would happily bless the exact anecdote the surrounding
-prose is trying to kill. **The dispersion gate must sit *behind* the count gate, not beside it**,
-and must additionally require `n ≥ MIN_REPLICATES_FOR_A_CLAIM` **and** `pooled_iqr > 0` on both
-arms before it emits anything.
+* **Version/maintenance:** `9.1.4`, released **2026-02-07**; `9.1.3` two days earlier (2026-02-05);
+  `9.1.2` 2025-04-02. PyPI provenance is signed by GitHub Actions and attributed to
+  `github.com/jd/tenacity`. Last default-branch commit `2026-10-01`. Two maintainers.
+* **License:** Apache-2.0. **Auth:** none — no account, no key, no telemetry.
+* **Rate limits:** none of its own.
+* **Zero dependencies** — `requires_dist` is `[]`. Wheel is 28.9 kB, pure `py3-none-any`.
+* **Output/behaviour shape — this is the part that matters.** Tenacity decorates a function; the
+  decorated callable returns the **same value on success** and raises the **last exception** once
+  a `stop` strategy trips. So wrapping `manager.ohlc` is a drop-in with no return-shape change
+  — which is what keeps the duck-typed `FakeSource`/`OneShotManager` fakes in
+  `tests/test_rl_data_store.py:65-72`, `tests/test_rl_paper_trade.py:85-96` working untouched.
+* **The exact primitives this gap needs, from `tenacity/wait.py` / `tenacity/retry.py`:**
+  - `wait_random_exponential(multiplier=…, max=…)` (`wait.py:247`) — subclasses `wait_exponential`,
+    `__call__` returns `random.uniform(self.min, high)`. Its own docstring names the AWS post and
+    says it **"corresponds to the 'Full Jitter' algorithm described in this blog post"**.
+  - `wait_exponential_jitter(initial=…, max=…, jitter=…)` (`wait.py:279`) — implements **Google's**
+    documented strategy: `max(min, min(multiplier * 2**n + random.uniform(0, jitter), maximum))`.
+    That is AWS "Equal Jitter", and the AWS post ranks Equal Jitter the loser of the two.
+  - `retry_if_exception_type(...)`, `retry_if_exception(...)`,
+    `retry_any(...)`/`retry_all(...)`, `retry_if_exception_message(...)` (`retry.py:107, 88, 284, 301, 232`).
+  - `stop_after_attempt`, `before_sleep_log` for the visibility half.
+* **Correct composition for this repo** (and note it is *not* pure exponential, per §1.3):
+  `retry=retry_if_exception_type((RateLimitError, APIError, requests.RequestException))`,
+  `wait=wait_combine(wait_random_exponential(multiplier=1, max=30), wait_retry_after)`,
+  `stop=stop_after_attempt(5)`, `reraise=True`.
 
-### 5.3 Sizing the fix (~50 lines, zero new data, zero new deps)
+### 2.3 `urllib3.Retry` — free, already installed, and **blind to Kraken's actual signal**
 
-**Estimator.** Pooled within-group spread = **median of the per-group IQRs** (`q3 − q1`). Chosen
-over `max` or `mean`: `max` lets one wild group condemn every comparison (I hit this — my first
-draft used `max` and case 1 collapsed from 53× to 0.21×), `mean` is not robust to the same group.
-`median` of the IQRs is the same order-statistic the harness already uses in `median()`
-(`model_matrix.py:296-308`), so it is house-consistent and needs no new concept. It also degrades
-gracefully at n=3, where a group's own IQR is a 50th-percentile-of-2 estimate — which is exactly
-why the gate reports a **ratio**, not a boolean, and why `n=3` is already labelled "ordering
-hints, not evidence" in the prose.
+`requests 2.34.2` and `urllib3 2.8.0` are already in `.venv` (verified via
+`importlib.metadata`). `requests` exposes it cleanly — verified from the installed
+`requests/adapters.py`:
 
-**Four edits, all inside existing functions:**
+* `HTTPAdapter.__init__(..., max_retries: int | Retry = DEFAULT_RETRIES, ...)`
+* `HTTPAdapter.__attrs__ = ['max_retries', 'config', '_pool_connections', '_pool_max_nsize', ...]`
+* `Session.mount(prefix, adapter)` exists
 
-| # | Site | Change | ~lines |
-|---|---|---|---|
-| 1 | new `pooled_within_spread(summaries)` next to `summarize()` (`:328`) | median of `q3 − q1` over groups with `n ≥ MIN_REPLICATES_FOR_A_CLAIM`; `None` if fewer than 2 such groups or if the result is `0` | 15 |
-| 2 | `_group_summaries()` (`:1345`) row dict | add `"separation"`: the same ratio per group pair is computed in `_build_claims`, so here just carry `summary` through (already does) | 0 |
-| 3 | `_build_claims()` (`:2208`) | for each adjacent pair of arms in the headline cohort, emit one line: `gap = \|median_A − median_B\|`, `ratio = gap / pooled`, verdict `RESOLVED (≥1×) / NOT SEPARATED (<1×) / UNDEFINED (n<3 or zero spread)`. Replaces the `thin`/else branch at `:2259-2280` rather than adding to it | 25 |
-| 4 | `_print_group_table()` (`:1930`) header | print the pooled IQR once under the table, so a reader sees the yardstick the verdicts used | 10 |
+so `session.mount("https://", HTTPAdapter(max_retries=Retry(...)))` is a two-line change in
+`transport.py` — **if** `transport.py` ever let a caller pass a session. It currently takes a
+`session` parameter (`transport.py:91,114`) but constructs `requests.Session()` itself
+(`transport.py:114`) with **no adapters mounted**. Verified defaults from the installed
+`urllib3/util/retry.py:231-242`:
 
-**Why this is ~50 lines and not a rewrite:** `q1`/`q3`/`median`/`n` are already in every row
-(`_group_summaries` `:1345` → `"summary": summarize(values)`), already survive into the JSON
-report (`:2079-2082` `"per_ticker"/"per_config"/"per_axis"`), and are already printed
-(`fmt_iqr` `:363`). **The measurement exists. Only the comparison is missing.** There is no new
-data collection, no new run, no schema change — the gate can be validated against any existing
-results JSONL the moment it lands.
-
-**Why the ratio is the right output, not a pass/fail.** A boolean needs a threshold, and the
-threshold is a judgement call. A ratio is a fact: *"this 2 pp gap is 0.9× the within-group spread
-you measured."* The prose can then say what to do with it, which is the harness's established
-voice. The report should still be able to fail a run — `cmd_report` already returns non-zero on
-no-valid-cells, so a `separated: false` can raise a `warn(...)` in `cmd_plan`'s
-`thin_replication` neighbourhood (`:1339`) with zero new plumbing.
-
-**One honest limitation to state in the docstring.** With n=3, a group IQR is a percentile of two
-values; the pooled estimate inherits that. The gate is therefore a **necessary, not sufficient**,
-condition — it catches "the seeds you have do not resolve this effect", which is exactly the
-wording in my brief. It does not manufacture power. Its value is that it stops a matrix report from
-presenting case 2 as a finding, and the cheapest way to get more power remains what the harness
-already says: 5+ seeds.
-
----
-
-## 6. Do CAND-4 and CAND-5 gate the others? (Q6)
-
-### 6.1 CAND-5 is a **precondition** for gating any other change on a claimed effect — including CAND-3's
-
-Stated plainly, because this is the load-bearing conclusion of my brief:
-
-- **Nothing can be validated by this repo's own harness until CAND-5 lands.** `tools/model_matrix.py`
-  is the only instrument in the project that turns a config change into a number, and today it
-  reports a 3 pp difference across a 19 pp spread (case 2) identically to a 53× resolved one
-  (case 1). Any claim of the form "change X improves the model" is therefore unmeasurable until
-  the dispersion gate exists.
-- **This includes CAND-3.** The moment a store is seeded, the first question is "does 8 years of
-  bars beat 721 bars?" — which is a headline-metric comparison between two arms. Without CAND-5
-  that comparison's verdict is a coin flip dressed as a measurement. **Seed the store and evaluate
-  it without CAND-5, and you will produce a number you cannot defend.**
-- **It also gates CAND-1, CAND-2, CAND-4, CAND-6, CAND-7** by the same argument. CAND-1's
-  `microstructure` group is one column; CAND-2's signal channels are 8 columns; both are
-  effect-size questions.
-- **But CAND-5 does not gate the *build*.** It gates the *claim*. The store, the retry guard, the
-  signal backfill are all worth building blind, because their value does not depend on the harness
-  measuring them correctly — they are unambiguous. What CAND-5 gates is the decision to **ship
-  or revert based on a reported effect**.
-- **Ordering that follows:** land CAND-5 first or in the same change as anything whose acceptance
-  criterion is a matrix number. It is 50 lines and no data. It is the cheapest gate in the repo.
-
-### 6.2 CAND-4 is **not** a precondition for the G3 push-down — but it lands *with* the store change, for a different reason
-
-- **Not a correctness gate.** §3.4 proved the pushed-down read and the post-hoc clip produce
-  identical bar times, with values agreeing to 1.5e-13 beyond the 19-bar warm-up edge. Retrying
-  does not change which bars you get.
-- **Not a sequencing gate.** Nothing in CAND-3 fails without it, and nothing in CAND-3 is fixed by
-  it.
-- **But they should land together**, for a reason that is specific and cheap: the store change is
-  the moment the pipeline starts reading years of bars, and `_page_candles` is invoked on the
-  store leg too (`data.py:1174`). At that point the 5-wasted-calls-per-read replay loop (§3.2)
-  goes from "annoying" to "6 API calls per tick, per pair, forever", and the salvage path stops
-  being hypothetical because a read failure now means "the tail of my training window is missing".
-  Landing the cursor-advance guard (`if last == cursor: break`) **with** the store flip costs
-  1 line and removes 5/6 of the API load the store introduces.
-- **So: CAND-4 is a precondition for the store change being safe to operate, not for it being
-  correct.** If the store work slips, CAND-4 can land alone and still pay for itself (it removes
-  5 wasted API calls from every existing read *today*).
-
-### 6.3 Recommended landing order
-
-| order | item | ~lines | data cost | why here |
-|---|---|---|---|---|
-| 1 | **CAND-5** dispersion gate | ~50 | none | gates every claimed effect, incl. #3's own acceptance |
-| 2 | **CAND-4** cursor guard + retry/salvage | ~40 | none | removes 5 wasted calls *today*; makes #3 safe to run |
-| 3 | **CAND-3a** seed the store + flip `market_data_store` | **0** | 158 s, 13 MB, `/tmp` | pure config; 721 → 76,561 bars proved |
-| 4 | **CAND-3b** `since`/`until` push-down + venue label in `_meta.json` | ~21 | none | store-only efficiency; documented as such |
-| 5 | *(deferred)* Kraken OHLCVT reader | ~300 | 10.5 GB | **not recommended** — §2.4 |
-
-**CAND-3a is the cheapest item in the entire audit: 158 seconds, 13 megabytes, 3 commands, and one
-YAML key. It should not be waiting behind anything.** What waits behind CAND-5 is only the claim
-that it worked.
-
----
-
-## 7. Findings not in the audit
-
-1. **§3.2 — `pages` is not merely non-scaling, it is a replay loop.** `last` never advances past
-   page 1 (`last == 0` is dead code on a live pair), so calls 2..N are byte-identical requests.
-   Measured: `pages=6` → 6 calls, 721 unique bars, **identical to `pages=1`**. 10 duplicate rows
-   are collected and discarded at `data.py:1031`. Fix: `if last == cursor: break`.
-2. **§1.3 — `kraken-deep-history`'s dev shell cannot produce a bot-readable store.** It has only
-   pytest; `market_data` is not importable, so `_open_store` silently degrades to
-   `fallback-csv` and writes `.csv` files that `MarketDataStore.read` (which globs `*.parquet`)
-   cannot see. Only the `store_mode` field in the JSON report distinguishes them.
-3. **§3.4 — the audit's "`data_window` is only a post-hoc mask → clips to empty" is overstated for
-   the store leg.** With a store there is no clipping-to-empty failure mode; there is wasted work.
-   `NotEnoughDataError` from a pinned window is confined to runs **without** `market_data_store`.
-4. **§3.4 — the push-down has a 19-bar warm-up cost.** `trade_count_zscore_20` goes from 0 to 19
-   NaNs at the window's leading edge, because the 20-bar rolling window can no longer reach back
-   across the boundary. Beyond bar 20 the two paths agree to 1.5e-13.
-5. **§4.3 — Kraken's published rate limits did not reproduce on the keyless public path.** A burst
-   of 16 rapid `/public/OHLC` calls and 8 calls at 2.5/s both returned 100 % OK. CAND-4 should be
-   scoped as *transient-failure resilience*, not *rate-limit compliance* — the exposure is 5xx and
-   connection resets, not 429s.
-6. **§2.1 — Kraken's OHLCVT article contradicts its own MANIFEST on intervals.** The intro
-   paragraph lists 30 minutes; the "About the data" section and every real filename omit it. A
-   reader written from the prose would request a non-existent file.
-7. **§2.1 — Kraken's bulk OHLCVT has no `vwap` column**, so a store seeded from it would
-   **silently lose `vwap_dev`** — one of the 52 bare observation columns — via the presence gate at
-   `data.py:846`. The bulk archive is strictly poorer on shape than the REST endpoint it replaces.
-8. **§1.1 — a store is 60 bytes/bar.** 204,245 bars across three tickers and 8.7 years of 1 h data
-   is 13 MB. Any future "we cannot afford the disk" objection is answered.
-
----
-
-## 8. Reproduce this
-
-```bash
-# 1. store build cost (158 s, 13 MB, no code)
-cd ~/Projects/kraken-market-data
-nix develop --command bash -c "
-  PYTHONPATH=\$HOME/Projects/kraken-deep-history:\$HOME/Projects/kraken-market-data \
-  python \$HOME/Projects/kraken-deep-history/cli.py seed \
-    --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store2"
-du -sh /tmp/krb-cand3/store2          # 4.6M, 104 parquet files
-
-# 2. it is a config flip (76,561 bars, 0.48 s, zero code)
-cd ~/Projects/kraken-trading-bot
-nix develop --command bash -c "python -c \"
-from kraken_trading_bot.rl.data import read_ohlc_dataframe
-df = read_ohlc_dataframe('ETH/USD', 60, pages=1, market_data_store='/tmp/krb-cand3/store2')
-print(df.shape, df.index[0], df.index[-1])\""
-
-# 3. since is a no-op on REST (Kraken's own words + measurement)
-curl -s https://docs.kraken.com/api/docs/rest-api/get-ohlc-data | grep -o 'older data cannot be retrieved[^.]*'
-
-# 4. pages replays (5 of 6 calls are identical)
-nix develop --command bash -c "python -c \"
-from kraken_api import KrakenManager
-from kraken_trading_bot.rl.data import _page_candles
-m = KrakenManager.from_env()
-for p in (1,2,6):
-    print(p, len(_page_candles('ETH/USD',60,p,m,None)))\""
-
-# 5. cross-venue basis (Kraken OHLCVT vs Binance, 2,184 real bars)
-#    ranged GET of the ZIP central directory + MANIFEST.json, then diff vs
-#    https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1h/ETHUSDT-1h-2026-0{4,5,6}.zip
-#    (both archives extracted under /tmp/krb-cand3/ — not committed)
+```python
+status_forcelist: typing.Collection[int] | None = None,
+backoff_factor: float = 0,          # ← no backoff unless you ask
+backoff_max: float = DEFAULT_BACKOFF_MAX,          # 120
+raise_on_status: bool = True,
+respect_retry_after_header: bool = True,
+backoff_jitter: float = 0.0,        # ← no jitter unless you ask
+retry_after_max: int = DEFAULT_RETRY_AFTER_MAX,    # 21600
 ```
 
-Everything lives under `/tmp/krb-cand3/`. Nothing was written to the repo but this file.
+**Three reasons it cannot be the whole answer, all sourced:**
+
+1. **It cannot see a Kraken rate limit.** `is_retry(self, method, status_code, has_retry_after=False)`
+   (`urllib3/util/retry.py:424`) is the sole status gate at `:435` (`status_forcelist` membership)
+   and `:442` (`RETRY_AFTER_STATUS_CODES`). There is no body inspection anywhere in `retry.py`.
+   Kraken's `EAPI:Rate limit exceeded` arrives as **HTTP 200** — §1.2 case 1 — so `Retry` returns
+   `False` and passes the response straight through. Confirmed by the wrapper's own control flow:
+   `transport.py:205` `raise_for_status()` succeeds on a 200, and the rate limit is only detected
+   later, at `:248-250`, by string-matching the JSON body. **A 200 is, to urllib3, a success.**
+2. **Its jitter is additive, not full, and off by default.** `get_backoff_time()`
+   (`urllib3/util/retry.py:321-338`), read from the installed file:
+   ```python
+   backoff_value = self.backoff_factor * (2 ** (consecutive_errors_len - 1))
+   if self.backoff_jitter != 0.0:
+       backoff_value += random.random() * self.backoff_jitter
+   return float(max(0, min(self.backoff_max, backoff_value)))
+   ```
+   Jitter is `random.random() * backoff_jitter` **added to** the full exponential value — a
+   widening band around the deterministic delay, which is strictly weaker than Full Jitter's
+   `uniform(0, high)`. AWS's simulation (§3) is unambiguous that the *un-jittered* curve is the
+   loser; this only becomes full jitter in the AWS sense if you both set `backoff_factor > 0`
+   and accept the additive band as good enough. Treat it as "exponential backoff with optional
+   additive jitter", not "jittered backoff".
+3. **Layer violation.** Mounting `Retry` in `transport.py` protects the HTTP layer, which by §1.2
+   is not where Kraken's rate limit is detected.
+
+**Where `urllib3.Retry` *is* exactly right:** connection errors and read timeouts, and real
+HTTP 429/5xx if Kraken or a proxy ever emits them (`status_forcelist={429,500,502,503,504}`,
+`allowed_methods=frozenset({"GET"})`, `respect_retry_after_header=True`). Note `allowed_methods`:
+**POST must not be retried** — `transport.py:157` stamps a monotonic nonce
+(`_next_nonce()`, `transport.py:170-178`) into every private call, so an automatic POST retry
+would replay an order against a stale nonce. A `Retry` mounted at the session layer therefore
+needs `allowed_methods={"GET"}` explicitly, or private order calls become a duplicate-order bug.
+That is a concrete, non-obvious safety constraint on option (b).
+
+### 2.4 `httpx` — disqualified twice over
+
+`httpx`'s own transport docs (`docs/advanced/transports.md`, read from the repo) state verbatim:
+
+> "Connection retries are also available via this interface. Requests will be retried the given
+> number of times in case an `httpx.ConnectError` or an `httpx.ConnectTimeout` occurs… **If you
+> need other forms of retry behaviors, such as handling read/write errors or reacting to `503
+> Service Unavailable`, consider general-purpose tools such as [tenacity].**"
+
+i.e. `httpx.HTTPTransport(retries=1)` covers connect failures **only** — no status-code retry,
+no backoff, no jitter, no `Retry-After`. And httpx is not installed (`kraken-python` uses
+`requests`, `transport.py:204-206`), so adopting it means replacing the HTTP stack of the
+foundation repo to obtain *less* retry capability than `requests` already has. Reject.
+
+### 2.5 `backoff` — reject, and the reason is unambiguous
+
+`litl/backoff` is **`archived: true`** on GitHub. Last PyPI release `2.2.1` on **2022-10-05**;
+last commit on the default branch **2023-01-20** ("Add exponential decay (#189)"); 64 open issues
+unanswered. An archived dependency cannot receive a security fix. Reject despite a clean API
+(`@backoff.on_exception`, `expo`, `jitter`) and MIT licensing.
 
 ---
 
-*End of RESEARCH-3. Nothing was written, committed or deleted outside this file.*
+## 3. Jitter is the point — the authority
+
+**Marc Brooker, "Exponential Backoff And Jitter", AWS Architecture Blog, 04 Mar 2015**
+(https://aws.aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/ — fetched live).
+Carries a **May 2023 update** stating that after eight years "this solution continues to serve as
+a pillar for how Amazon builds remote client libraries", that "Most AWS SDKs now support
+exponential backoff and jitter as part of their retry behavior", and pointing at the
+[Amazon Builders' Library chapter "Timeouts, retries, and backoff with jitter"](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/).
+
+The claims that bear on this gap, quoted:
+
+* **"The solution isn't to remove backoff. It's to add jitter."**
+* **"The no-jitter exponential backoff approach is the clear loser. It not only takes more work,
+  but also takes more time than the jittered approaches. In fact, it takes so much more time we
+  have to leave it off the graph to get a good comparison to the other methods."**
+* On the mechanism: after plain exponential backoff the call timeseries still shows clusters —
+  *"Instead of reducing the number of clients competing in every round, we've just introduced
+  times when no client is competing."*
+* Ranking: Full Jitter and Equal Jitter are "approximately the same" for call count with Equal
+  slightly worse; Decorrelated is worse still; **"Of the jittered approaches, 'Equal Jitter' is
+  the loser"**; the Full-vs-Decorrelated call is "less clear".
+* Quantified: **"In the case with 100 contending clients, we've reduced our call count by more
+  than half."**
+* Recommendation: **"The return on implementation complexity of using jittered backoff is huge,
+  and it should be considered a standard approach for remote clients."**
+
+**Applied to this repo specifically.** The herd here is not hypothetical and it is *in the
+repo*: `justfile:76-77`'s `bench` recipe runs `train` then `backtest`, and the recipe's own
+comment says so — *"The backtest refetches the same `pages` window seconds after training"*. Each
+`train`/`backtest` invocation is a fresh 6-page burst (`data.py:1112` `pages: int = 6`). N
+matrix cells from `tools/model_matrix.py` swept back to back → N nearly-simultaneous 6-page
+bursts against a **Starter-tier counter capped at 15 with decay of −0.33/sec**
+(§4). Six pages per run against a 15-count ceiling that recovers 0.33/sec is one or two runs
+away from the cap on a cold counter. That is precisely the contention AWS simulated, and it is
+why the fix must be Full Jitter rather than `wait_fixed` — and why `wait_fixed` would be the
+*actively harmful* choice here.
+
+**Design consequence:** the two `data.py` legs must not share one RNG stream. Two concurrent
+`just bench` invocations (the sweep case) that both start jitter at `uniform(0, 1)` on their
+first retry are correlated at exactly the wrong moment. Seed per-attempt from
+`random.SystemRandom()` or, better, jitter on a hash of `(pid, pair, page_index, attempt)`.
+
+---
+
+## 4. Kraken's documented rate-limit policy (fetched live)
+
+Source: **https://docs.kraken.com/exchange/guides/rest/ratelimits** — "Spot REST Rate Limits"
+(the old `support.kraken.com/hc/en-us/articles/360000426832-api-rate-limits` now **301**s to a
+404; `docs.kraken.com/api/docs/rest-api/rate-limits` is **404**; the working canonical URL is
+the one above, cross-linked from the support centre). Verbatim:
+
+> "Every REST API user has a 'call counter' which starts at `0`. Ledger/trade history calls
+> increase the counter by `2`. All other API calls increase this counter by `1` (except AddOrder,
+> CancelOrder which operate on a different limiter detailed further below)."
+>
+> | Tier | Max API Counter | API Counter Decay |
+> | Starter | 15 | -0.33/sec |
+> | Intermediate | 20 | -0.5/sec |
+> | Pro | 20 | -1/sec |
+>
+> "The user's counter is reduced every couple of seconds depending on their verification tier.
+> Each API key's counter is separate, and if the counter exceeds the maximum value, subsequent
+> calls using that API key would be rate limited. **If the rate limits are reached, additional
+> calls will be restricted for a few seconds (or possibly longer if calls continue to be made
+> while the rate limits are active).**"
+>
+> **Errors**
+> * `"EAPI:Rate limit exceeded"` if the REST API counter exceeds the user's maximum.
+> * `"EService: Throttled: \[UNIX timestamp\]"` if there are too many concurrent requests.
+>   **Try after \[timestamp\]**.
+
+Four things follow, each of which changes the fix:
+
+1. **The limit is a decaying counter, not a fixed interval.** A fixed `min_interval` cannot
+   express it — another reason `transport.py:181-186` is the wrong shape (§1.1).
+2. **Kraken documents the thundering-herd penalty itself**: "possibly longer if calls continue
+   to be made while the rate limits are active". Retrying *tightly* makes the punishment longer.
+   This is the exchange, in its own docs, endorsing §3.
+3. **`Retry-After`: not a header.** The signal is the UNIX timestamp inside
+   `EService: Throttled: [UNIX timestamp]`, which is currently unrecognised by the wrapper (§1.2)
+   and therefore unavailable to any caller. **Parsing it is the single highest-value, lowest-cost
+   piece of this gap** — it replaces a guess with the server's own instruction.
+4. **Numbers are small.** Starter = 15 count, −0.33/sec ⇒ full recovery from a blown counter in
+   ~45 s. Any retry budget that gives up sooner than ~45 s is mis-tuned for the default tier;
+   any budget that waits *longer* than ~45 s is waiting on nothing. Five attempts with
+   `wait_random_exponential(multiplier=1, max=30)` (expected total ≈ 1+2+4+8+16 ≈ 31 s of
+   *mean* window, tail to 30 s each) sits sensibly inside that. **Ceiling the total at ~60 s.**
+   Note also `pages=6` means a *page* costs 1 count — so a 6-page burst costs 6 of 15.
+
+---
+
+## 5. Where should the retry live? — answering AUDIT.md §5 Q3
+
+### (a) In `data.py:_page_candles` — **do this now**
+
+* **Cost:** one function, both call sites, zero new dependencies (`urllib3` is already there
+  transitively via `requests`).
+* **Covers both legs automatically.** `data.py:1179` (fetch) and `data.py:1364` (store) share
+  `_page_candles`; the AUDIT is right that one edit covers both. The docstring at `data.py:1071-1098`
+  says so explicitly: *"This is shared by the live fetch and the market-data store read-through
+  adapter so the two paths can never drift apart on pagination semantics."* — the retry inherits
+  that guarantee.
+* **Correct layer for the *cursor* concern.** Only the caller knows `cursor`, `collected`, and
+  `pages`. A transport-level retry cannot resume a partially-collected page loop; it can only
+  retry one HTTP call. The discarded-pages-1-to-3 failure (`data.py:1104-1111`) is a *caller*
+  bug, so a caller-side fix is the only one that addresses it directly.
+* **The governance asymmetry (§1.4) settles it.** A `data.py` fix runs in the Nix dev shell that
+  `just` drives and in the lock-pinned build. An upstream-only fix does not, until a lock bump
+  and a GitHub push.
+* **Honest weakness:** it does not protect `engine.py`'s three direct calls
+  (`engine.py:59, 65, 72`). That is a real gap and option (b) is the answer to it — but it is a
+  *different* program (AUDIT §1.2: "a separate, disjoint program"), so it can be sequenced.
+
+### (b) Upstream in `kraken-python`'s `transport.py` — **the right end state, wrong first move**
+
+* **For:** fixes `engine.py`'s three calls and any future consumer; a `session.mount(...,
+  HTTPAdapter(max_retries=Retry(...)))` is two lines; a retry-aware `RateLimitError` carrying
+  `retry_after` would let *every* caller honour `EService: Throttled`.
+* **Against, and it is substantial:** pinned flake input (`flake.nix:6`, `flake.lock` rev
+  `81de5974`) ⇒ needs a lock bump + push to `github.com/Cairnstew/kraken-python` +
+  `nix/default.nix` rebuild to affect `just`; it edits a repo this audit is scoped *out* of;
+  a `Retry` mounted at the session layer will **replay private POSTs** unless
+  `allowed_methods={"GET"}` is set explicitly (§2.3), because `transport.py:157` +
+  `:170-178` stamp a monotonic nonce — an ordering/duplicate-order hazard in a *trading* client;
+  and per §1.1 a throttle-only fix is a no-op under this repo's current config.
+* **Also note:** the wrapper already has a structured error path — `transport.py:210-221` calls
+  `log_event(_HTTP_LOG, …, status="error", reason=exc.__class__.__name__)` and
+  `transport.py:245-251` logs `errors=[...]` before raising. So the wrapper has the observability
+  plumbing; only the retry and the marker set are missing.
+
+### (c) Layered — **correct end state, wrong order**
+
+The layering is right: transport owns per-HTTP-call retries; the caller owns resume-from-cursor.
+But land (a) first and (b) as a **separate PR with its own lock bump**, so that each half is
+independently reviewable and the repo is never in a state where the fix exists only in a local
+checkout that `flake.lock` does not know about.
+
+**Answer to §5 Q3: (a) now, (b) after, (c) as the destination.**
+
+---
+
+## 6. Making the failure visible instead of a silent WARNING
+
+### 6.1 The current collapse, precisely
+
+`engine.py:57-74` — three bare `except Exception as e: _LOGGER.warning(...)`, one per key:
+
+| `engine.py` | call | on failure |
+|---|---|---|
+| `:58-62` | `manager.ticker(pair)` | `data["ticker"]` **absent** |
+| `:64-68` | `manager.ohlc(pair, interval=60)` | `data["candles"]` **absent** |
+| `:71-75` | `manager.order_book(pair, count=10)` | `data["order_book"]` **absent** |
+
+`strategies/sma.py:68-76` reads `data.get("candles", [])` and `data.get("ticker")`, so a
+rate-limited tick and a genuinely empty market are the *same object*. `sma.py:72-76` then answers
+`hold` with reason `"insufficient data"`. A 60-second tick loop (`engine.py:36, 166-168`) means
+the strategy can emit `hold` for an hour with no signal that the exchange was refusing calls.
+
+### 6.2 The fix, consistent with what the repo already does
+
+The repo has an established, non-obvious pattern for exactly this: **absence is distinguishable
+from neutral**. `data.py:806-816` never ffill-buries a missing signal into a real-looking `0.0`;
+it emits `signal_observed` / `signal_age_hours` (`features.py:104-108`). The engine should do the
+same with a **reason code**, not with an absent key.
+
+**Concrete, minimal:**
+
+1. **New exception in `data.py`, beside the existing three.** `NotEnoughDataError`
+   (`data.py:220`), `MarketDataStoreUnavailableError` (`data.py:237`) and
+   `SignalTickerMismatchError` (`data.py:367`) are all `ValueError` subclasses declared in
+   `data.py` itself. Add a fourth in the same place and style:
+
+   ```python
+   class RateLimitExhaustedError(ValueError):
+       """Every retry attempt was refused; the window is incomplete."""
+       def __init__(self, pair, interval, attempts, last_error, retry_after=None): ...
+   ```
+
+   with `attempts`, the last exception's type, and the parsed `retry_after` timestamp on the
+   instance so callers and the run log can read them. **A partial page-loop must never be
+   persisted as a complete window** — so this must be raised *before* `store.upsert`
+   (`data.py:1366`), not after. See §8.
+
+2. **`engine.py`: replace the three bare `except Exception` with typed handlers plus a reason
+   code.** A `RateLimitExhaustedError`/`RateLimitError` handler sets
+   `data["degraded"] = "rate_limited"`; any other exception sets `data["degraded"] = repr(type(e).__name__)`;
+   a partial-success tick keeps a populated key **and** a non-null `degraded`. Key *presence* then
+   stops carrying the meaning of "no data" and `sma.py` can distinguish `hold/no-data` from
+   `hold/unavailable` — a two-line change at `sma.py:72-76` once the code exists. Keep
+   `_LOGGER.warning`, but log the **type name and the retry-after delta**, so the run log says
+   `rate_limited (retry_after=41s)` rather than the current free-text `e`.
+
+3. **`errors.py` is the wrong home — do not put it there.** `errors.py:1-29` is a pure re-export:
+   it imports seven names from `kraken_api.errors` and adds exactly one (`StrategyError`). The
+   three `data.py` errors are *not* in it and never were. Putting `RateLimitExhaustedError` there
+   would be a first, and the wrong one: it is a bot-side data-completeness failure, not a Kraken
+   transport error. **`data.py` is the consistent home.** (`RateLimitError` is already
+   re-exported at `errors.py:11, 26`, so a caller that wants it has it.)
+
+4. **`tools/store_guard.py` is also the wrong home, and it is worth reading anyway.** It is a
+   *pipe-stage refusal* tool: `store_guard.py:82-122` exits `1` on a bad `store_mode` with the
+   reason on stderr, consumed by `just store-seed`. Its lesson generalises (a refusal, not a
+   warning; name the recipe and the fix in the message) but its mechanism does not apply — a
+   retry policy inside a training read is not a seed-report gate. **Reuse its message style;
+   do not wire it in.**
+
+---
+
+## 7. The MINIMAL correct fix
+
+Five changes. Nothing else. No new required dependency.
+
+### Step 1 — `data.py`: a jittered, envelope-aware resume wrapper inside `_page_candles`
+
+Wrap the single `manager.ohlc(...)` call at `data.py:1105`. Requirements, each traceable to
+evidence above:
+
+* Retry on `(RateLimitError, APIError, requests.RequestException)` — **not** `RateLimitError`
+  alone (§1.2). `requests` is available transitively; if importing it into `data.py` is
+  considered unacceptable, `APIError` + a message predicate covers cases 1 and 2 and case 3
+  degrades to the pre-existing behaviour.
+* `wait = max(full_jitter(2**attempt), retry_after - now)` where `retry_after` is parsed out of
+  `EService: Throttled: <epoch>` (§1.3, §4.3). Full jitter per §3 — **never `wait_fixed`**.
+* Cap: 5 attempts, per-attempt ceiling 30 s, **total ≤ ~60 s** (§4.4).
+* `reraise=True` semantics: on exhaustion raise `RateLimitExhaustedError` **carrying `collected`
+  in the message** (pages 1-3 were real data; the operator needs to know a partial window existed).
+* **Injectable sleep/RNG.** `def _page_candles(..., *, _sleep=time.sleep, _rng=random.random)`
+  with `pages` untouched. Every existing fake (`tests/test_rl_data_store.py:65-72`,
+  `tests/test_rl_paper_trade.py:85-96`, `tests/test_rl_export.py:86`,
+  `tests/test_rl_signal_config_wiring.py:115`, `tests/test_rl_training.py:180,196,270,354`)
+  keeps its current signature, and no test acquires real wall-clock delay.
+* Log each retry at `WARNING` with `(pair, interval, page, attempt, kind, retry_after)` — the
+  page-loop currently logs only at `DEBUG` (`data.py:1109`), so today *nothing above DEBUG*
+  records that the loop retried.
+
+### Step 2 — `data.py:1364-1372`: do not persist a partial window
+
+Today `candles = _page_candles(...)` then `store.upsert(...)`. If `_page_candles` raises after
+partial collection, `upsert` is skipped — good. But if the caller *catches* the exhaustion to
+"be resilient", it must **not** upsert a partial window. The minimal correct shape:
+
+* Either `_page_candles` returns `(collected, complete: bool)` and `data.py:1366` upserts only
+  when `complete` is true; or
+* keep the raise, and at the `data.py:1366` call site guard the fetch in `try/except
+  RateLimitExhaustedError` → log, **skip the upsert**, and fall through to
+  `store.read(pair, interval, since=since, until=until)` (`data.py:1374`), which is the
+  read the store could already serve.
+
+The second is preferred: it makes the store leg's value proposition real instead of theoretical
+and it needs no signature change. It also turns the existing `else:` branch at `data.py:1368-1374`
+("no candles — reading whatever the store already has") from an *unreachable* path into the
+*intended* one.
+
+### Step 3 — `data.py:1383`: distinguish "store empty" from "store rate-limited"
+
+`NotEnoughDataError(1, 0, what="OHLC candles")` at `data.py:1383` fires when the read is empty.
+If the fetch leg was rate-limited **and** the store came back empty, the honest error is
+`RateLimitExhaustedError` (we were refused and have no data), not "not enough data" (we had a
+normal, merely short, window). Chain the original as `__cause__` so the run log keeps both.
+
+### Step 4 — `engine.py:57-74`: reason codes, per §6.2.
+
+### Step 5 — upstream `kraken-python` (separate change, separate lock bump), per §5(b):
+
+* add `"EService: Throttled"` to `_RATE_LIMIT_MARKERS` (`transport.py:45-48`);
+* drop or verify the stale `"EGeneral:Too many requests"`;
+* parse the `EService` timestamp onto `RateLimitError` as `retry_after`
+  (`kraken_api/errors.py:31`);
+* mount `HTTPAdapter(max_retries=Retry(..., allowed_methods={"GET"}, status_forcelist={429,500,502,503,504}))`
+  at `transport.py:114` — **`allowed_methods={"GET"}` is mandatory**, per the nonce hazard in §2.3;
+* bump `flake.lock` to the new rev in `kraken-python`.
+
+---
+
+## 8. What must NOT regress
+
+1. **`data.py:1364`'s store leg must not re-page when the store can serve the read.** This is the
+   strongest single argument for the §7 Step 2 shape. Today a transient 429 aborts a read the
+   store already held. A naive "retry harder" fix makes this *worse* — more waiting, still an
+   abort. The correct outcome is: fetch fails → **skip the upsert** → `store.read` still answers.
+   Assert this in a test: a source that raises `RateLimitError` on page 1 against a
+   **pre-populated** store must return that store's rows, not raise.
+2. **A partial page-fetch must never be silently persisted as a complete window.** No path may
+   reach `store.upsert` (`data.py:1366`) with a `complete=False` collection. A store seeded with
+   3-of-6 pages looks identical, on the next run, to a complete seed — the exact failure
+   `tools/store_guard.py`'s whole docstring exists to prevent ("a fallback-csv seed reports
+   success, leaves a directory that *looks* seeded"). Same anti-pattern, same reason.
+3. **Pagination semantics are load-bearing and already tested.** `data.py:1108` `if last == 0 or
+   not batch` and `data.py:1111` `cursor = last` must not change; the boundary-duplicate drop at
+   `data.py:1183-1184` (`~df.index.duplicated(keep="first")`) depends on it. Every fake returns
+   `last=0` and must still terminate on page 1.
+4. **No real sleeping in tests.** 9 fake `ohlc` implementations exist across 6 test files (see
+   §7 Step 1). A non-injectable `time.sleep` turns any future failure-path test into a
+   multi-second test and makes the suite flaky.
+5. **`pages` stays the bound.** `data.py:1112` `pages: int = 6` is the operator's knob and the
+   `ValueError` at `data.py:1101` (`pages < 1`) is a tested contract. Retries are per *page*;
+   they must not multiply the number of pages fetched.
+6. **Non-retryable errors must stay non-retryable.** `ConfigurationError` /
+   `AuthenticationError` (`kraken_api/errors.py:10,14`) mean a wrong key — retrying 5× just
+   delays the real error by a minute. Neither is a `RateLimitError`, so keying on the tuple in
+   §7 Step 1 gets this right; do not widen it to bare `Exception`.
+7. **POST must never be auto-retried** (§2.3, nonce at `transport.py:157`/`:170-178`).
+8. **`derived-column parity between the two legs** — `tests/test_rl_data_store.py:687`
+   (`test_store_and_live_legs_derive_identical_columns`) and `:650`
+   (`test_store_read_leg_derives_the_ohlcv_scalars`) assert the store and fetch legs produce an
+   identical column set. `add_derived_ohlcv_features` runs *after* the fetch/store fork in both
+   (`data.py:1186`, `data.py:1387`), so a retry change must not move it.
+
+---
+
+## 9. Where this belongs in the repo
+
+| Concern | Home | Why |
+|---|---|---|
+| Retry policy + resume-from-cursor | `data.py:_page_candles` (`data.py:1071-1111`) | The one function both legs share, by design (`data.py:1086-1088`). |
+| The new error type | `data.py`, beside `NotEnoughDataError` (`:220`), `MarketDataStoreUnavailableError` (`:237`), `SignalTickerMismatchError` (`:367`) | All three are `ValueError` subclasses declared there. `errors.py` is a pure re-export (`:1-29`) and holds none of them. |
+| Engine visibility | `engine.py:57-74` + `strategies/sma.py:72-76` | The only two consumers of the tick dict. |
+| Not a store-guard concern | — | `tools/store_guard.py` is a pipe-stage refusal for seed reports; reuse its message style (name the recipe, name the fix), not its mechanism. |
+| Upstream markers/`retry_after`/`GET`-only adapter | `kraken-python` `transport.py:45-48`, `:114`, `kraken_api/errors.py:31` | Separate repo, **separate lock bump** (`flake.lock` rev `81de5974`). |
+
+**Dependency verdict, stated plainly:** the minimal fix requires **no new dependency** —
+`urllib3` 2.8.0 and `requests` 2.34.2 are already in `.venv`, and §7 Step 1 is ~25 lines. If the
+architect would rather not hand-roll, `tenacity` (9.1.4, Apache-2.0, zero deps, actively
+maintained, and whose `wait_random_exponential` implements AWS Full Jitter by direct citation) is
+the one library to take, and `backoff` and `httpx` are both rejected — one archived, one without
+status-code retry.
+
+---
+
+RESEARCH COMPLETE

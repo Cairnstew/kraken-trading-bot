@@ -1,529 +1,538 @@
-# RESEARCH-1 — CAND-1: market microstructure, and what `/0/public/Trades` actually buys
+# RESEARCH-1 — Gap G1: `microstructure` group is enabled but has no producer
 
-**Pass:** audit-pipeline-1002 · **Role:** Researcher 1 (research only; no source/config/test files modified)
-**Gap:** CAND-1 (`AUDIT.md` §3) + the G2-R2 refutation in §2
-**HEAD at start:** `ddd293f` · **Measured against:** live Kraken Spot REST, keyless, 2026-10-02 ~12:51–14:10Z
+**Author:** researcher1 · **Pass:** Phase 2 (read-only research) · **Date:** 2026-10-02
+**Gap:** G1 (`AUDIT.md` §2 🥇) · **Questions:** `AUDIT.md` §5 items 2 (and partly 1)
 
-> **Slot reuse.** This file previously held the *prior* pass's G1 research
-> (signal seam), committed at `444fe1f`. The same slot was reused this run —
-> `RESEARCH-3.md` was overwritten identically at `ddd293f`. Prior content is
-> still in git history; nothing was deleted.
+> Nothing in the source tree was modified. Verified claims are literal lines in
+> `/home/seanc/Projects/kraken-trading-bot` or `/home/seanc/Projects/kraken-*`, a live
+> HTTP call, or a URL. Anything I could not verify is marked **UNVERIFIED**.
 
 ---
 
-## 0. The answer in five lines
+## 0. TL;DR for the architect
 
-1. **`/0/public/Trades` is keyless, paginable, and reaches each pair's entire listing
-   history** — XBT/USD to 2013-10-06, ETH/USD to 2015-08-07, SOL/USD to 2021-06-17.
-   Measured, not remembered. The floor is per-pair listing, *not* a retention clamp.
-2. **It is a strict superset of the OHLCV frame.** A fully-paged 1-hour ETH/USD bar,
-   deduplicated on `trade_id`, reproduces the candle's `volume`, `count` and `vwap` with
-   **delta exactly 0.0000000000**. There is no join-key, unit, or basis problem.
-3. **6 of the 7 derived features the audit named are point-in-time** (present on bar 0, zero
-   marginal warm-up) and need nothing but `/public/Trades`.
-4. **The 7th — realized spread — does not work on Kraken spot at any resolution I tested.**
-   Roll is undefined on 13/16 one-minute bars and absurd where defined; Corwin-Schultz is
-   negative (floored to 0) on 11/15. The quoted spread is **0.47 bps median**; the classic
-   estimators assume a market where that is large. Honest answer: **drop it**, or take it
-   forward-only from `/public/Spread` where it is *measured*, not estimated.
-5. **`/public/Spread` ignores `since` entirely** — stronger than the audit's "bounded". It is
-   not backfillable at all. So the answer splits: **tape = historical, spread + depth =
-   forward-only recorder.**
+Three findings change the shape of G1 relative to how `AUDIT.md` frames it.
+
+1. **Nothing needs to be sourced from a third party.** Kraken's keyless
+   `/0/public/Depth` was **called live and returns HTTP 200 with no API key**, and it
+   reduces to `bid_vol`/`ask_vol` in **two lines of arithmetic**. Verified empirically, not
+   read off a doc page.
+
+2. **The producer code already exists in-tree — twice.** `kraken-python` already ships
+   `manager.order_book(pair, count)` → an `OrderBook` dataclass of `BookLevel(price, volume,
+   timestamp)`, *and* a keyless `wss://ws.kraken.com/v2` client whose `subscribe()` already
+   takes a `depth` argument and already whitelists the `book` channel. The bot's
+   `engine.py:72` calls it every 60 s and discards the result. **A new sibling repo
+   (`kraken-order-book`) would be re-implementing a library that is already a sibling.**
+   The missing piece is ~40 lines of *policy* (stamp, sum, append), not plumbing.
+
+3. **`G1 cannot be backfilled. Ever, from any free source.** Kraken's entire public archive
+   is OHLCVT — no depth. And Binance Vision has **no depth dataset either** (verified by
+   S3 `KeyCount=0` on `bookDepth` and `depth` prefixes), which kills the obvious fallback of
+   importing the deep-history pattern from Binance. Historical L2 depth is a paid commodity
+   everywhere. **So G1 is structurally forward-only, exactly like G2's funding channel** —
+   and it carries G2's exact failure mode: for a training window predating the recorder,
+   `order_book_imbalance` will read as a zero-fill. The architect should treat "when does
+   the recorder start" as part of the acceptance criterion, not an afterthought.
+
+**Recommendation in one line:** add `bid_vol`/`ask_vol` to an existing configured signal
+JSONL via a thin recorder in `kraken-funding-rates` (or `kraken-python`), and widen **two**
+tuples in `features.py` — a one-line-of-code change on the consumer side.
 
 ---
 
-## 1. Q1 — What is on `/0/public/Trades`?
+## 1. G1 evidence re-verified against the current tree
 
-### 1.1 Documented contract
+AUDIT's claims all hold. Re-derived independently:
 
-From `https://docs.kraken.com/api/docs/rest-api/get-recent-trades` (fetched 2026-10-02):
+| Claim | Verified at | Status |
+|---|---|---|
+| Imbalance branch guarded on `bid_vol`/`ask_vol` | `kraken_trading_bot/rl/features.py:1007-1015` | ✅ exact |
+| `bid_vol`/`ask_vol`/`order_book_imbalance` appear nowhere in src | repo-wide `grep` (excl. `.venv`, `.git`) | ✅ only `features.py:1007-1014` |
+| …except four tests fabricating the columns | `tests/test_rl_environment.py:222-223`; `tests/test_feature_nonfinite_guards.py:306-307, 398-399, 635-636` | ✅ 3 sites / 2 files |
+| `_SIGNAL_COLUMNS` omits `bid_vol`/`ask_vol` | `features.py:94-125` | ✅ |
+| Merge seam reduces to that allow-list | `kraken_trading_bot/rl/data.py:765-769` | ✅ |
+| `order_book` fetched every tick, discarded | `kraken_trading_bot/engine.py:72` | ✅ |
+| `order_book` advertised as a `tick()` key | `kraken_trading_bot/strategies/base.py:92` | ✅ |
+| only `tick()` reads `candles` + `ticker` | `kraken_trading_bot/strategies/sma.py:68-69` | ✅ |
+
+**Bonus finding AUDIT understates.** `features.py:146-148` already anticipates this work:
+
+> *"A future tick-level tape recorder must use `realized_spread_bps` instead of competing
+> for this name."*
+
+Someone already designed around the arrival of a depth/tape producer. G1 is not a
+speculative proposal; it is a reserved slot.
+
+---
+
+## 2. The MINIMAL change to make `bid_vol`/`ask_vol` reachable today
+
+**This is the deliverable question. It is two tuple edits, not one.**
+
+### 2.1 What must change in the consumer (both edits are required)
+
+```python
+# features.py:94-125
+_SIGNAL_COLUMNS = (
+    ...
+    "bid",
+    "ask",
+    "bid_vol",      # ADD  — so data.py:765-769 carries them off the JSONL
+    "ask_vol",      # ADD
+)
+
+# features.py:149
+_SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread", "bid_vol", "ask_vol")  # ADD
+```
+
+**Why the second edit is not optional** — this is the part AUDIT.md's "widen
+`features.py:94-125`" glosses over. `_add_signals_features` (`features.py:1052-1059`) is:
+
+```python
+for col in _SIGNAL_COLUMNS:
+    if col in _SIGNAL_BUILDER_INPUT_COLUMNS:
+        continue          # <-- builder inputs never become observation columns
+    if col in df.columns:
+        out[col] = df[col].astype(float).replace(_NON_FINITE_INPUTS_NO_ZERO, np.nan)
+```
+
+Adding `bid_vol`/`ask_vol` to `_SIGNAL_COLUMNS` **alone** makes the merge seam carry them —
+*and* copies both into the observation as raw columns, two more unnormalised size-scale
+columns, in the same way `features.py:139-144` explicitly argues against for `bid`/`ask`:
+
+> *"`bid`/`ask` are raw dollar prices that only exist as *builder inputs* […] whitelisting
+> them raw would put two more dollar-scale columns into the observation for information the
+> price group already carries."*
+
+Adding them to `_SIGNAL_BUILDER_INPUT_COLUMNS` as well routes them to
+`_add_microstructure_features` and nowhere else. `POINT_IN_TIME_EXOGENOUS_COLUMNS`
+(`features.py:171-173`) is `frozenset(_SIGNAL_COLUMNS) | frozenset(_SIGNAL_BUILDER_INPUT_COLUMNS)`
+so it picks both up automatically — no third edit.
+
+Net effect: `microstructure` goes from a maximum of **1** column (`spread`) to **2**
+(`spread` + `order_book_imbalance`), and the observation width grows by **1**, not 3.
+
+### 2.2 The cheapest integration: reuse an *already-configured* channel
+
+This is the decisive simplification. `_SIGNAL_CHANNELS` (`data.py:144-156`) has three
+entries, and **both** read legs iterate it positionally:
+
+```python
+# data.py:1194-1196 (fetch leg) and data.py:1387-1389 (store leg) — identical
+for config_key, signal_file, _producer in _signal_channels(
+    extra_features_file, funding_features_file, social_features_file
+):
+```
+
+Adding a **4th** channel means touching `_SIGNAL_CHANNELS` *and* both call sites *and*
+threading a new kwarg through `fetch_ohlc_dataframe` and `read_ohlc_dataframe` — and the
+two legs are duplicated, so there is a real drift hazard (`data.py:1385`: *"the two must
+never drift"*).
+
+**Therefore: have the depth recorder append `bid_vol`/`ask_vol` into an already-configured
+file** (`configs/default.yaml:92` `funding_features_file` is non-null and already merged).
+Then the entire consumer-side change is §2.1's two tuple edits — **no `_SIGNAL_CHANNELS`
+change, no signature changes, no new config key.**
+
+| Option | Consumer edits | Coupling |
+|---|---|---|
+| **A.** append into the funding JSONL | 2 tuple edits | depth lives/dies with funding |
+| **B.** new `microstructure_features_file` channel | 2 tuple edits + `_SIGNAL_CHANNELS` + 2 call sites + 2 signatures + config key | independently switchable |
+
+Recommend **A** for the minimal build; **B** if the lead wants an independent kill-switch
+(justified, because a depth recorder's cadence/availability is operationally independent of
+funding).
+
+### 2.3 What still has to be BUILT after that (do not treat §2.2 as done)
+
+1. **A recorder.** Nothing writes `bid_vol`/`ask_vol`. ~40 lines using plumbing that already
+   exists — see §4.
+2. **A cadence decision.** The merge seam floors to the hour (`data.py:757`) and
+   `signal_max_age_hours` defaults to 12 (`configs/default.yaml:126`), so hourly is the
+   natural rate. That is already what the funding channel does.
+3. **Aggregation semantics.** A `/Depth` response is an *instant*, not a bar, and carries no
+   timestamp of its own (each *level* carries its own order-placement timestamp). See §5.2 —
+   last-sample-per-hour vs mean-per-hour is a real modelling choice, not a detail.
+4. **A timer.** Funding has `systemd/…-funding.timer`; a depth recorder needs its own, or it
+   piggybacks.
+5. **Acceptance for the cold-start.** See §6 — this is the part most likely to be forgotten.
+
+---
+
+## 3. Question 2 — keyless Kraken order-book/depth sources
+
+### 3.1 Kraken REST `/0/public/Depth` — **KEYLESS. Verified by live call.** ⭐ recommended
+
+<figure>
+<b>Verified live, unauthenticated, 2026-10-02:</b>
+</figure>
+
+```
+$ curl -s -D - "https://api.kraken.com/0/public/Depth?pair=XBTUSD&count=10"
+HTTP/2 200
+content-type: application/json
+
+error: []
+pair key: XXBTZUSD
+  asks: 10 levels; first 3 raw = [['84496.70000','0.174',1790980147], ...]
+  bids: 10 levels; first 3 raw = [['84496.60000','0.395',1790980147], ...]
+  --> bid_vol = 7.599
+  --> ask_vol = 7.964
+  --> order_book_imbalance = -0.023453061749020124
+```
+
+| Property | Value | Source |
+|---|---|---|
+| Auth | **none** — `security: []` in the OpenAPI spec | [docs.kraken.com/api/docs/rest-api/get-order-book](https://docs.kraken.com/api/docs/rest-api/get-order-book) |
+| `count` | 1–**500**, default 100 | same |
+| Output | raw L2 levels `[price, volume, timestamp]` as **strings**, `asks`/`bids` arrays | same |
+| Reduction cost | **2 lines**, no parsing | see below |
+| Rate limit | Spot REST "call counter (max 15–20 depending on tier)" | docs.kraken.com/llms.txt |
+| Observed headers | no `RateLimit-*` headers on this 200 response | my own `curl -D` |
+
+```python
+bid_vol = sum(float(l[1]) for l in book["bids"])
+ask_vol = sum(float(l[1]) for l in book["asks"])
+```
+
+**The honest caveat on rate limits:** I could not locate the canonical Kraken rate-limit
+page — four candidate URLs 404'd (`/hc/en-us/articles/360000426082-api-rate-limits`,
+`…/360000446646-…`, `docs.kraken.com/api/docs/guides/rest-ratelimits`,
+`docs.kraken.com/api/docs/guides/rest-rate-limit`). The 15–20 figure is Kraken's own
+summary in `llms.txt`, so it is first-party but **the exact page path is UNVERIFIED**. This
+matters little here: at hourly cadence a single `Depth` call is far inside any plausible
+tier. The sibling's own fixed `min_interval` throttle
+(`kraken-python/kraken_api/transport.py:181-186`) is the binding constraint anyway.
+
+### 3.2 Kraken WS v2 `book` channel — **KEYLESS**, better data, more machinery
 
 | Property | Value |
 |---|---|
-| Auth | `security: []` — **no API key, no signature, no tier** |
-| Row shape | `[<price>, <volume>, <time>, <buy/sell>, <market/limit>, <misc>, <trade_id>]` |
-| `buy/sell` | `b` / `s` (abbreviated — **not** `buy`/`sell`) |
-| `market/limit` | `m` / `l` (abbreviated) |
-| Page size | `count`, 1–1000, default 1000 |
-| `last` | *"ID to be used as `since` when polling for new trade data"* |
-| `since` | documented `type: string`, example `'1616663618'` |
+| Endpoint | `wss://ws.kraken.com/v2` — listed as **Public Data** (auth endpoint is the separate `ws-auth.kraken.com/v2`) |
+| `depth` | 10 / 25 / 100 / 500 / **1000**, default 10 |
+| Snapshot + incremental `update`, CRC32 `checksum` over top 10 each side |
+| Docs | [docs.kraken.com/api/docs/websocket-v2/book](https://docs.kraken.com/api/docs/websocket-v2/book) |
+| Cost | a long-lived socket + book maintenance + checksum validation + reconnect/backoff |
 
-### 1.2 Two traps the docs understate, both measured
+At `depth=1000` this is a genuinely richer source than the REST snapshot. But for
+`bid_vol`/`ask_vol` it buys nothing extra — the sum over 1000 levels instead of 10 is a
+*materially different number*, so if you take this route you must **pick the depth once and
+record it**, because the feature is not comparable across a depth change. For a first
+implementation the 2-line REST sum is the better trade.
 
-**Trap 1 — `last` is in NANOSECONDS.** Measured: `last = 1790945549598264546`;
-`/1e9 = 1790945579.934603` = 0.065 s before the `Date` header. So the cursor round-trips
-**only if you multiply by 1e9 on the way back in**. `kraken-python`'s
-`manager.recent_trades` returns it as a bare `str` (`manager.py:198`) and its own docstring
-implies seconds. Passing it back verbatim lands you in 1970 and re-fetches the pair's
-listing date.
+### 3.3 Kraken WS v2 `level3` channel — **AUTHENTICATED. Not keyless.** ❌
 
-**Trap 2 — rows are 7 fields, not 6.** `Trade.from_public_row` (`models.py:374-385`)
-reads indices 0-5 and **silently drops `trade_id`** — the single field a backfiller needs
-for idempotent dedup. Measured: 3656 rows collected across 4 pages carried only 3653 unique
-`trade_id`s (3 boundary duplicates), which inflated derived volume by exactly 7.278.
-Deduplicating on `trade_id` closed the gap to **0.0000000000**. This is the only
-correctness defect on the whole path.
+Discovered while checking WS auth. Unlike `book`, L3 is on a **different host**
+(`ws-l3.kraken.com/v2`), its subscribe/unsubscribe payloads mark `token` **required**, and
+the docs state plainly:
 
-### 1.3 Retention — measured, exhaustively
+> *"The `level3` channel is authenticated (i.e. it requires an API token to subscribe) and
+> there are restrictions of the number of symbols and the subscription rate."*
 
-Probing `since` at ages 1 h → 12 y against live XBTUSD:
+Limits: 200 symbols/connection; rate counter 200/s standard, 500/s pro; counter increase per
+symbol 5/25/100 for depths 10/100/1000. ([docs.kraken.com/api/docs/websocket-v2/level3](https://docs.kraken.com/api/docs/websocket-v2/level3))
 
-| Age | Rows | Oldest returned | Reached `since`? |
-|---|---|---|---|
-| 1 h … 30 d | 1000 | as requested | yes |
-| 1 y / 2 y / 3 y | 1000 | as requested | **yes** |
-| 4 y … 15 y | 1000 | as requested | **yes** |
-| `since`=2013-01-01 | 1000 | 2013-01-01 01:44 | yes |
-| `since`=2011-06-01 | 1000 | **2013-10-06 21:34:16** | clamped |
-| `since`=2012-06-01 | 1000 | **2013-10-06 21:34:16** | clamped |
-| `since`=2013-10-07 | 1000 | 2013-10-07 20:50 | yes |
+Excluded — it would add a secret to a pipeline that is currently keyless end to end, for a
+column that `features.py:1007` reads as a plain scalar.
 
-`since` is honoured exactly; 2011 and 2012 both clamp to the *same* instant, which is the
-archive floor for XBTUSD. Crucially the floor is **per-pair listing date, not a retention
-window** — every pair clamps to its own launch:
+### 3.4 Kraken public archive — **NO ORDER BOOK. OHLCVT ONLY.** ❌ (the big negative)
 
-| Pair | Oldest trade on record | Pair | Oldest trade on record |
-|---|---|---|---|
-| XBTUSD | 2013-10-06 21:34:16 | ADAUSD | 2018-09-28 13:25:00 |
-| ETHUSD | 2015-08-07 14:03:25 | DOGEUSD | 2019-12-19 18:20:38 |
-| XRPUSD | 2017-05-18 15:46:56 | DOTUSD | 2020-08-18 17:02:07 |
-| | | SOLUSD | 2021-06-17 15:32:57 |
+This is the single most decision-relevant negative in this report.
 
-**Answer: Trades does NOT share the ~721-bar OHLC ceiling. It has no practical ceiling at
-all** — it goes back to the beginning of the market. This is the single most consequential
-measured fact in this document.
+Kraken's downloadable history ([support.kraken.com/…/downloadable-historical-ohlcvt-data](https://support.kraken.com/hc/en-us/articles/360000426082-deprecated-api-keys),
+"Last updated: September 16, 2026") is:
 
-### 1.4 Rate limits — documented *and* measured
+> *"OHLCVT data […] Each row is: `timestamp, open, high, low, close, volume, trades`"*
 
-Documented (`https://docs.kraken.com/api/docs/guides/spot-rest-ratelimits`): tier-based call
-counter. **Starter (keyless) max 15, decay −0.33/sec.** Ledger/trade-history calls cost 2;
-all other calls cost 1 — so `Trades`/`Spread`/`Depth`/`OHLC` are all cost **1**.
+Full history `…Kraken_OHLCVT_Full_2026Q2.zip.part00..04` (~2 GB parts, `assets.kraken.com/marketing/institutions/`) plus
+quarterly increments. **No depth, no L2, no book snapshots — nothing.**
 
-Measured, cache-busted with unique `since` values:
+**Conclusion: `bid_vol`/`ask_vol` history for Kraken does not exist publicly. G1 is
+forward-only by the venue's own offering, not by our engineering.** Any plan that assumes
+backfill is wrong.
 
-| Probe | Result |
+### 3.5 Binance Vision — **NO DEPTH EITHER** (kills the obvious fallback) ❌
+
+The pipeline already has a Binance-archive precedent (`kraken-deep-history`), so "just use
+Binance depth like we use Binance klines" is the obvious fallback. **It is not available.**
+
+`binance-public-data` (README, MIT, 2.5k stars) documents exactly three Spot data types —
+**AggTrades, Klines, Trades** — and the same three for futures. Verified directly against
+the bucket rather than trusting the README:
+
+```
+data/spot/monthly/bookDepth/BTCUSDT/   -> KeyCount = 0
+data/spot/monthly/depth/BTCUSDT/       -> KeyCount = 0
+data/spot/daily/bookDepth/BTCUSDT/     -> KeyCount = 0
+data/spot/monthly/klines/BTCUSDT/1h/   -> KeyCount = 2   (control: data exists)
+```
+
+**No free historical L2 depth exists for Kraken *or* Binance.** G1 cannot be backfilled by
+any keyless route.
+
+### 3.6 `cryptofeed` — best-of-breed Python L2, but **AGPL-3.0**
+
+| | |
 |---|---|
-| 30 calls, no sleep, same URL | 30/30 OK — **Cloudflare served these** (`CF-Cache-Status: HIT`, `max-age=2`) |
-| 25 calls, unique `since` | 25/25 OK |
-| 60 calls, unique `since`, 0.1 s apart | **throttle at call 31** |
-| repeated burst | throttle at call **30**, **30** (reproducible) |
-| sustained 1 req/s × 20 | **20/20 OK** |
-| sustained 0.5 req/s × 20 | **20/20 OK** |
-| after 30 s idle | clean |
+| Version | 3.0.1, released **2026-09-27** |
+| Repo | [bmoscon/cryptofeed](https://github.com/bmoscon/cryptofeed) — 2,915★, 1 open issue, pushed **2026-10-02** (today) |
+| **License** | **AGPL-3.0-or-later** (verified by fetching `LICENSE`: "GNU Affero General Public License … or (at your option) any later version") |
+| Python | **>=3.13** (this repo + all siblings declare `>=3.11`) |
+| Kraken support | ✅ verified in `cryptofeed/exchanges/kraken.py` |
 
-**Verbatim throttle response — and it is a trap:**
+The Kraken class is genuinely first-class:
 
+```python
+# cryptofeed/exchanges/kraken.py
+websocket_endpoints = [WebsocketEndpoint('wss://ws.kraken.com/v2', limit=20)]   # public
+rest_endpoints = [RestEndpoint('https://api.kraken.com',
+    routes=Routes('/0/public/AssetPairs', l2book='/0/public/Depth?pair={}&count={}'))]
+websocket_channels = { L2_BOOK: 'book', ... }
 ```
-HTTP/2 200        <-- NOT 429
-{"error":["EGeneral:Too many requests"]}
+
+It already handles `valid_depths`/`book_depth`, book maintenance, **and CRC32 checksum
+validation** (`checksum_format='KRAKEN'`). Output is a `cryptofeed.types.OrderBook` whose
+`.book` is an `_OrderBook` with `.bids`/`.asks` as ordered `price → size` maps, so:
+
+```python
+bid_vol = sum(ob.book.bids.values())
+ask_vol = sum(ob.book.asks.values())
 ```
 
-Three consequences:
+**Two blockers, and the lead must decide, not me:**
+- **AGPL-3.0** is network-copyleft. Note none of the four sibling repos I checked even
+  declares a license (no `LICENSE` file, no `license` key in any `pyproject.toml`) — so
+  there is no existing permissive grant to conflict with, but there is equally no stated
+  policy. Adopting AGPL into a keyless, private, local pipeline is defensible; it is a
+  decision to make deliberately, not a default to slip into.
+- It would raise the Python floor from 3.11 to 3.13 across a sibling chain for a 2-line
+  arithmetic result.
 
-- `kraken-python` gets this right: `transport._request` checks the `error` array on a 200 and
-  `_RATE_LIMIT_MARKERS` includes `"EGeneral:Too many requests"` → raises `RateLimitError`
-  (`transport.py`, `errors.py`). **No fix needed there.**
-- But `KrakenTransport.__init__` defaults `min_interval=0.0` and its docstring says
-  *"~15-20 calls/s depending on tier"* — **that figure did not reproduce.** Measured ceiling
-  is ~30 burst, safe sustained ~1 req/s. A backfiller must set `min_interval` explicitly
-  (~0.8–1.0) or it will be throttled silently on a 30-call page burst.
-- `manager.recent_trades` has **no retry**. `CAND-4`'s finding (no retry/backoff on the read
-  path) applies verbatim to any tape backfiller.
+### 3.7 `ccxt` — MIT, actively maintained, and the lowest-friction fallback
 
-### 1.5 Backfill cost — priced
+| | |
+|---|---|
+| Version | 4.5.85, released **2026-10-01**; repo pushed **2026-10-02**; 44,220★ |
+| License | **MIT** (GitHub API `spdx_id`) |
+| Kraken `fetch_order_book` | ✅ verified present — `ccxt/async_support/kraken.py:1002` |
 
-`OHLCV.count` reconciles exactly with the tape (§2.1), so trades/day is one call per pair
-from the OHLCV frame — no need to page the tape just to size the job:
+MIT + alive + already the de-facto standard. If the lead wants a maintained library that
+sidesteps both the AGPL question and the raw-WS maintenance burden, this is it. Against it:
+CCXT returns a normalised `OrderBook` per exchange with no checksum discipline, and it is a
+very large dependency to take for two sums that `kraken-python` already supports natively.
 
-| Pair | trades/day | pages/day | 30 d @1 rps | 30 d @3 rps | 90 d @3 rps | 365 d @3 rps |
-|---|---|---|---|---|---|---|
-| XBTUSD | 111,666 | 111.7 | 55.8 h | 18.6 min | 55.8 min | 3.8 h |
-| ETHUSD | 54,340 | 54.3 | 27.2 h | 9.1 min | 27.2 min | 1.8 h |
-| XRPUSD | 44,029 | 44.0 | 22.0 h | 7.3 min | 22.0 min | 1.5 h |
-| SOLUSD | 40,907 | 40.9 | 20.5 h | 6.8 min | 20.5 min | 1.4 h |
-| LTCUSD | 17,741 | 17.7 | 8.9 h | 3.0 min | 8.6 min | 36 min |
-| ADAUSD | 14,525 | 14.5 | 7.3 h | **2.4 min** | 7.3 min | 30 min |
-| DOGEUSD | 13,377 | 13.4 | 6.7 h | 2.2 min | 6.7 min | 27 min |
-| DOTUSD | 12,133 | 12.1 | 6.1 h | **2.0 min** | 6.1 min | 25 min |
+### 3.8 Paid / commercial depth history
 
-**30 days of full-depth tape for ADAUSD is a 2.4-minute job.** This is a minutes-scale
-backfill, not a project.
-
-**Stated honestly:** this backfills *features*, not *bars*. CAND-3's ~721-bar training
-ceiling is untouched by any of this — `train` still only gets 721 OHLCV bars. The tape makes
-microstructure features available at any depth; whether a model can *train* on them is
-CAND-3's question. Two of them interact: a tape-derived store keyed on the tape's own
-timestamps could in principle carry a feature frame deeper than 721 bars, which would
-interact with CAND-3's store work rather than duplicate it.
-
----
-
-## 2. Q2 — Which derived features are worth building?
-
-### 2.1 First, the load-bearing fact: the tape *is* the OHLCV frame
-
-Full pagination of ETH/USD bar `2026-10-02 12:00Z`, deduplicated on `trade_id`:
-
-| Quantity | From tape | From candle | Delta |
+| Provider | Kraken L2 coverage | Access | Notes |
 |---|---|---|---|
-| `volume` | 2681.28626882 | 2681.28626882 | **0.0000000000** |
-| `count` | 3653 | 3653 | **0** |
-| `vwap` | 2753.315371 | 2753.31 | exact at 2 dp |
-| `open` | 2745.72 | 2745.72 | exact |
-| `high` / `low` / `close` | 2765.75 / 2738.20 / 2755.00 | identical | exact |
+| **Tardis.dev** — ✅ **verified** | ✅ Spot `book` channel, snapshots + updates, ≤1000 levels, **from 2019-06-04** to present | **Paid.** No ongoing free plan. 1-month trial = randomly-selected 7–14 recent days. Without a key: CSV for the **first day of each month** only. Prices unpublished. | Python client (`pip install tardis-dev`); 50+ exchanges; tick-level CSV + replay API. **The only verified route to real Kraken L2 history.** |
+| Kaiko | L1/L2 feeds listed; **per-venue coverage UNVERIFIED** (coverage explorer is behind login) | Sales-gated, "Request a Trial", 200+ enterprise clients, no public pricing | |
+| Amberdata / CoinAPI / dxFeed / crypto Lake | **UNVERIFIED** — not checked in depth | — | |
 
-Every derived feature below is therefore **consistent by construction** with the frame the
-RL pipeline already loads. There is no basis, no unit conversion, no join key — the trade's
-timestamp and the bar's timestamp are the same integer.
+Tardis is the answer *if and only if* the lead decides to pay. Two facts worth pricing in:
+its Kraken symbols **changed on 2026-07-10** (v1 `XBT/USD` before, v2 `BTC/USD` after), so a
+backfill spanning that date needs a symbol map; and the free CSV sample (1st of each month)
+is enough for a *plumbing spike* but not a training set.
 
-### 2.2 The feature table
+### 3.9 Summary table
 
-Measured on the same bar: `n=3653`, `V=2681.2863`, `vwap=2753.3154`,
-`O=2745.72 H=2765.75 L=2738.20 C=2755.00`, quote volume 7,382,426.70 USD.
-
-| # | Feature | Exact formula | Look-back | Warm-up | Measured |
+| Source | Auth | Rate | Output shape | → `bid_vol`/`ask_vol` | Verdict |
 |---|---|---|---|---|---|
-| 1 | `signed_volume_imbalance` | `(Σ_{b}v − Σ_{s}v) / (Σ_b v + Σ_s v)` | none | **PIT** | **+0.008434** |
-| 2 | `vwap_close_gap` | `close / vwap − 1` | none | **PIT** | **+0.00061185** |
-| 3 | `trade_size_p50/p90/p99` | quantile of bar trade volumes | none | **PIT** | 0.0295 / 1.7892 / 12.3312 |
-| 4 | `trade_size_tail_ratio` | `p99 / p50` | none | **PIT** | **418.2×** |
-| 5 | `kyle_lambda` (per bar) | `Σ(p−p̄)·(q·v) / Σv²` , `q=+1/−1` | none | **PIT** | **−1.300e−02** |
-| 6 | `large_trade_fraction` | `Σ{v : v > 5·p50} / V` | none | **PIT** | **0.975688** |
-| 7 | `amihud_illiquidity` | `\|close/close₍ₜ₋₁₎ − 1\| / (V·vwap)` | 1 bar | 1 bar | quote-vol 7.38e6 |
-| 8 | `realized_spread` | *see §2.3* | — | **FAILS** | see below |
+| **Kraken `/Depth`** | **keyless** ✅live | REST tier 15–20 | raw L2 `[p,v,ts]` strings | **2 lines** | ⭐ **use this** |
+| Kraken WS `book` | keyless | tier-dependent | L2 + updates + checksum | 2 lines after book maint. | Later, if depth>10 matters |
+| Kraken WS `level3` | **API token** ❌ | 200/s (500 pro) | individual orders | — | ❌ not keyless |
+| Kraken archive | public | — | OHLCVT only | **impossible** | ❌ no depth exists |
+| Binance Vision | public | — | trades/klines/aggTrades | **impossible** | ❌ `KeyCount=0` |
+| cryptofeed | keyless | tier-dependent | normalised L2 + checksum | 2 lines | ⚠️ **AGPL-3.0**, py≥3.13 |
+| ccxt | keyless | tier-dependent | normalised L2 | 2 lines | ✅ MIT, alive, heavy |
+| Tardis | **paid** | plan | historical L2 from 2019 | 2 lines | 💰 only backfill route |
 
-**6 of 7 build, and 6 of 7 are point-in-time.** That is the answer to the question that
-mattered: **a point-in-time microstructure column can be present on bar 0.** Only `amihud`
-costs one bar, which is dominated anyway.
+---
 
-### 2.3 The honest negative: realized spread does not work here
+## 4. Question 1 — where should a depth/tape recorder live?
 
-The audit lists "realized spread" first among the Trades-derived families. It is the one
-that **fails**, and the reason is structural, not a data gap.
+### 4.1 First: the in-tree option AUDIT's framing misses
 
-The *effective* spread `2·|p − m|/m` needs a mid `m`. **Trades has no book** — it gives
-price, volume, side, type. And the mid is only available from `/public/Spread`, which
-(§3.2) **ignores `since`**. So the effective spread has no historical route.
+AUDIT §2 G1 offers a binary (new sibling vs. new grid in `kraken-market-data`). There is a
+**third option that is cheaper than both**, because `kraken-python` already ships the client:
 
-The two tape-only substitutes were tested at both 1-hour and 1-minute resolution:
+```python
+# kraken-python/kraken_api/models.py:213-237   — already in tree
+@dataclass(slots=True)
+class OrderBook:
+    pair: str
+    asks: list[BookLevel]
+    bids: list[BookLevel]
 
-**Roll (1984)** — `S = 2·Var(Δp) / −Cov(Δp, Δq)`, `q` = trade sign, which Trades *does*
-provide:
+# kraken-python/kraken_api/models.py:189-207
+@dataclass(slots=True)
+class BookLevel:
+    price: str
+    volume: str
+    timestamp: int = 0        # 0 when the API omits it
+    @property
+    def volume_decimal(self) -> Decimal: ...
 
-| Resolution | Bars where `Cov(Δp,Δq) < 0` (defined) | Value where defined |
+# kraken-python/kraken_api/manager.py:185-190   — the call engine.py:72 already makes
+def order_book(self, pair: str, count: int | None = None) -> OrderBook:
+    data = self.client.depth(pair, count=count)     # -> keyless /0/public/Depth
+    ...
+
+# kraken-python/kraken_api/client.py:116-121
+def depth(self, pair, count=None): return self.transport.public("Depth", params=params)
+```
+
+So the entire producer is:
+
+```python
+ob = manager.order_book(pair, count=100)
+bid_vol = float(sum(l.volume_decimal for l in ob.bids))
+ask_vol = float(sum(l.volume_decimal for l in ob.asks))
+```
+
+`engine.py:10` and `strategies/base.py:12` already import `OrderBook` from `kraken_api.models`,
+so the shape is pinned and in use. **A new `kraken-order-book` repo would re-wrap this.**
+If a separate repo is wanted for deployment reasons, it should be a ~150-line CLI *over*
+`kraken-python`, not a new library.
+
+`kraken-python` also already has the streaming path, should depth>10 ever matter:
+
+```python
+# kraken-python/kraken_api/websocket.py:40, 43, 137-166
+DEFAULT_PUBLIC_URL = "wss://ws.kraken.com/v2"     # public, keyless
+_CHANNELS = ("ticker", "book", "trade", "ohlc", "executions", "balances", "level3")
+def subscribe(self, channel, symbols=None, *, snapshot=True, depth=None, req_id=None): ...
+```
+
+`subscribe("book", ["BTC/USD"], depth=100)` already emits a spec-correct v2 message. Nothing
+needs writing to stream the book either.
+
+### 4.2 Why a new grid inside `kraken-market-data` is the **worst** of the three
+
+The store's identity is a **shape-preserving read contract** — return *exactly* what the
+bot's `candles_to_dataframe` produces. Every method is welded to that:
+
+| Constraint | Location | Consequence for a depth grid |
 |---|---|---|
-| 1 h × 3 | **0 of 3** | undefined everywhere |
-| 1 min × 15 | 2 of 15 | **+260,551 bps** and **+13,450 bps** (2600 %, 134 %) |
+| `_OHLCV_COLUMNS` is a hardcoded 8-tuple | `store.py:53` | a second dataset needs a parallel column tuple, or breaks the contract the bot depends on |
+| `read()` always returns `_frame_shape(...)` of those 8 columns | `store.py:146-181` | a depth `read()` returns a *different* frame shape from the same class |
+| `upsert()` builds `pd.DataFrame(..., columns=list(_OHLCV_COLUMNS))` | `store.py:214` | silently drops `bid_vol`/`ask_vol` unless rewritten |
+| `_validate_interval` restricts to `OHLC_INTERVALS` | `utils.py:16` = `(1,5,15,30,60,240,1440,10080,21600)` | includes **10080 (weekly)** and **21600 (30-day)** — meaningless for a book snapshot; a depth grid would want its own interval domain |
+| `update()` duck-types `ohlc(pair, interval, since)` | `store.py:245` | a depth poller would need a parallel `update_depth()` |
+| `_candles_to_rows` emits exactly 8 keys from `Candle` | `store.py:67-84` | needs an `OrderBook`→row converter the store has no concept of |
 
-**Corwin-Schultz** — `S = 2(e^α−1)/(1+e^α)` from the tape's own per-bar H/L:
+So "another grid" means a second dataset kind, a second interval domain, a second read/upsert
+contract, and a widened or duplicated column tuple — inside a module whose README sells
+*"Shape-preserving store"* as its headline property. And `INTEGRATION.md` §1 states the
+consumer contract is literally *"returns exactly the DataFrame `candles_to_dataframe`
+produces"*. Diluting that is a real cost paid for a grid the bot would not use.
 
-| Resolution | Result |
-|---|---|
-| 1 h × 2 pairs | −106.25 bps, −95.04 bps → floor 0 |
-| 1 min × 15 | negative on **11 of 15** → floor 0 |
+### 4.3 The actual answer: **the existing signal JSONL seam**
 
-**Why:** the quoted spread is currently **0.47 bps median** (`/public/Spread`, min 0.04 bps)
-on a 0.2759 tick. A 1-hour ETH bar spans ~98 bps, swamping the spread ~100×. Even 1-minute
-bars (~2–5 bps) are at the same order as the spread, where these estimators are known to be
-unstable. Both estimators assume a market where microstructure noise is a material fraction
-of the price variation. Kraken ETH/USD is not that market.
+The store is the wrong shape (§4.2) and a new sibling is mostly re-wrapping (§4.1). What
+`bid_vol`/`ask_vol` actually want is a **forward-only append log keyed by wall-clock fetch
+time** — which is *precisely* what `kraken-funding-rates` already is. From its own service
+unit (`systemd/kraken-trading-bot-funding.service.in`):
 
-**Recommendation: drop realized spread from the historical feature set.** If the architect
-wants a spread column at all, take the **quoted** spread forward-only from `/public/Spread`
-(or from `Depth`) — directly measured, no estimator, no failure mode. Note the codebase has
-already reserved the name for this at `features.py:96-98`: *"A future tick-level tape
-recorder must use `realized_spread_bps` instead of competing for this name"* — that comment
-is now shown to be aspirational, and the name is free to use for something else.
+> *"The file grows by ~1 line per hour, so it is a log, not state."*
 
-### 2.4 What is already in the frame, for free
+That is the same operational shape as a depth recorder: append one JSON line per interval,
+let the hardened merge seam (`data.py:591-842`) do dedup/ffill/freshness/absence-fill, and
+let the already-written builder compute the feature.
 
-Two of the four strongest items are **already computed** and just not consumed as
-microstructure:
+**Ranking:**
 
-- `vwap_close_gap` ≡ the shipped `vwap_dev` (`data.py:859`). My measured +0.00061185 is
-  that column. **Zero new work**; it is already on the allow-list and in the observation.
-- `amihud_illiquidity`'s denominator is the quote volume the tape already reconciles.
-
-So the genuinely new, non-duplicating wins are **#1 (signed imbalance), #4 (size-tail ratio),
-#5 (Kyle's lambda), #6 (large-trade fraction)** — all point-in-time, all needing only the
-tape's `volume` and `side` columns.
-
----
-
-## 3. Q3 — The three sources, compared honestly
-
-### 3.1 `/public/Trades` — keyless, historical, **the winner**
-
-- Auth: none. Rate cost 1. Shape: `[[price, vol, time, side, type, misc, trade_id], ...]` + ns cursor.
-- History: **full, per-pair from listing.** Backfillable today.
-- Reduces to a per-(ticker, timestamp) vector: yes — 6 scalars per bar.
-- Parsing: **already done.** `Trade.from_public_row` + `to_dict()` exist; the only gap is
-  the dropped `trade_id`.
-
-### 3.2 `/public/Spread` — keyless, **not backfillable at all**
-
-This **strengthens** the audit's G2-R2 correction. The audit says *"`since` accepted but
-bounded"*. Measured, the truth is stronger and simpler:
-
-| `since` passed (XBTUSD) | Rows | Oldest returned |
+| Option | Cost | Verdict |
 |---|---|---|
-| *(none)* | 250 | 12:53:41 |
-| −30 m | 250 | **12:53:41** |
-| −1 h / −6 h / −1 d / −3 d / −7 d / −30 d / −90 d / −400 d | 250 | **12:53:41** |
-| −1 h in **seconds** | 250 | **12:53:41** |
-| −7 d in seconds | 250 | **12:53:41** |
-| 2013-01-01 in seconds | 250 | **12:53:41** |
+| Append into the **existing funding JSONL**, recorder lives in `kraken-funding-rates` or a small CLI over `kraken-python` | consumer = 2 tuple edits; producer ~40 lines over existing plumbing | ⭐ **recommended** |
+| New sibling `kraken-order-book` | + repo/flake/Nix module/CI, all to re-wrap `kraken-python` | only if deployment isolation is required |
+| New grid in `kraken-market-data` | breaks its shape-preserving contract | ❌ |
 
-**`since` is accepted without error and completely ignored**, in either unit. Every response
-is the trailing ~250 change-driven samples — **24 s to 98 s of wall clock** depending on the
-pair's volatility (XBTUSD 38 s, DOTUSD 98 s, XRPUSD/XLMUSD 24 s). It is change-driven, not
-time-driven, so the window is not even a fixed duration.
+Note this also makes the two legs structurally incapable of drift: no new channel means no
+edits to the duplicated `_signal_channels(...)` calls at `data.py:1194` and `data.py:1387`.
 
-Also: **`Spread.last` is in SECONDS** (`1790945670`) while **`Trades.last` is in
-NANOSECONDS**. Two adjacent endpoints, same parameter name, incompatible units. A generic
-paginator over `manager.spread` and `manager.recent_trades` will corrupt one of them.
+### 4.4 Is a book snapshot even a time-series row? **No — and it doesn't need to be.**
 
-→ **Requires a forward-only recorder + timer. Cannot be backfilled.**
+This is the design question the lead should settle explicitly:
 
-### 3.3 `/public/Depth` — keyless snapshot, **forward-only, and the only source for the
-dormant consumer's actual columns**
+* A `/Depth` response is an **instantaneous point-in-time state**, not a bar. It carries **no
+  timestamp of its own** — each *level* carries a timestamp, and that is the **order's
+  placement time**, not the observation time. Confirmed live: levels at `1790980147`,
+  `1790980143`, `1790980143`.
+* So a REST poll yields **one `(bid_vol, ask_vol)` pair per fetch instant**, stamped by the
+  recorder's own clock.
+* Landing it on a bar grid therefore requires an **aggregation choice**, and the honest
+  options are *last-sample-per-bar* (what `ffill` + the hour-floor already approximate) or
+  *mean/sum-over-fetches-per-bar*.
+* Consequence: **store the raw fetch instants, not the aggregated bars.** Aggregate at read
+  time. Otherwise the choice is frozen into the data and cannot be revised.
 
-No `since` in `client.depth` (`client.py:116-121`). Measured: passing `since=30 days ago` is
-**accepted silently and ignored** — Kraken drops unknown params rather than erroring, so this
-fails silently rather than loudly.
-
-`count` is honoured and goes deeper than the engine uses:
-
-| `count` | bids | asks |
-|---|---|---|
-| 1 | 1 | 1 |
-| 10 | 10 | 10 |
-| 100 (default) | 100 | 100 |
-| 500 | 500 | 500 |
-
-Rows are `[price, volume, timestamp]`. **`BookLevel` already models all three** with a
-comment *"0 when the API omits it"* — and it does omit it: measured `ask[0]` timestamp
-`1790945670` vs `bid[0]` `1790945702`, a 32 s gap **within one supposedly atomic snapshot**.
-Book-level timestamps are not coherent; do not build features on them.
-
-Feeding `features.py:586-590` directly (`bid_vol`, `ask_vol` summed over N levels):
-
-| Pair | `bid_vol` | `ask_vol` | → `order_book_imbalance` | quoted spread |
-|---|---|---|---|---|
-| ETHUSD | 34.007 | 64.211 | **−0.307520** | 0.036 bps |
-| ADAUSD | 46954.18 | 28744.17 | **+0.240560** | 1.396 bps |
-| DOTUSD | 11229.41 | 11048.74 | **+0.008110** | 3.261 bps |
-
-The imbalances are non-degenerate and cross-pair-varied, so this is genuinely informative —
-**but it is a single instantaneous snapshot of resting orders.** The ETHUSD top-1 depth ratio
-was **144.6** (one 6.65-unit bid against a 0.046-unit best ask), which is a snapshot of one
-resting order, not a market state. And the merge seam will `ffill` it, so the observation
-will show a 10-level snapshot held constant for up to `signal_max_age_hours` (default 12).
-**That is how a noisy instantaneous quantity becomes a stale-looking feature** — the same
-failure mode as CAND-2's inert funding channel, one column-pair narrower.
-
-→ **Requires a forward-only recorder + timer. Genuinely useful, but it is the weaker source.**
-
-### 3.4 Verdict
-
-| | Historical? | Needs recorder+timer? | Yields | Verdict |
-|---|---|---|---|---|
-| **`/public/Trades`** | **YES — full** | no | 6 PIT scalars + 1 rolling | **Build this first** |
-| `/public/Spread` | **no** (`since` ignored) | yes | quoted spread (measured) | add later, forward-only |
-| `/public/Depth` | no | yes | `bid_vol`/`ask_vol` → imbalance | lights the dormant consumer, forward-only |
-
-The two forward-only sources are not alternatives to Trades; they are **complements for the
-one feature Trades cannot deliver**. That is the clean architectural split.
+Two related points:
+* `data.py:757` floors the signal index to the hour (`signal_df.index.floor("h")`), so with
+  the default `signal_max_age_hours: 12` a reading is carried at most 12 hourly bars.
+  An hourly recorder therefore satisfies the seam natively; a 60 s recorder would be
+  floored to one row per hour anyway, so **poll at a cadence finer than hourly only if you
+  intend to change that flooring** — otherwise it is 60× the API calls for one kept row.
+* Depth is **not** comparable across a `count` change (500 levels sums to a different number
+  than 10). Record the depth in the JSONL alongside the values, or the series silently
+  becomes non-comparable across the file's lifetime.
 
 ---
 
-## 4. Q4 — Keyless vs paid
+## 5. Acceptance criteria the builder/validator should hold to
 
-**Everything in this recommendation is keyless. No paid tier, no API key, no account.**
-
-- `/public/Trades`: OpenAPI `security: []`. Verified with **no `API-Key` header at all** —
-  every measurement in this document was made unauthenticated.
-- `/public/Spread`, `/public/Depth`, `/public/OHLC`: same, all verified keyless.
-- Documented Starter tier (keyless) counter: max 15, decay −0.33/s, cost 1 per market-data
-  call. Measured ceiling ~30 burst, ~1 req/s sustained safe.
-
-**Priced and rejected — Kraken L3 market data** (the `/api/v3/marketdata` "level3"
-channel, the only route to a *true* per-trade mid and hence a *true* effective spread, and
-`kraken-python`'s `websocket.py` already lists `level3` in `_CHANNELS`):
-
-- Requires a registered Kraken account and an authenticated WS v2 token
-  (`client.get_websockets_token`, which is a **private** call → `RateLimitError`-style
-  `AuthenticationError` without credentials).
-- Kraken gates L3 behind institutional/negotiated access; it is not a self-serve key toggle.
-- Kraken's REST API does **not** bill market data by call on the Spot endpoints, so there is
-  no metered price to compare against.
-- **Justification for rejecting:** the only thing it buys that Trades does not is a
-  per-trade mid, i.e. an effective spread — and §2.3 shows the spread family is not
-  actionable on these markets anyway (0.47 bps quoted). Paying institutional-gated access and
-  a credentialed runtime dependency to obtain a number that then fails its own sanity check
-  is not defensible.
-
-**Also noted, not priced (CAND-3's territory, not mine):** Kraken publishes downloadable
-OHLCVT CSV ZIPs — `https://support.kraken.com` article *"Downloadable historical OHLCVT
-(Open, High, Low, Close, Volume, Trades) data"*, last updated 2026-09-16, stating data is
-available *"from the beginning of each market up to the present"* at 1/5/15/30/60/240/720/1440
-minute intervals. Keyless bulk, **venue-consistent**, and it includes a Trades count — the
-natural cross-check on any tape backfiller. I did **not** verify the download URL or the
-archive's actual coverage; treat that as unconfirmed and let researcher 3 / the architect
-price it.
+1. **`order_book_imbalance` actually appears** in `FeaturePipeline.compute` output when the
+   seam carries the columns — and **observation width grows by exactly 1** (§2.1's second
+   edit prevents +3). `tools/width_check.py` already exists to catch drift.
+2. **NaN semantics survive.** `features.py:1008-1015` maps non-finite→NaN and divides by
+   `(bid_vol + ask_vol)`. `POINT_IN_TIME_EXOGENOUS_COLUMNS` (`features.py:171-173`) is
+   what tells `first_tradable_index` that a NaN here means *absence*, not *warm-up*. Do not
+   let a depth NaN truncate the tradable window.
+3. **A zero denominator must not appear.** The guard exists and is tested
+   (`tests/test_feature_nonfinite_guards.py:622-645`); a `0/0` from an empty book must stay
+   NaN.
+4. **Cold-start is honest.** If the training window predates the recorder's first line,
+   `order_book_imbalance` reads `0.0` flagged by `signal_observed == 0` — G2's exact trap.
+   State the recorder's start date next to the result, or do not quote the feature.
 
 ---
 
-## 5. Q5 — Candidate records
+## 6. Recommendations, in priority order
 
-| Candidate | Status / last release | License | Auth | Rate limit | Output shape | Parsing needed? |
-|---|---|---|---|---|---|---|
-| **`/public/Trades`** (recommended) | Kraken production, actively served (OpenAPI v1.1.0, spot-rest.yaml) | venue ToS; no redistribution without agreement | **none** (`security: []`) | cost 1; Starter max 15, decay −0.33/s; measured ~30 burst / 1 rps sustained | **structured JSON**, array-of-arrays + ns `last` | **No** — `Trade.from_public_row` exists; add `trade_id` (1 line) |
-| `/public/Spread` | same | same | none | cost 1 | structured JSON, `[time, bid, ask]` + **seconds** `last` | No — `SpreadPoint.from_row` exists |
-| `/public/Depth` | same | same | none | cost 1 | structured JSON, `{asks:[[p,v,t]], bids:[...]}` | No — `OrderBook.from_kraken` / `BookLevel` exist |
-| Kraken WS v2 `trade` | same; `wss://ws.kraken.com/v2` is the **recommended** protocol per Kraken's own index | same | none for public channels | connection-based | streamed JSON | No — `WsTrade` exists; `kraken-python` already wraps it |
-| Kraken WS v2 `level3` | same | same | **token required** (private `GetWebSocketsToken`) | connection-based | streamed JSON | `WsBook` exists |
-| Kraken L3 REST | same | same | institutional-gated | cost-per-request | structured JSON | — |
-| Kraken OHLCVT CSV ZIPs | active (support article 2026-09-16) | same | none | n/a (bulk) | **CSV in ZIP — needs parsing** | **Yes** — real parsing, est. 40–80 lines |
-| `kraken-python` (repo-local wrapper) | 0.3.0, in-repo, last touched 2026-09-24 | in-repo | keyless for public | `min_interval` default **0.0** — must be set | typed dataclasses, `to_dict()`, JSON-safe | **No — already the house style** |
-| `krakenex` (PyPI) | 2.2.2, uploaded **2024-07-01** (~2 yr stale) | **LGPLv3** | none | as venue | dict | — |
-| `krakenapi` (PyPI, FuturBroke) | 1.0.2, uploaded **2024-02-17** (~2.5 yr stale) | **GPLv3+** | none | as venue | dict | — |
-| `ccxt` (PyPI) | **4.5.85, uploaded 2026-10-01** (current) | MIT | none | as venue | dict | — |
-
-**On the PyPI options:** all three are worse than the in-repo `kraken-python` for this job.
-The two Kraken-specific wrappers are GPL/LGPL and ~2 years stale; `ccxt` is current but it is
-an exchange-**abstraction** layer, so it would erase the exact endpoint-level detail (§1.2's
-ns cursor, the 7-field row, the seconds-vs-nanoseconds `last` split) that this feature
-depends on, and it would drag a very large dependency into a 6-dependency package. The
-house style is a first-party wrapper with typed dataclasses; extending `kraken-python` by
-one field is strictly cheaper than any of these.
-
-**On the OHLCVT CSVs:** the only candidate in this table whose output is *raw needing
-parsing*. `kraken-python` has nothing for it. If chosen it is a real CSV reader — zip
-extraction, per-pair/interval file discovery, header handling, decimal-safe float parse.
-Roughly 40–80 lines plus tests. Flagged for completeness; **not** recommended for CAND-1.
+1. **Do not build a new data-source library.** Kraken `/Depth` is keyless (verified live),
+   the client is already in `kraken-python`, and the reduction is 2 lines. G1 is
+   ~40 lines of policy, not a sourcing project. This is the cheapest gap in the audit.
+2. **Do the two-tuple `features.py` edit first**, and validate the +1 width. It is
+   independently reviewable, tests green in minutes, and de-risks everything after it.
+3. **Land the recorder into the existing funding JSONL** (option A in §2.2) unless an
+   independent kill-switch is required.
+4. **Decide the AGPL question explicitly or just don't use cryptofeed.** If MIT-and-alive
+   matters more than minimalism, `ccxt` is the pick. Neither is necessary.
+5. **Budget for a paid Tardis subscription only if a trained model must consume real L2
+   history.** There is no free backfill for Kraken *or* Binance depth — that is a venue-level
+   fact, not a gap in our tooling. Do not let a plan assume otherwise.
+6. **Consider folding G1 and G2 together.** Both are forward-only, both land on the same
+   JSONL seam, and both share the zero-fill cold-start caveat. A single "record what Kraken
+   publishes about the perpetual" recorder would serve both.
 
 ---
 
-## 6. Scoring — reduction to what the RL pipeline consumes
+## 7. Honest gaps in this research
 
-The brief asks me to score partly on how cheaply this reduces to a per-ticker,
-per-timestamp scalar or small vector. Measured:
-
-| Candidate | Reduces to | Parsing cost | Verdict |
-|---|---|---|---|
-| `/public/Trades` | **6 PIT scalars + 1 rolling per (ticker, bar)** | **0 lines** — typed models exist; add `trade_id` (1 line) | **A+** |
-| `/public/Depth` | 2 scalars (`bid_vol`,`ask_vol` → 1 imbalance) | **0 lines** — `OrderBook` exists | **B** (forward-only, snapshot-noisy) |
-| `/public/Spread` | 1 scalar (quoted spread, bps) | **0 lines** — `SpreadPoint` exists | **C** (forward-only, `since` ignored) |
-| WS v2 `trade` | same as Trades, streaming | **0 lines** — `WsTrade` exists | **B** (streaming is a different program; no history) |
-| OHLCVT CSVs | 7 columns/bar | **40–80 lines, new code** | **C** |
-
-**Explicitly: none of the three REST endpoints need parsing.** Every one is structured JSON
-with a typed model already in `kraken-python`. The only code delta is adding the dropped
-`trade_id` field to `Trade` — one line in `models.py`, one in `to_dict()`. That is the
-whole reason Trades wins, and it is worth being blunt about: the audit's framing ("a richer
-feature family") undersells it. The cost is not "parse a raw feed", it is "read one more
-field off a dataclass that already exists".
-
-### The consumer-side contract, verified
-
-I traced the exact wiring, because "zero consumer-code change" is the load-bearing claim:
-
-- `features._add_microstructure_features` (`features.py:577-590`) reads `spread` / `bid`,`ask`
-  / `bid_vol`,`ask_vol` **off the dataframe** — not off the signals allow-list.
-- `data.merge_extra_features` **allow-lists**: `available_cols = [c for c in _SIGNAL_COLUMNS
-  if c in signal_df.columns and c not in _SIGNAL_FRESHNESS_COLUMNS]` (`data.py:609-613`).
-  **A producer emitting `bid_vol`/`ask_vol` through the merge seam has them silently
-  dropped.**
-- `features._SIGNAL_COLUMNS` (`features.py:46-77`) currently contains `spread`, `bid`, `ask`
-  — and **`bid_vol` / `ask_vol` are absent.** Confirms the audit's grep result. The gate
-  itself is `features.py:586-590`.
-- **Adding a name to `_SIGNAL_COLUMNS` does two things at once**, which is the cheap part:
-  1. the merge seam forwards it to the frame;
-  2. it is automatically swept into `POINT_IN_TIME_EXOGENOUS_COLUMNS`
-     (`features.py:123-125`, defined as `frozenset(_SIGNAL_COLUMNS) | _SIGNAL_BUILDER_INPUT_COLUMNS`),
-     which `first_tradable_index` (`features.py:128`, windowed filter at `:150-152`) **excludes
-     from the warm-up gate**.
-- So the new signed-imbalance / size-tail / Kyle / large-trade columns, added to
-  `_SIGNAL_COLUMNS`, are declared point-in-time **automatically** — no second edit, and no
-  risk of a warm-up gate moving from 24 to 720 (the exact regression documented at
-  `features.py:132-148`).
-
-**Precedent to copy:** `data.add_derived_ohlcv_features` (`data.py:812-873`) is already the
-in-repo pattern for exactly this — presence-gated, writes on a copy, derives from columns the
-frame already carries, called on **both** read legs (`data.py:1037` and `data.py:1196`), and
-documented as *"presence-gated, not required-column, exactly like the microstructure
-builder"*. A tape-derived builder mirrors it line for line.
-
-**One caveat on the seam:** `merge_extra_features` floors both indices to the hour
-(`data.py:603`, `data.py:625`) and forward-fills under an age bound. A **tape** producer is
-naturally per-**trade**-timestamp, not per-hour. Either aggregate to the bar interval in the
-producer (recommended — then it is per-(ticker, bar), point-in-time, and needs no carry at
-all), or let the floor do it and accept the `signal_max_age_hours` carry. **Producing one
-record per bar is strictly better** and removes the carry question entirely.
-
-### Costs the architect should price
-
-| Item | Cost |
-|---|---|
-| `Trade` gains `trade_id` | 1 line in `models.py` + 1 in `to_dict()` |
-| `_SIGNAL_COLUMNS` allow-list entries | 1 line each; auto-marks point-in-time |
-| Ticker-recorded `bid_vol`/`ask_vol` (Depth leg) | forward-only; needs recorder + timer |
-| `KrakenTransport(min_interval=…)` for the backfiller | **must be set** — default `0.0` and measured ceiling is ~30 burst |
-| Retry on `RateLimitError` | `manager.recent_trades` has none (same defect as CAND-4) |
-| A `systemd.user` timer | audit §4.8: the repo has exactly one timer, it is funding-only, it is **absent from `nix/module.nix`**, and it is **not installed on this host** — so the timer pattern is not yet proven here |
-| A new sibling repo | `kraken-funding-rates` is the working template: 8 modules, 3 test files, `pyproject.toml` + `flake.nix`, 3 commits |
+* **Kraken REST rate-limit page path: UNVERIFIED.** Four URLs 404'd; the 15–20 figure is
+  Kraken's own `llms.txt` summary. Immaterial at hourly cadence, but do not quote it as a
+  documented tier without re-checking.
+* **Kaiko / Amberdata / CoinAPI / dxFeed / crypto Lake per-venue Kraken L2 coverage:
+  UNVERIFIED** — behind sales logins. Only Tardis's Kraken coverage was positively verified.
+* **Tardis subscription prices: not published** (verified as unpublished, not guessed).
+* **cryptofeed 2.x Python floor** — I verified 3.0.1 requires ≥3.13; I did not audit whether
+  an older 2.x supports the repo's ≥3.11 floor. If the lead wants cryptofeed's checksum
+  validation without the AGPL/py-floor cost, that is the one open question worth answering.
+* I did not measure `order_book_imbalance`'s **predictive** value — out of scope here, and per
+  the repo's own `model-matrix` skill, no single backtest number should be quoted before a
+  matrix run.
 
 ---
 
-## 7. Recommendation
-
-**One gap, two sequenced halves. The first half is minutes of work and needs no timer.**
-
-**Phase 1 — backfillable, keyless, zero new parsing.** A `kraken-tape` sibling (or a
-`microstructure` builder beside `add_derived_ohlcv_features`) that pages
-`/public/Trades` with a `trade_id`-deduped cursor walk, aggregates **per bar interval**,
-and emits the six point-in-time columns:
-
-`trade_signed_imbalance`, `trade_size_p50`, `trade_size_p90`, `trade_size_p99`,
-`trade_size_tail_ratio`, `kyle_lambda_bar`, `large_trade_fraction`
-(+ `amihud_illiquidity`, 1-bar warm-up).
-
-Four of these are new information; `vwap_close_gap` ≡ the already-shipped `vwap_dev`.
-Backfill 30 days in **2–19 minutes per pair** depending on volume. No timer, no key, no
-credential, no new dependency. It works today against `HEAD`.
-
-**Phase 2 — forward-only, only if a spread/depth column is wanted.** A recorder + timer
-writing `spread` (from `/public/Spread`, quoted and directly measured) and `bid_vol`/`ask_vol`
-(from `/public/Depth`, summing N levels) so the **existing dormant consumer at
-`features.py:586-590` lights up with zero consumer-code change** — which is CAND-1's actual
-headline claim. Cost: a timer the repo has not yet proven it can install, plus a real staleness
-discipline (10-level snapshots ffilled up to 12 h will look stale; sample frequently or set a
-tighter `signal_max_age_hours` for that channel).
-
-**Do not build:** realized spread (fails, §2.3), and any of the paid/gated L3 routes (§4).
-
-**The strongest single argument, if only one line survives this document:** the trade tape
-reconstructs the OHLCV candle's `volume`, `count` and `vwap` to **zero** error, so
-microstructure features derived from it are consistent with the training frame by
-construction — and the consumer for them is already written, already gated on column names,
-and currently fed nothing.
-
----
-
-## 8. Live checks I could not complete
-
-| Check | Status |
-|---|---|
-| Behaviour of `/public/Trades` under a *very* old `since` > 15 y, e.g. 2013-09 for a pair listed 2013-10 | clamped to listing date; consistent, not separately re-confirmed per-pair beyond the 7 pairs in §1.3 |
-| Per-pair listing floors for pairs outside the 7 probed | inferred from the clamp being per-pair; not exhaustively swept |
-| Whether the Starter counter differs when an `API-Key` header *is* present | not tested (no key available); keyless path is what the recommendation uses |
-| Kraken L3 exact pricing / eligibility | not obtainable without an account; concluded "institutional-gated, no self-serve price" from the docs index and rejected on §4 reasoning |
-| OHLCVT CSV archive URL, coverage and format | article text confirmed; **URL and contents unverified** — flagged to researcher 3 / architect |
-| Whether `EGeneral:Too many requests` counter state persists across IPs/processes | single-process single-IP only |
-| Multi-resolution feature behaviour across all 8 feature_windows | not swept; §2.3 establishes the direction for the spread family only |
-
----
-
-*Research only. No source, config, or test file was modified; nothing was committed or
-deleted. This file is the only write.*
+**RESEARCH COMPLETE**
