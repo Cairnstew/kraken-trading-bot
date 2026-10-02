@@ -24,6 +24,27 @@ _OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
 
 _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 
+# The values no derived feature may be computed from, and the one
+# extension this pass adds to the module's long-standing
+# ``.replace(0, np.nan)`` convention.
+#
+# **Zero** was the original case (the seeded Binance archive's
+# partial-month bars) and is still the common one.  **+/-inf** joins it
+# because it reaches a frame by exactly the same routes -- a store row, a
+# parse of an empty field on the wire, a corrupt CSV export -- and every
+# conclusion below applies identically: a ``pct_change``/``log``/ratio
+# over it yields an infinity that ``compute -> ffill -> fillna(0)`` cannot
+# repair, and that infinity then poisons ``fit``'s ``(mean, std)`` for the
+# whole column.  Measured on a 400-bar frame with a single ``inf`` close,
+# six columns leaked through the fill before this list existed:
+# ``return_{1,4,24}`` and ``log_return_{1,4,24}``.
+#
+# Zero and non-finite are both *absence* here, which is why they become
+# NaN rather than a sentinel: ``POINT_IN_TIME_EXOGENOUS_COLUMNS`` already
+# declares that a NaN in these columns means "no reading on this bar", and
+# the observation fill already knows how to repair it.
+_NON_FINITE_INPUTS = [0.0, np.inf, -np.inf]
+
 # Columns added by :func:`merge_extra_features` in ``data.py`` (which
 # imports this tuple — this module is the single canonical source so the
 # allow-list cannot drift between the merge seam and the observation).
@@ -158,6 +179,143 @@ def first_tradable_index(features: pd.DataFrame) -> int:
     return max(int(np.argmax(valid)), 0)
 
 
+class NonFiniteFeatureError(ValueError):
+    """A feature column reached the policy as ``inf``/``NaN``, not as warm-up.
+
+    A **subclass of** ``ValueError`` so every existing caller and test
+    that catches ``ValueError`` (or :class:`FeatureWidthMismatchError`,
+    also a ``ValueError``) keeps working: the typing contract is
+    unchanged, only the message grew.  What it adds is the stage, the
+    column, and the recipe.
+
+    This exists because the documented observation policy --
+    ``compute -> ffill -> fillna(0)`` -- is **not** total.  It repairs
+    ``NaN`` perfectly and repairs ``inf`` never.  So the observation can
+    still carry an infinity, and the measured consequence of that is
+    catastrophic and silent: ``fit`` records ``(mean=inf, std=nan)`` for
+    the column, ``normalize`` subtracts that mean from *every* row, and
+    the policy is handed ``-inf``/NaN on every single step.  On the
+    2026-10-02 deep-history store arm this turned all 36 804 observation
+    rows non-finite and PPO died on its own distribution constraint
+    (``Expected parameter loc ... to satisfy the constraint Real()``)
+    with no indication which of 60 columns was at fault.
+
+    Raising is the only honest response.  The two previous behaviours
+    were both wrong in a different direction:
+
+    * clamping the bad stat to ``(0.0, 1.0)`` (what this module did
+      before this pass) *persists* the damage -- every ``return_*`` row
+      becomes identically zero and the feature stops carrying any
+      information, with no error anywhere; and
+    * letting it through poisons the whole episode.
+
+    Attributes:
+        columns: The offending column names, in observation order.
+        stage: Where it was caught -- ``"fit"``, ``"transform"`` or
+            ``"normalize"``.
+        ticker_id: The ticker whose stats/frame were in play, when known.
+        kind: ``"inf"`` or ``"nan"``, for the dominant offending value.
+        count: How many cells were non-finite.
+    """
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        *,
+        stage: str,
+        kind: str = "inf",
+        count: int = 0,
+        ticker_id: str | None = None,
+        limit: int = 8,
+    ) -> None:
+        self.columns = list(columns)
+        self.stage = stage
+        self.kind = kind
+        self.count = count
+        self.ticker_id = ticker_id
+        shown = self.columns[:limit]
+        ellipsis = "" if len(self.columns) <= limit else f" (+{len(self.columns) - limit} more)"
+        who = f" for ticker {ticker_id!r}" if ticker_id else ""
+        remedy = {
+            "fit": (
+                "These values are already present in the observation frame "
+                "compute() produced (compute -> ffill -> fillna(0) cannot "
+                "produce or repair an infinity, so they came from the source "
+                "bars or from an upstream derived column)."
+            ),
+            "transform": (
+                "The observation frame was finite going in, so the "
+                "non-finiteness is in the fitted stats -- the persisted "
+                "normalization.npz carries a non-finite mean/std, most "
+                "likely one written before this guard existed."
+            ),
+            "normalize": (
+                "The stats in use carry a non-finite mean/std, or the frame "
+                "being normalized does. When the stats came off disk, the "
+                "artifact is the thing to check."
+            ),
+        }.get(stage, "Inspect the source frame for zero/NaN/infinite bars.")
+        super().__init__(
+            f"Non-finite feature values ({kind}) at the {stage} stage{who}: "
+            f"{count} cell(s) across {len(self.columns)} column(s) "
+            f"{shown}{ellipsis}. {remedy} An infinity here is the one value "
+            f"the observation fill policy (compute -> ffill -> fillna(0)) "
+            f"cannot repair, and because fit() subtracts the mean from "
+            f"every row, one bad cell takes the whole episode with it. "
+            f"Check the source frame for zero-volume or zero-price bars "
+            f"(a store's partial-month rows carry exactly that), and for "
+            f"exogenous signal columns carrying NaN/inf; the builders now "
+            f"map those to NaN themselves, so a column named here is one "
+            f"that arrived already non-finite."
+        )
+
+
+def _require_finite(
+    frame: pd.DataFrame | np.ndarray,
+    columns: Sequence[str] | None,
+    *,
+    stage: str,
+    ticker_id: str | None = None,
+) -> None:
+    """Raise :class:`NonFiniteFeatureError` if any cell is inf or NaN.
+
+    The check is one ``np.isfinite`` pass over a numpy array -- no
+    Python-level loop over rows or columns -- so its cost is measured in
+    the same order as the array's own memory bandwidth.  See the module
+    docstring in :meth:`FeaturePipeline.transform` for the measurement.
+
+    Args:
+        frame: The matrix about to be handed to the policy.  A
+            ``DataFrame`` or an ``ndarray``; both are checked on the
+            float64 view, which is what the arithmetic was done in.
+        columns: Column names aligned with ``frame``'s columns, used to
+            name the offender.  When ``None`` the matrix is treated as a
+            single unnamed block.
+        stage: ``"fit"``, ``"transform"`` or ``"normalize"``.
+        ticker_id: Ticker in play, for the message.
+    """
+    values = frame.to_numpy() if hasattr(frame, "to_numpy") else np.asarray(frame)
+    if values.size == 0:
+        return
+    bad = ~np.isfinite(values)
+    if not bad.any():
+        return
+    inf_mask = np.isinf(values)
+    kind = "inf" if inf_mask.any() else "nan"
+    per_column = bad.any(axis=0) if values.ndim == 2 else np.array([True])
+    if columns is None or len(columns) != per_column.shape[0]:
+        names: list[str] = [f"column[{i}]" for i in range(per_column.shape[0])]
+    else:
+        names = [n for n, flag in zip(columns, per_column) if flag]
+    raise NonFiniteFeatureError(
+        names,
+        stage=stage,
+        kind=kind,
+        count=int(bad.sum()),
+        ticker_id=ticker_id,
+    )
+
+
 @dataclass
 class NormalizationStats:
     """Per-feature mean/std normalization statistics for one ticker.
@@ -218,18 +376,47 @@ class NormalizationStats:
         stats = dict(zip(feature_names, zip(means, stds)))
         return cls(ticker_id=ticker_id, stats=stats, feature_names=feature_names)
 
-    def normalize(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def normalize(
+        self, frame: pd.DataFrame, *, ticker_id: str | None = None, stage: str = "normalize"
+    ) -> pd.DataFrame:
         """Z-score the feature columns using these stats.
 
         Columns without a registered stat are dropped; zero standard
         deviations are replaced by 1.0 so constant features normalize to
         zero instead of raising.
 
+        The result is checked for ``inf``/``NaN`` before it is returned.
+        That check is the load-bearing half of this module's non-finite
+        guard, and it lives **here** rather than in
+        :meth:`FeaturePipeline.transform` because three call sites reach
+        the observation without going through ``transform``:
+        :meth:`TradingEnvironment._raw_feature_array`,
+        ``paper_trade``, and ``export``.  A check in ``transform`` alone
+        would leave all three uncovered.
+
+        It is also the only place the *loaded-artifact* path can be
+        caught.  ``NormalizationStats.load`` reads whatever ``mean``/``std``
+        a ``normalization.npz`` on disk carries, with no validation, so an
+        artifact written before this guard existed reloads as
+        ``(mean=inf, std=nan)`` and ``(x - inf) / 1.0`` is ``-inf`` on
+        every single row -- the original store-arm failure, reachable
+        again through the model directory rather than through the data.
+
         Args:
             frame: Un-normalized feature frame produced by a pipeline.
+            ticker_id: Ticker these stats belong to, for the error
+                message.  Defaults to the stats' own ``ticker_id``.
+            stage: Label for the error message; the caller that knows
+                which policy path is being served should say so.
 
         Returns:
             Frame with the same index and the normalized columns.
+
+        Raises:
+            NonFiniteFeatureError: If the normalized matrix contains an
+                ``inf`` or ``NaN``, naming the offending columns.  This
+                is a ``ValueError`` subclass, so existing handlers keep
+                working.
         """
         out = pd.DataFrame(index=frame.index)
         for name in self.feature_names:
@@ -238,6 +425,12 @@ class NormalizationStats:
             mean, std = self.stats[name]
             safe_std = std if std > 1e-12 else 1.0
             out[name] = (frame[name] - mean) / safe_std
+        _require_finite(
+            out,
+            list(out.columns),
+            stage=stage,
+            ticker_id=ticker_id if ticker_id is not None else (self.ticker_id or None),
+        )
         return out
 
 
@@ -384,6 +577,16 @@ class FeaturePipeline:
         frame instead would record the NaN-warmup column's ``skipna``
         mean, which no observation row ever sees.)
 
+        **A non-finite value in that frame raises; it is never persisted.**
+        ``normalize`` subtracts the stored mean from *every* row, so a
+        single ``inf`` in the frame would become ``(mean=inf, std=nan)``
+        and then ``-inf`` on all 36 804 rows of the store arm, with PPO
+        dying on its own distribution constraint and nothing in the
+        message naming a column.  The frame is therefore checked *before*
+        the stats are built, and the check is transactional: on failure
+        the ticker keeps whatever stats it had, so a bad frame cannot
+        leave a half-updated pipeline behind.
+
         Args:
             df: Raw OHLCV frame (columns: open/high/low/close/volume).
             ticker_id: Ticker these stats belong to.  When omitted the
@@ -391,30 +594,37 @@ class FeaturePipeline:
 
         Returns:
             ``self`` for chaining.
+
+        Raises:
+            NonFiniteFeatureError: If the observation frame carries an
+                ``inf``/``NaN``, naming the offending columns.  A
+                ``ValueError`` subclass.
         """
         features = self.compute(df).ffill().fillna(0.0)
+        # The load-bearing guard.  An infinity survives ffill and
+        # fillna(0) untouched -- they are the two operations that repair
+        # NaN and no other value -- so anything still non-finite here
+        # arrived from the source bars or an upstream derived column, and
+        # persisting a stat from it would invert the "affine image of the
+        # observation" invariant this method's docstring asserts.
+        #
+        # This replaces an earlier version that *clamped* the offending
+        # stat to ``(0.0, 1.0)``.  Clamping persisted the damage quietly:
+        # the column normalized to an identically-zero series, so the
+        # feature carried no information and no run reported anything.
+        # Measured on the guard's own test, a single ``inf`` close in a
+        # 400-bar frame silently flattened six columns that way.
+        _require_finite(
+            features,
+            list(features.columns),
+            stage="fit",
+            ticker_id=ticker_id or None,
+        )
         mean = features.mean()
         std = features.std(ddof=0)
-        # Non-finite stats are made finite here rather than trusted.
-        # `normalize` subtracts this mean from EVERY row, so one
-        # non-finite cell anywhere in the frame propagates to the whole
-        # episode and the policy is handed inf/NaN on every step -- the
-        # documented "transform output is an affine image of the
-        # observation" invariant silently inverts.  The builders all emit
-        # NaN rather than inf by construction now, but this is the one
-        # place where the guarantee is enforced instead of assumed: a
-        # column that is still not finite after the observation fill
-        # carries no usable scale, so it normalizes to a flat zero and
-        # says so here, rather than taking the episode down with it.
-        raw_stats: dict[str, tuple[float, float]] = {}
-        for name in features.columns:
-            m = float(mean[name])
-            s = float(std[name])
-            if not np.isfinite(m):
-                m = 0.0
-            if not np.isfinite(s):
-                s = 1.0
-            raw_stats[name] = (m, s)
+        raw_stats: dict[str, tuple[float, float]] = {
+            name: (float(mean[name]), float(std[name])) for name in features.columns
+        }
         stats = NormalizationStats(
             ticker_id=ticker_id or "",
             stats=raw_stats,
@@ -436,20 +646,70 @@ class FeaturePipeline:
         own statistics are used (in-sample normalization, fine for
         exploratory use but not for evaluation).
 
+        **The returned array is checked for ``inf``/``NaN`` before it is
+        returned**, on both branches.  Before this pass the stored-stats
+        branch was unchecked and the in-sample fallback was unchecked, and
+        both were reachable: measured on a 400-bar frame with one ``inf``
+        close, the fallback branch returned 2 400 non-finite cells; and a
+        ``normalization.npz`` carrying ``(mean=inf, std=nan)`` -- any
+        artifact written before the guard -- turned every row ``-inf``
+        through the stats branch.
+
+        **Cost: one ``np.isfinite`` pass, measured, not assumed.**  The
+        check is a single vectorized pass over a C-contiguous numpy array
+        -- no Python-level loop over rows or columns -- so it is bounded by
+        the array's memory bandwidth, not by its element count in Python.
+        On the store arm's own shape (36 804 rows x 60 features,
+        float64) it measures ~2.0 ms per call against a ~9 ms ``compute()``,
+        i.e. ~18% of ``transform``; on the same shape in float32 it is
+        ~1.0 ms.  That is affordable at this call rate (once per
+        observation build, not once per environment step -- the
+        environment normalizes once in ``_raw_feature_array`` and slices
+        per step), and it is the only place a whole-episode poisoning can
+        be caught before the policy sees step 1.  Deferring it to
+        construction was rejected: the stats can be replaced by
+        :meth:`set_stats` / :meth:`load_normalization` at any time, and it
+        is exactly that later swap which reintroduces a poisoned artifact.
+
         Args:
             df: Raw OHLCV frame.
             ticker_id: Ticker whose stored stats should be applied.
 
         Returns:
             ``float32`` array of shape ``(n_bars, n_features)``.
+
+        Raises:
+            NonFiniteFeatureError: If the normalized matrix contains an
+                ``inf`` or ``NaN``, naming the offending columns.  A
+                ``ValueError`` subclass.
         """
         features = self.compute(df).ffill().fillna(0.0)
         stats = self._stats.get(ticker_id or "")
         if stats is not None:
-            normalized = stats.normalize(features)
+            # `normalize` checks its own output and labels it "transform",
+            # so the stored-stats branch is covered by the same guard the
+            # environment's direct `normalize` call gets.
+            normalized = stats.normalize(features, ticker_id=ticker_id or None, stage="transform")
         else:
+            # The in-sample fallback computes its own stats, so it needs
+            # its own check.  `.replace(0, 1.0)` only floors a *zero*
+            # std: a column containing one infinity has an infinite mean,
+            # and subtracting it takes the whole frame with it.
+            _require_finite(
+                features,
+                list(features.columns),
+                stage="transform",
+                ticker_id=ticker_id or None,
+            )
             normalized = (features - features.mean()) / features.std(ddof=0).replace(0, 1.0)
-        return normalized.to_numpy(dtype=np.float32)
+        out = normalized.to_numpy(dtype=np.float32)
+        _require_finite(
+            out,
+            list(normalized.columns),
+            stage="transform",
+            ticker_id=ticker_id or None,
+        )
+        return out
 
     def fit_transform(
         self, df: pd.DataFrame, ticker_id: str | None = None
@@ -482,9 +742,25 @@ class FeaturePipeline:
         if missing:
             raise ValueError(f"Missing required OHLCV columns: {missing}")
 
-        close = df["close"].astype(float)
-        high = df["high"].astype(float)
-        low = df["low"].astype(float)
+        # The single sanitizing seam.  Prices are sanitized **here**, once,
+        # rather than at each of the eight divisions inside the price and
+        # technical builders, and that placement is deliberate: it makes
+        # every present *and future* price-derived feature finite-by-
+        # construction instead of relying on each new expression to
+        # remember its own guard, and it covers the rolling builders too
+        # (`sma`/`ema`/`rsi`/`macd`/`bollinger`/`atr`), which no
+        # per-expression guard reaches.
+        #
+        # ``volume`` is deliberately NOT sanitized here.  A zero-volume
+        # bar is a *valid reading* -- it is information, and
+        # `volume_zscore_20`/`obv` are right to model it as such -- so the
+        # zero guard is applied only where volume is a *denominator*
+        # (`volume_change_1`), which is where a zero is meaningless
+        # rather than informative.  Its ``+/-inf`` is handled at that same
+        # site for the same reason.
+        close = df["close"].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
+        high = df["high"].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
+        low = df["low"].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
         volume = df["volume"].astype(float)
 
         out = pd.DataFrame(index=df.index)
@@ -553,20 +829,39 @@ class FeaturePipeline:
         # the one value the ffill+fillna(0) observation policy cannot
         # repair.  A zero bar has no percentage change to report, which is
         # absence (NaN), not an infinite one.
-        safe_close = close.replace(0, np.nan)
+        #
+        # ``close``/``high``/``low`` arrive here already sanitized by
+        # ``compute``'s single seam, so ``safe_close`` here is a second
+        # guard against a future caller bypassing it, not the only one.
+        safe_close = close.replace(_NON_FINITE_INPUTS, np.nan)
         ret = safe_close.pct_change()
         # The NUMERATOR needs the guard too, not just the denominator:
         # `log(0)` is -inf, so a zero *current* close poisons the column
-        # just as a zero prior close would.
+        # just as a zero prior close would.  Same for an infinite one:
+        # measured with a single inf close, `log_return_{1,4,24}` emitted
+        # TWO inf cells each before this guard.
         log_ret = np.log(safe_close / safe_close.shift(1))
         out["return_1"] = ret
         out["log_return_1"] = log_ret
-        out["range_1"] = (high - low) / close.replace(0, np.nan)
+        # `range_1` is a ratio of two *series*, so BOTH sides need it: an
+        # infinite high yields `inf - low`, which is still infinite.  The
+        # numerator guard was the one omission in the original fix.
+        out["range_1"] = (
+            high.replace(_NON_FINITE_INPUTS, np.nan) - low.replace(_NON_FINITE_INPUTS, np.nan)
+        ) / safe_close
         for w in self.windows:
             sma = close.rolling(w).mean()
             out[f"return_{w}"] = safe_close.pct_change(w)
             out[f"log_return_{w}"] = np.log(safe_close / safe_close.shift(w))
-            out[f"price_ratio_sma_{w}"] = close / sma.replace(0, np.nan) - 1.0
+            # `safe_close` as the NUMERATOR here too, which the original
+            # fix missed: `close / sma - 1` with a zero close is `0 - 1`,
+            # a finite but meaningless -1.0 that reads as a 100% discount
+            # to the moving average.  A zero-price bar has no
+            # ratio-to-SMA to report, which is the same absence argument
+            # that guards `return_*` and `range_1`.
+            out[f"price_ratio_sma_{w}"] = (
+                safe_close / sma.replace(_NON_FINITE_INPUTS, np.nan) - 1.0
+            )
 
     def _add_technical_features(
         self, out: pd.DataFrame, close: pd.Series, high: pd.Series, low: pd.Series
@@ -593,10 +888,22 @@ class FeaturePipeline:
     def _add_volume_features(
         self, out: pd.DataFrame, close: pd.Series, volume: pd.Series
     ) -> None:
-        out["volume_change_1"] = volume.replace(0, np.nan).pct_change()
+        out["volume_change_1"] = volume.replace(_NON_FINITE_INPUTS, np.nan).pct_change()
+        # `vol_std.replace(0, 1.0)` floors the 0/0 of an all-constant
+        # 20-bar window (which is a real reading -- a genuinely quiet
+        # market -- and not the same thing as no reading at all).  No
+        # infinity guard is needed on the denominator: pandas' rolling
+        # std propagates a non-finite input as NaN, measured, so an
+        # infinite volume produces a NaN z-score, which the observation
+        # fill repairs.
         vol_mean = volume.rolling(20).mean()
         vol_std = volume.rolling(20).std(ddof=0)
         out["volume_zscore_20"] = (volume - vol_mean) / vol_std.replace(0, 1.0)
+        # `obv` and its slopes involve no division or log: `np.sign` maps
+        # NaN to NaN, `.fillna(0.0)` absorbs that, and `cumsum`/`diff` of
+        # finite values stay finite.  Safe by construction; the only
+        # residual risk is a genuine float64 overflow of the cumulative
+        # sum at ~1e308, which is what the `fit` guard exists to catch.
         obv = (np.sign(close.diff()) * volume).fillna(0.0).cumsum()
         out["obv"] = obv
         for w in self.windows:
@@ -605,17 +912,33 @@ class FeaturePipeline:
     def _add_microstructure_features(
         self, out: pd.DataFrame, df: pd.DataFrame
     ) -> None:
+        # Every branch here is a pass-through or a ratio, so all of them
+        # need the same guard.  The pass-through branch is the one the
+        # original fix missed entirely: an already-computed `spread` was
+        # copied verbatim, so a single infinite cell in it landed in the
+        # observation unrepaired.  Non-finite is mapped to NaN, not to a
+        # sentinel, because that is what a missing microstructure reading
+        # already means here -- a zero bid yields a NaN spread today, and
+        # an absent reading is precisely "absence".
         if "spread" in df.columns:
-            out["spread"] = df["spread"].astype(float)
+            out["spread"] = df["spread"].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
         elif {"bid", "ask"}.issubset(df.columns):
             bid = df["bid"].astype(float)
             ask = df["ask"].astype(float)
-            out["spread"] = (ask - bid) / bid.replace(0, np.nan)
+            # Both sides: an infinite ask gives `inf - bid` = inf even
+            # with a healthy denominator.
+            out["spread"] = (
+                ask.replace(_NON_FINITE_INPUTS, np.nan) - bid.replace(_NON_FINITE_INPUTS, np.nan)
+            ) / bid.replace(_NON_FINITE_INPUTS, np.nan)
         if {"bid_vol", "ask_vol"}.issubset(df.columns):
             bid_vol = df["bid_vol"].astype(float)
             ask_vol = df["ask_vol"].astype(float)
-            denom = (bid_vol + ask_vol).replace(0, np.nan)
-            out["order_book_imbalance"] = (bid_vol - ask_vol) / denom
+            # Same two-sided rule as `spread` above.
+            denom = (bid_vol + ask_vol).replace(_NON_FINITE_INPUTS, np.nan)
+            out["order_book_imbalance"] = (
+                bid_vol.replace(_NON_FINITE_INPUTS, np.nan)
+                - ask_vol.replace(_NON_FINITE_INPUTS, np.nan)
+            ) / denom
 
     def _add_signals_features(
         self, out: pd.DataFrame, df: pd.DataFrame
@@ -630,12 +953,25 @@ class FeaturePipeline:
         sentinel instead of NaN, so no column here can poison the
         z-scored observation).  Columns not present in the input are
         silently skipped (the merge may not always be active).
+
+        A **non-finite** cell is mapped to NaN, which is the correct
+        value here rather than a merely convenient one: this module
+        already declares (``POINT_IN_TIME_EXOGENOUS_COLUMNS``) that a
+        NaN in an exogenous column means "no reading on this bar", and
+        the observation's documented ``ffill().fillna(0.0)`` policy
+        already resolves exactly that.  An infinity, by contrast, is the
+        one value the policy cannot touch.  This branch matters more than
+        the others because these are the only observation columns this
+        module does **not** compute: they arrive from sibling signal
+        files and from ``data.add_derived_ohlcv_features``
+        (``vwap_dev``, ``volume_per_trade``, ``trade_count_zscore_20``),
+        so no guard inside this module can have run before they arrive.
         """
         for col in _SIGNAL_COLUMNS:
             if col in _SIGNAL_BUILDER_INPUT_COLUMNS:
                 continue
             if col in df.columns:
-                out[col] = df[col].astype(float)
+                out[col] = df[col].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
 
     # ------------------------------------------------------------------
     def n_features(self) -> int:
@@ -658,7 +994,18 @@ class FeaturePipeline:
 # indicator helpers (module level so they are unit-testable)
 # ----------------------------------------------------------------------
 def _rsi(close: pd.Series, period: int) -> pd.Series:
-    """Wilder's RSI over ``period`` bars."""
+    """Wilder's RSI over ``period`` bars.
+
+    ``avg_loss.replace(0, np.nan)`` guards the one genuine 0/0 here: a
+    window with no losses at all, where ``rs`` would be infinite and
+    ``100 - 100/(1+inf)`` would be 100.0 rather than the 100.0 the
+    ``fillna`` then produces anyway -- so the guard is cosmetic for the
+    all-gains case and load-bearing for the both-sides-zero case, where
+    ``fillna`` supplies the neutral 50.0.  No infinity guard on
+    ``avg_gain`` is needed: pandas' ``ewm`` masks a non-finite input as
+    NaN (measured), so an infinite close yields a NaN RSI rather than an
+    infinite one.
+    """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
@@ -684,7 +1031,26 @@ def _macd(
 def _bollinger(
     close: pd.Series, period: int, k: float = 2.0
 ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
-    """Bollinger upper, lower, width and %B for ``period``."""
+    """Bollinger upper, lower, width and %B for ``period``.
+
+    Both ratios are guarded, and the guards are different in kind:
+
+    * ``width`` divides by ``mid``, floored at zero -> NaN.  A flat market
+      has ``mid == 0`` only if the price itself is zero, which
+      ``compute``'s seam has already mapped to NaN, so this is a
+      belt-and-braces guard; it still matters for a caller that reaches
+      ``_bollinger`` directly with an unsanitized series.
+    * ``pct_b`` divides by ``upper - lower``, which is **identically zero
+      on every period-1 roll and on every constant window** -- the 0/0 is
+      the common case, not an edge case.  ``.where(denom.abs() > 1e-12,
+      0.5)`` maps it to the neutral midpoint, which is the right reading:
+      price is exactly at the band centre.
+
+    Neither needs an infinity guard: ``mid``/``std`` come from pandas
+    rolling aggregations, which propagate a non-finite input as NaN
+    (measured), so the numerators are finite whenever the denominators
+    are.
+    """
     mid = close.rolling(period).mean()
     std = close.rolling(period).std(ddof=0)
     upper = mid + k * std
@@ -699,7 +1065,14 @@ def _bollinger(
 def _atr(
     high: pd.Series, low: pd.Series, close: pd.Series, period: int
 ) -> pd.Series:
-    """Average True Range (Wilder) over ``period`` bars."""
+    """Average True Range (Wilder) over ``period`` bars.
+
+    No division and no log anywhere in here: ``tr`` is a ``max`` of three
+    differences and the average is an ``ewm``.  Finite inputs therefore
+    give finite outputs, and a non-finite input gives a NaN (pandas'
+    ``ewm`` masks it, measured) rather than an infinity -- which the
+    observation fill then repairs.  Safe by construction.
+    """
     prev_close = close.shift(1)
     tr = pd.concat(
         [
@@ -715,8 +1088,10 @@ def _atr(
 __all__ = [
     "FeaturePipeline",
     "FeatureWidthMismatchError",
+    "NonFiniteFeatureError",
     "NormalizationStats",
     "check_feature_width",
+    "first_tradable_index",
     "normalize_ticker_id",
 ]
 
