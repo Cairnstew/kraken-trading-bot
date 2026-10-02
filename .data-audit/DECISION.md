@@ -453,6 +453,104 @@ Kraken's counter limits did not reproduce on the keyless path (16 rapid + 8 at 2
 
 ---
 
+## 9A. POST-DECISION AMENDMENTS — recorded after the Phase 4B measurement
+
+The builder's measurement (commit `bfe32aa`, real keyless data, store seeded 2018-01→2026-10)
+confirmed the gate assertions and surfaced three things §8 did not anticipate. They are recorded
+here so the reviewer reads them as **known limitations of the harness**, not as new findings.
+
+### 9A.1 A live-vs-store pair inside ONE matrix is structurally uncomparable (DEFECT — Phase 7)
+
+`tools/model_matrix.py report` emits **no dispersion section at all** for a matrix mixing both
+arms. With `min_bar_ratio: 0.5` the degenerate-cell guard scores each cell against the ticker's
+**largest observed `n_bars`**:
+
+| | live arm | store arm |
+|---|---|---|
+| `n_bars` | 697 (721 − 24 warm-up) | 76,538 |
+| guard `0.50 × 76,538` | **31,269** — 697 fails by 45× | passes |
+| outcome | **all 3 cells marked INVALID** | valid cells flagged IN-SAMPLE and excluded |
+
+Net effect: **6 recorded cells → 0 usable out-of-sample measurements, no arm-pair, gate never
+fires.** The guard is doing exactly what it was written to do — a cell replaying 0.9% of its
+peers' bars is degenerate *within a comparable cohort* — but a live-vs-store pair is not such a
+cohort: the two arms differ **by construction** in bar count, so the guard measures the treatment
+and discards the arm it is comparing.
+
+**This is a defect in the harness, not in the store or the gate.** The CAND-5 estimator is sound;
+it is being invoked through a report path that cannot reach it.
+
+- **Deferred to Phase 7** by user decision (2026-10-02), NOT fixed in this pass.
+- **Interim method the reviewer MUST use:** score the two arms as **two separate matrices**, each
+  with its own `min_bar_ratio` reference, then apply `pooled_within_spread` /
+  `dispersion_verdict` across the two sets of replicates. The builder did exactly this and got the
+  numbers in §9A.2.
+- Any future report comparing arms of deliberately different depth **must** state this limitation
+  rather than quoting a `report` run that silently produced no verdict.
+
+### 9A.2 The gate verdict is `NOT SEPARATED`, and that is a finding
+
+Six cells (2 arms × 3 seeds), 0 invalid at run time, 0 errored. Measured with the shipped
+`pooled_within_spread` + `dispersion_verdict` (threshold 1.0, `MIN_REPLICATES_FOR_A_CLAIM` 3):
+
+| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
+|---|---|---|---|---|---|---|
+| `excess_return` (headline) | −3.23% | −19.48% | 439.01% | 16.24% | **0.037** | **NOT SEPARATED** |
+| `total_return` | +4.07% | +225.13% | 439.06% | 221.06% | **0.503** | **NOT SEPARATED** |
+| `sharpe` | +0.574 | +1.626 | 0.751 | 1.052 | 1.400 | RESOLVED |
+| `max_drawdown` | +4.79% | +66.97% | 0.058 | 0.622 | 10.74 | RESOLVED |
+
+**Why the headline is `NOT SEPARATED`:** the store arm's own within-group IQR is **8.73** — its three
+seeds returned **+53%, +225%, +1800%**. The apparent between-arm gap sits entirely inside seed
+noise, so those medians are not ordered by the data. This is precisely the presentation CAND-5
+exists to prevent, and it is working.
+
+**The two RESOLVED rows are NOT evidence of a better model** and must never be reported as such.
+They are **confounded by horizon**: the store arm replays 76,538 bars against the live arm's 697,
+and *both* replay bars they were fitted on (neither arm is pinned here), so a longer in-sample fit
+mechanically produces both a higher Sharpe and a deeper drawdown. `timesteps` was 10,000 on both
+arms — **depth buys normalization-sample size and regime diversity, not gradient steps.**
+
+### 9A.3 Honest out-of-sample result is NEGATIVE
+
+The +225% figure is **in-sample and is not a result**. Both arms above are unpinned, so backtest
+replays the bars the model was fitted on. The pinned store model (`storeP1`) backtested on the
+**disjoint** eval tail:
+
+| | value |
+|---|---|
+| `total_return` | **−34.30%** |
+| `sharpe` | **−0.568** |
+| `max_drawdown` | 54.22% |
+| `num_trades` | 11,866 |
+| bars replayed | 15,749 / 15,773 |
+| buy-and-hold | −19.46% |
+| **excess** | **−14.84%** |
+
+**What CAND-3a actually delivered, stated without inflation:** a store makes an
+**out-of-sample measurement possible at all**. On the shipped default, `since`/`until: null` means
+`training_frame` and `evaluation_frame` return the **same object**, so no OOS number existed to be
+good or bad. It did **not** deliver better returns, and it did not deliver a claim that could be
+adjudicated without the two-matrix method in §9A.1.
+
+**Wording to use in all downstream reports** (user-specified, binding):
+> The store arm reached **76,562 bars** with **disjoint** train/eval splits over a pinned
+> 2020→2026 window. Honest out-of-sample result: **−34.3% return, Sharpe −0.568**. The CAND-5 gate
+> reports **NOT SEPARATED** on both return metrics. **No claim of improvement.**
+
+Two further facts that fall out of the measurement:
+- **Pinning alone is not enough and, without a store, is actively destructive** — pinned on the
+  live arm it yields **0 train / 0 eval**. The store is a *precondition* for pinning, not an
+  optional extra.
+- **The store flip is not deliverable without the non-finite guard** (`bfe32aa`). The seeded
+  archive carries a zero-volume bar at each partial-month boundary (4 across the store); `pct_change`
+  turns it into `inf`, which the documented `compute → ffill → fillna(0)` policy cannot repair, and
+  one such bar inside the training slice poisoned all 36,804 rows and killed PPO. **The live arm was
+  unaffected** (721 Kraken bars contain no zero-volume bar), so this was invisible until the store
+  was switched on.
+
+---
+
 ## 10. DEVIATIONS — labelled
 
 1. **DEVIATION — CAND-5 is inside the outcome, not a separate one.** RESEARCH-3 §6.3 recommends
@@ -511,3 +609,39 @@ silently test a different tree), then `nix flake check --no-build`, then a store
 
 *End of decision. Written by the architect for team `audit-pipeline-1002`; nothing outside this file
 was modified, committed or deleted.*
+
+---
+
+## 12. USER DECISIONS — 2026-10-02, binding on the reviewer
+
+Recorded at the checkpoint between Phase 4B and Phase 5. These are decisions, not proposals.
+
+1. **`configs/default.yaml` stays as-is.** `market_data_store: null` and `since/until: null` are
+   **coupled**: pinning without a store yields 0 train / 0 eval bars, so making out-of-sample the
+   default would break fresh clones. Pinned windows live in `configs/deep-history.example.yaml` and
+   in per-model `models/{TICKER_ID}/{NAME}/config.yaml`.
+2. **When `since`/`until` are null, the output must label the result `IN-SAMPLE`** so it cannot be
+   read as out-of-sample. Implemented by `builder-inlabel`.
+3. **Pinning with no store must fail with a message naming the seed recipe**, not a bare
+   `NotEnoughDataError`. Implemented by `builder-inlabel`.
+4. **The mixed-matrix harness defect (§9A.1) is Phase 7, not this pass.** For this pass's gate the
+   two arms are scored as **two separate matrices**, each with its own `min_bar_ratio` reference.
+   The defect is nevertheless documented in §9A.1 so the limitation is on record before it is fixed.
+5. **Required before the reviewer's gate verdict:**
+   - the non-finite guard swept across every ratio/log/pct_change feature, plus a hard finite-check
+     after normalization on **both** `fit` and `transform`, failing loudly and naming the offending
+     column (`builder-inf`);
+   - **live-arm width-neutrality proven bit-identical** before and after the fix — 60 features,
+     `start_index` 24 — so no `models/` artifact is invalidated;
+   - the **76,562 vs 76,561** bar-count discrepancy resolved and attributed to a specific bar
+     (leading hypothesis: the store arm's live upsert leg contributed one additional bar);
+   - the **+1800% seed** confirmed *not* a degenerate artifact of the zero-volume boundary bars
+     before it is described as seed noise.
+
+### Two-reviewer-group split for this pass (busy-time limit)
+
+Three agents were aborted by the busy-time limit during Phase 4B, all on briefs that bundled
+implementation with verification. This pass therefore separates them: `builder-inf` and
+`builder-inlabel` implement (disjoint file ownership: `features.py` vs
+`data.py`/`backtest.py`/`export.py`), and the reviewer verifies. **No teammate both implements and
+verifies its own claim.**
