@@ -1723,7 +1723,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         record["duration_seconds"] = round(elapsed, 2)
         record["finished_at"] = _utcnow()
 
-        stderr_tail = (err_tr + err_bt).strip().splitlines()[-4:]
+        # Tail is taken PER LEG, not over the concatenation. When train
+        # fails the backtest leg still runs and still fails, and its
+        # output — the downstream "No trained model" consequence — is
+        # last, so a single concatenated slice kept only that and
+        # truncated away the train leg's refusal, the one message that
+        # names the fix. That made classify_process_failure's
+        # `signal_file_not_found` unfireable on the live cell: the
+        # classifier was right, the capture was losing the text. Measured
+        # on the real pair: refusal at line 8 of a 10-line err_tr, 19
+        # concatenated lines, last-4 keeps 4, refusal gone.
+        #
+        # train gets the larger tail because it is the ROOT-CAUSE leg;
+        # backtest only ever echoes the consequence, so two lines is
+        # enough for it and keeps the record small. Taking the legs
+        # separately also stops a leg that ends without a newline from
+        # splicing its last line onto the next leg's first.
+        stderr_tail = (
+            err_tr.strip().splitlines()[-4:] + err_bt.strip().splitlines()[-2:]
+        )
         if stderr_tail:
             record["stderr_tail"] = stderr_tail
 

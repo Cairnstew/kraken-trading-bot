@@ -944,6 +944,222 @@ def test_run_records_a_nonzero_exit_as_an_error(tmp_path):
     assert "returncodes" in record
 
 
+# ── the stderr CAPTURE, driven through cmd_run ──────────────────────────
+#
+# Everything above tests the CLASSIFIER. This section tests the thing the
+# classifier depends on and nobody was testing: `cmd_run`'s build of
+# `record["stderr_tail"]` itself.
+#
+# `3f9708e` pinned `signal_file_not_found` by handing
+# classify_process_failure a stderr_tail built BY HAND, so the tail was
+# correct by construction and the code that produces it was never
+# exercised. It shipped a reason code that could not fire: live, the cell
+# recorded a bare `process_failed`. Same class of error as the one
+# `8569c08` fixed in the source — a test that pins the intended value
+# without exercising the path that produces it. Hence these drive
+# cmd_run with a fake CLI whose two legs fail the way the real ones do.
+
+# The refusal as the real CLI prints it, in BOTH the shapes cli.py emits
+# it: the logging.error line (kraken_trading_bot/cli.py:511) and the
+# `print(f"Error training {t}/{m}: {e}", file=sys.stderr)` echo (:515).
+# Split across two constants so the fixture reads as the capture it is.
+_REAL_REFUSAL_TEXT = (
+    "funding_features_file is set to "
+    "'~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl' but no "
+    "file exists at /home/seanc/Projects/kraken-trading-bot/signals/"
+    "eth_usd_funding.jsonl (expanded from '~/Projects/kraken-trading-bot/"
+    "signals/eth_usd_funding.jsonl'). Produce it with: just funding-pull. "
+    "Or set funding_features_file to null to run without this channel: a "
+    "null key means off and is silent, a set key is a declared intent to "
+    "use it."
+)
+
+# err_tr from the measured 2026-10-02 run: TEN lines, of which only the
+# last two are the refusal, and only those two name the fix. Everything
+# before them is fetch and feature-build noise. The shape matters — the
+# refusal sits at index 8, so a slice that keeps fewer than 2 of the last
+# lines would lose it again, which is exactly what the bug was.
+TRAIN_REFUSED_STDERR = [
+    "2026-10-02 09:13:41 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC?pair=ETH%2FUSD&interval=60",
+    "2026-10-02 09:13:41 [DEBUG] urllib3.connectionpool: Starting new HTTPS "
+    "connection (1): api.kraken.com",
+    "2026-10-02 09:13:42 [DEBUG] urllib3.connectionpool: https://api."
+    "kraken.com:443 \"GET /0/public/OHLC HTTP/1.1\" 200 None",
+    "2026-10-02 09:13:42 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC",
+    "2026-10-02 09:13:43 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC",
+    "2026-10-02 09:13:44 [INFO] kraken_trading_bot.rl.features: Fetched 721 "
+    "bars of ETH/USD at 60m",
+    "2026-10-02 09:13:45 [INFO] kraken_trading_bot.rl.features: Building 52 "
+    "feature columns",
+    "2026-10-02 09:13:46 [INFO] kraken_trading_bot.rl.data: Reading "
+    "funding_features_file",
+    "2026-10-02 09:13:47 [ERROR] kraken_trading_bot.cli: Training "
+    f"ETH_USD/mtx_probe failed: {_REAL_REFUSAL_TEXT}",
+    f"Error training ETH_USD/mtx_probe: {_REAL_REFUSAL_TEXT}",
+]
+
+# err_bt from the same run, NINE lines. Its content is the DOWNSTREAM
+# consequence — train never wrote a model — which is why a
+# concatenate-then-slice kept exactly this and dropped the reason.
+BACKTEST_NO_MODEL_STDERR = [
+    "2026-10-02 09:13:47 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC?pair=ETH%2FUSD&interval=60",
+    "2026-10-02 09:13:48 [DEBUG] urllib3.connectionpool: Starting new HTTPS "
+    "connection (1): api.kraken.com",
+    "2026-10-02 09:13:48 [DEBUG] urllib3.connectionpool: https://api."
+    "kraken.com:443 \"GET /0/public/OHLC HTTP/1.1\" 200 None",
+    "2026-10-02 09:13:49 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC",
+    "2026-10-02 09:13:49 [INFO] kraken_trading_bot.data.kraken: GET "
+    "/0/public/OHLC",
+    "2026-10-02 09:13:49 [INFO] kraken_trading_bot.rl.features: Fetched 697 "
+    "bars of ETH/USD at 60m",
+    "2026-10-02 09:13:50 [ERROR] kraken_trading_bot.cli: Backtesting "
+    "ETH_USD/mtx_probe failed: No trained model at "
+    "/tmp/ktb-test/models/ETH_USD/mtx_probe/model.zip; train it first.",
+    "Error backtesting ETH_USD/mtx_probe: No trained model at "
+    "/tmp/ktb-test/models/ETH_USD/mtx_probe/model.zip; train it first.",
+]
+
+
+def _failing_fake_cli(train_stderr, backtest_stderr, backtest_rc=1):
+    """A fake CLI whose train and backtest legs both fail, verbatim.
+
+    Both legs still run, exactly as they do live: a train failure does not
+    short-circuit the backtest, so the backtest leg's noise lands LAST in
+    the combined capture. That ordering is the bug.
+    """
+    return (
+        "import sys\n"
+        f"train_err = {list(train_stderr)!r}\n"
+        f"bt_err = {list(backtest_stderr)!r}\n"
+        "a = sys.argv[1:]\n"
+        "if a[0] == 'train':\n"
+        "    sys.stderr.write('\\n'.join(train_err) + '\\n')\n"
+        "    sys.exit(1)\n"
+        "sys.stderr.write('\\n'.join(bt_err) + '\\n')\n"
+        f"sys.exit({int(backtest_rc)})\n"
+    )
+
+
+def _one_record(tmp_path, cli):
+    spec_path = _write_spec(tmp_path / "m.yaml")
+    rc = cmd_run(
+        _Args(spec=spec_path, force=False, limit=1, dry_run=False, cli=cli,
+              work_dir=str(tmp_path / "work"))
+    )
+    return rc, load_records(tmp_path / "cells.jsonl")[0]
+
+
+def test_cmd_run_keeps_the_refusing_legs_own_tail_so_the_reason_can_fire(
+    tmp_path,
+):
+    """THE REGRESSION: both legs fail, and the train leg's refusal must
+    reach `stderr_tail` — which is the only way `signal_file_not_found`
+    can exist at all.
+
+    Asserted on the record `cmd_run` WROTE, after driving the real capture
+    path through a fake CLI whose stderr is the measured 10-line train
+    refusal and 9-line backtest consequence. Not a hand-built
+    `stderr_tail`: the hand-built one is correct by construction, which is
+    how a reason code shipped that no live run could ever produce.
+    """
+    cli = _fake_cli(
+        tmp_path,
+        _failing_fake_cli(TRAIN_REFUSED_STDERR, BACKTEST_NO_MODEL_STDERR),
+    )
+    rc, record = _one_record(tmp_path, cli)
+
+    assert rc == 1
+    assert record["status"] == "error"
+    assert record["returncodes"] == {"train": 1, "backtest": 1}
+
+    tail = record["stderr_tail"]
+    joined = " ".join(tail)
+    # 1. The refusal survived the capture.
+    assert "funding_features_file is set to" in joined, tail
+    assert "just funding-pull" in joined, tail
+    # 2. BOTH legs contributed — this is what "per leg" buys, and what a
+    #    concatenate-then-slice cannot do.
+    assert any(line.startswith("Error training ") for line in tail), tail
+    assert any(line.startswith("Error backtesting ") for line in tail), tail
+    # 3. And the reason the whole thing exists now fires.
+    assert "signal_file_not_found" in record["invalid_reasons"]
+
+
+def test_the_capture_fires_the_reason_code_the_real_cell_would_not_have(
+    tmp_path,
+):
+    """The reason code, reached through the capture rather than around it.
+
+    `3f9708e`'s test fed the classifier a synthetic tail and so proved the
+    classifier. This walks the same assertion from the other end: it
+    starts from a record built by `cmd_run` and asks
+    `classify_process_failure` what it makes of the text the harness
+    actually kept — the end-to-end version of the claim, and the one that
+    would have caught the capture defect.
+    """
+    cli = _fake_cli(
+        tmp_path,
+        _failing_fake_cli(TRAIN_REFUSED_STDERR, BACKTEST_NO_MODEL_STDERR),
+    )
+    _rc, record = _one_record(tmp_path, cli)
+
+    reasons = classify_process_failure(record)
+    assert reasons == ["process_failed", "signal_file_not_found"]
+    # The refusal names a config key and a missing path. It must still not
+    # borrow the OTHER "your path is wrong" reason, which sends the reader
+    # to write a YAML file instead of running a producer.
+    assert "config_not_found" not in reasons
+
+
+def test_cmd_run_omits_stderr_tail_when_neither_leg_wrote_to_stderr(tmp_path):
+    """Both legs silent -> no `stderr_tail` key at all.
+
+    The `if stderr_tail:` guard is load-bearing, so the per-leg change must
+    not turn it into an always-true `[""]`-shaped list: an empty success
+    record must stay as small as it was.
+    """
+    cli = _fake_cli(tmp_path, FAKE_OK)
+    _rc, record = _one_record(tmp_path, cli)
+    assert record["status"] in {"ok", "invalid"}
+    assert "stderr_tail" not in record
+
+
+def test_a_single_failing_leg_still_records_its_own_tail(tmp_path):
+    """One leg's noise must not be padded by, or padded into, the other.
+
+    Same fake bot as ``FAKE_OK`` — train refuses with stderr, backtest
+    succeeds and prints its JSON — so the tail is the train leg's alone and
+    the cell is not errored for the backtest's sake.
+    """
+    train_stderr = [
+        "2026-10-02 [INFO] kraken_trading_bot.data.kraken: GET "
+        "/0/public/OHLC?pair=ETH%2FUSD&interval=60",
+        "2026-10-02 [ERROR] kraken_trading_bot.cli: Training "
+        "ETH_USD/mtx_probe failed: refused for a reason of its own",
+    ]
+    script = FAKE_OK.replace(
+        "import json, sys\n",
+        "import json, sys\ntrain_err = " + repr(train_stderr) + "\n",
+        1,
+    ).replace(
+        "    sys.exit(0)\n",
+        "    sys.stderr.write('\\n'.join(train_err) + '\\n')\n"
+        "    sys.exit(1)\n",
+        1,
+    )
+    cli = _fake_cli(tmp_path, script)
+    _rc, record = _one_record(tmp_path, cli)
+
+    assert record["returncodes"] == {"train": 1, "backtest": 0}
+    assert record["status"] == "error"
+    assert record["stderr_tail"] == train_stderr
+
+
 # ── report ──────────────────────────────────────────────────────────────
 
 
