@@ -672,8 +672,27 @@ and `assert`ed `== 1.0` (not passed as a literal), cost basis `fee_rate: 0.0026`
 **Stated plainly, as §13.3 required: the strategy loses money after costs in BOTH arms, in all six
 cells.** Live median −5.26% (equity $9,474 / $9,062 / $9,813). Store median **−99.76%** (equity
 **$23.68 / $12.03 / $818.02**), 99.85% max drawdown — a wipeout, not a drawdown statistic. The
-policy re-enters every ~1.2 bars in **both** arms; the store arm pays ~145× more absolute cost
-while replaying 110× more bars. **No "store arm improved" claim is made in either direction.**
+policy re-enters every **~1.22 bars in the live arm** (1.216 / 1.191 / 1.234, median 1.216) and every
+**~1.43 bars in the store arm** (1.649 / 1.429 / 1.139, median 1.429), while replaying 110× more bars.
+
+**The store arm's cost ratio is NOT directly recomputable, and no single figure is claimed.** The
+backtest records carry `fee_rate`, `slippage`, `n_bars`, `num_trades` and `final_equity` but **no
+notional or position size**, so absolute cost cannot be rebuilt. Two reproducible proxies, and
+**neither is picked as the true ratio**:
+
+| proxy | per-seed | median | what it assumes |
+|---|---|---|---|
+| seed-matched **trades** ratio (`store num_trades / live num_trades`) | 81.0× / 91.6× / 118.9× | **91.6×** | fixed notional — cost scales with trade count |
+| **final-equity drag** ratio (`ctrl_equity − cost_equity`) | 34.1× / 18.6× / 179.7× | **34.1×** | fractional equity on a compounding curve |
+
+They disagree by ~2.7× because the store arm's balance collapses (to $23.68 / $12.03 / $818.02), so
+drag is measured over a shrinking notional. The drag proxy's 179.7× outlier is seed 44, whose
+frictionless `ctrl_equity` is **$190,009** — the +1800% seed — so its drag spans a ~19× notional and
+is not comparable to the others; that is why the median, not the mean, is quoted. **The earlier
+`~145×` figure this line carried is withdrawn: it is not derivable from these records under either
+sizing.** Both proxies feed no verdict — §13.3 forbids directional framing either way.
+
+**No "store arm improved" claim is made in either direction.**
 What CAND-3a delivered is unchanged and orthogonal: *an out-of-sample measurement became possible
 at all.*
 
@@ -803,8 +822,76 @@ The fix is to compute features over a **reindexed, gap-filled bar grid**, so a w
 window spanning a gap means (hold last value, or mask the row).
 
 **It is not called CAND-3b here on purpose.** `CAND-3b` is **already taken** in this document:
-§10.4 defines it as `since`/`until` push-down plus a venue label in `_meta.json` — a ~21-line,
-store-only **efficiency** item, explicitly DEFERRED as not load-bearing (whole-store read 0.142 s
-vs windowed 0.010 s). Reusing that id for a correctness fix would be the same false-claim failure
-this pass exists to remove, so this item needs its own registration before it is referred to by
-id. *Raised with the lead rather than invented here.*
+§10 item 4 defines it as the `since`/`until` push-down — a ~21-line, store-only **efficiency** item,
+explicitly DEFERRED as not load-bearing (whole-store read 0.142 s vs windowed 0.010 s). *(The venue
+label is **not** part of item 4: §10 item 2 moved it **out** of the sibling's `_meta.json` and into
+the model's own `config.yaml`, and treats the `_meta.json` label as a follow-up, not dropped. §10.2
+therefore says the opposite of what attributing it to item 4 would imply.)* Reusing that id for a
+correctness fix would be the same false-claim failure this pass exists to remove, so this item needs
+its own registration before it is referred to by id. *Raised with the lead rather than invented here.*
+
+### 14.5 The §14.4 correction above was itself imprecise in one half — a definitional mix, not only staleness
+
+The CORRECTION block in §14.4 concedes that its pooled-IQR half was "stale". That undersells it, and
+the independent F1/F2 re-review caught the sharper defect. The two figures were not merely drawn at
+different times — **they were not the same statistic**:
+
+- **11.68pp** was the Phase 6 **store-arm-only** IQR, computed on a **76,539-bar** snapshot, before
+  the cost-aware estimator existed.
+- **3.97pp** is the **shipped estimator's** pooled-within-spread, which takes the **median of BOTH
+  arms'** IQRs, on a **76,540-bar** snapshot.
+
+So the 1.4 → 82.91 ratio compares a one-arm spread against a two-arm median. Two independent errors
+were folded into that half: the **snapshot** was one bar short, and — the material one — the
+**definition** changed underneath it. The gap half (16.24pp → 328.79pp) is unaffected; that
+comparison is like-for-like on the same metric.
+
+**This does not move the verdict, and the reason is worth stating precisely.** Both figures sit on
+the same side of a threshold that was committed (`97a2a52`) before the run and never touched since.
+A ratio's *magnitude* was mispredicted; its *sign against a fixed threshold* was not in question.
+The correction is recorded here rather than folded into §14.4's text so the original wording stays
+visible as the reviewer saw it.
+
+### 14.6 Phase 6 findings F2 and F3, at decision level
+
+F4 and F6 got records at the point they arose (§9A.3's CORRECTION block, §14). **F2 and F3 did not** —
+their dispositions lived only in a docstring and an error string, so a reader auditing this gate's
+findings would have had to read diffs to learn them. Recorded here now.
+
+**F2 — the vacuous seam test and five false docstrings.** *Finding:* deleting `compute`'s non-finite
+seam left **all 31** non-finite tests green, because pandas' `rolling` masks an infinity on its own;
+and five docstrings asserted the *opposite* of pandas' behaviour while claiming to have measured it.
+Severity MAJOR — a test that cannot fail, asserting a mechanism that does not exist.
+
+*Option (a) — delete the test and the docstrings.* **Rejected.** The underlying hazard is real; deleting
+the evidence would hide it and re-invite the same discovery as a "bug" later. *Option (b) — replace
+with a test that pins the seam by an effect pandas does **not** have on its own.* **Chosen**, on the
+reason that the seam's only defensible justification is the **zero** price, not the infinity: zero is
+in `_NON_FINITE_INPUTS`, a zero price is reachable in real OHLCV, and without the seam a zero enters
+a rolling window as a real number and yields `sma_4` **91.41** against a ~122 price and `bb_lower_4`
+**−14.14** — finite, plausible, and silent. So the replacement pins that symptom, and the old inf
+assertion was **kept and labelled** rather than deleted (it passes with the seam removed; its label
+now says so). *Option (c) — invert the claim to "the seam prevents infinities".* **Rejected as still
+false**: neither aggregation emits an infinity, so no `isinf` assertion can observe the seam.
+
+*Consequence accepted:* with the seam mapped to NaN, `rolling` reports a poisoned window as NaN
+("unknown") while `ewm` **skips** it and reports a **stale carried value** — finite and wrong, and
+invisible to `_require_finite`. That is **out of scope for this pass** and is pinned by
+`test_rolling_masks_but_ewm_skips_a_non_finite_price_this_guard_cannot_see`, which asserts `ewm`
+still skips a non-finite input so a future pandas change surfaces here. See the `KNOWN GAP` note in
+`compute` and the `_rsi` docstring.
+
+**F3 — `market_data_store: null` does not turn the store off.** *Finding:* `data.py`'s
+`MarketDataStoreUnavailableError` told the reader to "Set `market_data_store: null` in the config",
+but `_resolve_env_setting` treats a YAML `null` as *unset* and **skips** that source, so a run config
+saying `null` falls through to the **model's own** `config.yaml` — where the store path comes from —
+and the store silently stays on. A store-trained model would keep 76k bars while believing it went
+live. *Option (a) — honour an explicit sentinel (`""` / `--no-store`).* **Rejected**: it changes
+resolver semantics, which is outside this pass and would need its own test matrix. *Option (b) —
+correct the message to name the file that actually has to change.* **Chosen**: the advice now names
+**the model's own `config.yaml`**, because that is the file the reader must edit. The deliberate
+`null`-means-unset semantics are **kept** — YAML `key: null` legitimately means *unset*, and
+overriding it would break every other config layer that relies on it.
+
+*Residual, accepted and recorded:* with option (b) the trap is still reachable by editing the wrong
+file, but the message no longer *instructs* it. A working override remains the correct future fix.

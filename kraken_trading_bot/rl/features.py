@@ -1087,20 +1087,35 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     all-gains case and load-bearing for the both-sides-zero case, where
     ``fillna`` supplies the neutral 50.0.
 
-    No infinity guard on ``avg_gain`` is needed, but not for the reason
-    previously documented here.  That comment claimed pandas' ``ewm``
-    "masks a non-finite input as NaN"; measured on pandas 3.0.4 it does
-    not -- ``ewm`` **skips** the bar and returns a finite value.  The
-    conclusion still holds by a different route: ``compute``'s seam maps a
-    non-finite close to NaN *before* ``diff()`` runs, so ``gain``/``loss``
-    never see an infinity, and a NaN input makes ``rs`` NaN, which
-    ``fillna(50.0)`` then maps to the neutral reading.
+    No infinity guard on ``avg_gain`` is needed, and the reason is worth
+    stating exactly, because a previous version of this docstring got it
+    backwards.  It claimed pandas' ``ewm`` "masks a non-finite input as
+    NaN", so that ``compute``'s seam (which maps a non-finite close to
+    NaN *before* ``diff()`` runs) made ``gain``/``loss`` see a NaN, ``rs``
+    came out NaN, and ``fillna(50.0)`` mapped that NaN to the neutral
+    reading.  **None of that happens.**  Measured on pandas 3.0.4, ``ewm``
+    *skips* a non-finite input exactly as it skips an infinity: it carries
+    the previous bar's average forward and returns a **finite** number.
+    With the seam applied and a zero price at one bar, measured on a 400-bar
+    frame that has losses: ``avg_gain`` and ``avg_loss`` both stay finite
+    and non-zero, ``rs`` stays finite, and ``fillna(50.0)`` never fires --
+    ``rsi_4`` reports the *previous* bar's value again (85.5634 carried
+    across the poisoned bar in the recorded probe).  The 50.0 that
+    ``fillna`` does supply in the pinned test comes from the
+    both-sides-zero guard above, not from the seam: that test's frame is a
+    monotonically rising ramp, so it has no down-bars at all.  On a frame
+    with losses the route cannot fire.
 
-    The residual hazard is that ``ewm`` never yields a NaN of its own: a
-    bar skipped by the recursion leaves a *finite, wrong* RSI behind, and
-    ``fillna`` cannot distinguish it from a genuine one.  The seam is what
-    keeps that unreachable from here.  See the module-level note in
-    ``compute`` for the measurements.
+    So the residual hazard is real and this docstring does not make it
+    unreachable.  A bar skipped by the ``ewm`` recursion leaves a *finite,
+    wrong* RSI behind, ``fillna`` cannot distinguish that from a genuine
+    reading, and ``_require_finite`` cannot see it.  What ``compute``'s
+    seam does buy here is only that the bad price never enters ``diff()``
+    as an infinity -- it makes the bar *skippable*, not *unknown*.  That
+    distinction is the whole point: the ``rolling`` families report a
+    poisoned window as NaN, the ``ewm`` families report it as a stale
+    carried value.  The ``KNOWN GAP`` note in ``compute`` is the governing
+    record for this, and it states the limitation correctly.
     """
     delta = close.diff()
     gain = delta.clip(lower=0.0)

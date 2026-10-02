@@ -718,6 +718,17 @@ def test_range_1_and_price_ratio_numerators_are_guarded_on_an_inf_close():
 #: The rolling/technical columns that ``compute``'s seam is load-bearing
 #: for, split by the mechanism that repairs them once the seam has mapped
 #: the bad price to NaN.  See the two tests below for the measurements.
+#:
+#: FRAME-DEPENDENCY, recorded deliberately: the ``rsi_4`` entry here is NOT
+#: the seam reporting an unknown window as its neutral constant.  ``_rsi``
+#: reads the poisoned bar as a *stale carried value*, because ``ewm`` skips a
+#: non-finite input instead of masking it (see ``_rsi``'s docstring).  The
+#: 50.0 lands here only because ``_frame()`` is a monotonically rising ramp
+#: with no down-bars, so ``avg_loss`` is ``-0.0`` everywhere and the
+#: both-sides-zero guard -- not the seam -- feeds ``fillna(50.0)``.  On a
+#: frame that has losses this entry would read as a carried value instead and
+#: the assertion below would not hold; that assertion is about the seam, so
+#: it is pinned on the frame where the seam is the only variable.
 _ROLLING_NAN_COLUMNS = ("sma_4", "bb_upper_4", "bb_lower_4", "bb_width_4")
 _ROLLING_NEUTRAL_COLUMNS = {"rsi_4": 50.0, "bb_pctb_4": 0.5}
 
@@ -777,7 +788,10 @@ def test_compute_seam_makes_a_zero_price_bar_unknown_to_the_rolling_group():
         assert np.isfinite(values[204]), f"{col} never recovered after the gap"
 
     # These two have a *documented* neutral reading for an unknown window,
-    # so NaN is not what they may report -- the neutral constant is.
+    # so NaN is not what they may report -- the neutral constant is.  For
+    # `rsi_4` the route to 50.0 is the no-losses guard rather than the seam
+    # (see `_ROLLING_NEUTRAL_COLUMNS` above); this loop pins the value, not
+    # the mechanism that produced it.
     for col, neutral in _ROLLING_NEUTRAL_COLUMNS.items():
         values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
         assert np.allclose(values[poisoned], neutral), (
