@@ -19,6 +19,13 @@ Load and follow the `opencode-ensemble` skill for the lead workflow before start
   final pass artifacts (AUDIT/RESEARCH/DECISION/VALIDATION/PLAN) as one docs commit at run end,
   as prior passes do (`docs: data-pipeline pass <date> artifacts`). Never commit scratch
   models/store from `/tmp/...`.
+  **Commit the artifact dir after EACH phase, not once at the start** (verified 2026-10-02). A
+  worktree teammate branches from the last *commit*, so an artifact written but not committed is
+  invisible to every `worktree: true` role. Committing once at spawn time is not enough — the
+  architect writes `DECISION.md` later, so a single early commit leaves the Phase 4 builder
+  without the one document it exists to execute. (Observed exactly that: the builder had to read
+  `DECISION.md` read-only out of the lead's checkout.) Either commit per phase, or have the lead
+  copy the artifact into each worktree at spawn.
 - Do not skip ahead. Do not write code before Phase 4.
 - The audit is category-agnostic. Do not assume news, or any other specific data source, is the
   right gap; the audit has to find that out by reading the code.
@@ -114,7 +121,13 @@ zero or more builder slices in Phase 7 (fix loop / further development); each is
 
 ## Task board
 
-Create the team (`team_create` — name it `audit-pipeline`), then record the tasks up front with
+Create the team (`team_create`). **Name it `audit-pipeline-<MMDD>`** (e.g. `audit-pipeline-1002`),
+not the bare `audit-pipeline`: a team's name is claimed permanently by the first run that takes it,
+and a session that is *not yet in a team* cannot reclaim a name an archived team already holds
+(`team_create` → "Team audit-pipeline already exists" while `team_status` → "This session is not in a
+team", verified 2026-10-02). A per-run suffix never collides.
+
+Then record the tasks up front with
 `team_tasks_add`. `team_tasks_add` returns per-task IDs like `task_XXXX_0001_yyyy`. **Capture
 those returned IDs and pass them to `depends_on` — never label names, and never type an ID from
 memory.** If any `depends_on` references a label or a mistyped ID, every downstream task shows as
@@ -124,6 +137,16 @@ the board stays wrong for the whole run. Accepted fallback (verified 2026-10-01)
 once it is broken, track the chain yourself by the spawn order, complete whatever completes, and
 don't block teammates on claims. The only real cure is to write the `depends_on` list from the
 exact response of the *same* `team_tasks_add` call — double-check each ID before sending.
+
+**`blocked` is usually TEMPORAL, not poisoned — check before you give up on the board.** A task
+shows `blocked` whenever its dependency is merely *not yet completed*, which is the normal state
+while an earlier phase is still running. Completing the tasks in dependency order
+(`team_tasks_complete` on each, earliest first) unblocks the chain immediately, and the later
+teammates then `claim_task` normally (verified 2026-10-02: three parallel researchers spawned
+before `research-1` finished could not claim; completing the board in order cleared it). Spawning
+a task's teammates *before* its dependency completes is the usual cause, so either spawn them
+after, or expect unclaimed-but-running. Do **not** carry forward the habit of writing a placeholder
+into `depends_on` to "fill it in later" — a real ID from the same response, or nothing.
 
 | Task key (label) | Description | depends_on (real IDs from `team_tasks_add`) |
 |------------------|-------------|------------------------|
@@ -867,6 +890,79 @@ because the lessons generalise to any future pass that spawns builders.
     how long an eval window are needed to resolve an effect of a given size from the observed
     within-config spread. That turns "3 seeds, trust me" into a computed requirement, and it is the
     natural next slice for anyone who wants a real verdict from this pipeline.
+
+- 2026-10-02 — IMPROVE-EXISTING pass (G1, make the signal seam read the file its own config
+  names, and refuse by name). Gate NEEDS_FIX then PASS. 7 commits pushed `444fe1f..53fd684`,
+  314 → 331 tests, `nix flake check` green. Lessons:
+  - **`blocked` on the board is usually TEMPORAL, not poisoned.** Three parallel researchers
+    spawned before `research-1` finished could not `claim_task`, and I mis-read that as the
+    permanent-poisoned-board failure this RUN LOG already records twice — so I gave up on the
+    board and tracked the chain by hand. Completing the tasks in dependency order cleared it
+    immediately and the next teammate claimed normally. **Diagnose the board before working
+    around it.** This is the third time a prior lesson was applied past its actual scope: the
+    earlier entries are about a *mistyped* `depends_on`, which is genuinely unrecoverable, and
+    the symptom is identical until you try completing in order.
+  - **`team_create` name is a permanent claim, and an un-teamed session cannot reclaim it.**
+    `team_create("audit-pipeline")` → "already exists" while `team_status` → "This session is not
+    in a team". Had to use `data-audit-1002`. Guidance fixed: the Task board section now says to
+    name the team `audit-pipeline-<MMDD>`.
+  - **Committing the artifact dir "early" is not early enough if you commit once.** The 2026-09-29
+    proposal (commit early so worktree teammates can read artifacts) was right in principle and I
+    implemented it — once, at spawn, before the architect had written `DECISION.md`. The Phase 4
+    builder therefore had no `DECISION.md` in its worktree and read it read-only out of MAIN.
+    Guidance fixed: commit the artifact dir **after each phase**.
+  - **"Silent zero-fill" and "silent absence" are different defects with different guards.** The
+    audit reported the dropped signal columns as "permanently zero" and recommended reading
+    `signal_observed` as the diagnostic. RESEARCH-1 corrected it: the columns were **absent**, and
+    `signal_observed` was itself absent from the observation — so measured width as-shipped (52)
+    was *identical* to width-with-the-broken-path-configured (52), and the width guard cannot see
+    it by construction. Had the columns been zero-filled, the fix would have been smaller and the
+    gate weaker. Verify the fill-vs-absent class before sizing a fix or trusting a width guard.
+  - **When measured numbers disagree across artifacts, look for the axis one of them included.**
+    Four widths were in circulation (52 / 59 / 60 / 67) and three agents had each measured or
+    computed one. The answer: **60**, and the delta from the no-channel baseline is exactly **8** —
+    the 7 gate names **plus `open_interest`**, which is why 59 and 60 each looked right. Re-deriving
+    cost a full live train; asking "what extra column was in that one's fixture" cost nothing.
+  - **A test that pins a derived artifact's CONSUMER without exercising its PRODUCER is the same
+    defect class twice in one pass.** `3f9708e` added a `signal_file_not_found` reason code; its
+    test fed `classify_process_failure` a hand-built `stderr_tail`, so it never ran `cmd_run` and
+    never built the tail that was broken — `model_matrix.py:1726` sliced `-4:` over the
+    **concatenated** train+backtest stderr, so a failing backtest's downstream "No trained model"
+    displaced the train leg's refusal. The classifier was right; the capture discarded the text.
+    Same shape as the vacuous `"config points at a REAL funding file"` test fixed at the same time.
+    The fixer was required to pin the **capture** and to prove non-vacuity by reverting only the
+    source. Generalisable rule, now stated in the code comment: **assert the producer, not just
+    the consumer of what it produces.**
+  - **`nix develop --command bash -c "python -m pytest -q"` works from MAIN** — but the integrator
+    concluded there was no dev-shell python and hand-built a store python3.14 env, because the
+    repo's `.venv` has an editable install pointing at MAIN and so silently tests the *wrong tree*.
+    Two teammates wasted time on this. Put the verified command verbatim in every
+    builder/integrator/reviewer brief, and state that `.venv` shadows MAIN.
+  - **The stall notice fired 12 times this run and was wrong 12 times**, two of them the "no
+    communication" variant seconds after the teammate had messaged a detailed progress list.
+    Cumulative across runs it is now 20+ with zero true positives. It should be treated as pure
+    noise; `team_status` counts the notice itself as a "nudge". Nudge on elapsed time only.
+  - **`merge_extra_features`'s two read legs are byte-identical loops**, which is exactly why a
+    missing kwarg on one was invisible: `config_key` was pinned only on direct calls, and dropping
+    it from either loop left every test green while degrading the refusal. Pin duplicated loops
+    **per instance**, not once for the shape.
+  - **DECISION §5.2's prescribed field was wrong and shipping it would have been a regression.**
+    It said add `"ticker": self.symbol` (`PF_ETHUSD`); the consumer folds tickers to a
+    separator-free key, so that folds to `PFETHUSD`, never equal to `ETHUSD` — turning an inert
+    guard into `SignalTickerMismatchError` on every run. The builder used `self.spot_pair`
+    (`ETH/USD`, matching both sibling producers), documented the deviation, and pinned the wrong
+    spelling as wrong in a test. **A downstream agent that refuses a decision's literal value and
+    argues why from the consumer's own code is usually right** — have it report the deviation
+    explicitly rather than reverting it.
+  - Efficiency, measured from `~/.local/share/opencode/opencode.db` (sessions with
+    `directory LIKE '%kraken-trading-bot%'` created after 2026-10-02 00:00; **teammate sessions are
+    NOT attributable** — every ensemble-worktree session is absent from the table, so these figures
+    understate the run, as the fixer independently found): 3 sessions, input 651,309 / output
+    59,874 / reasoning 24,792 / cache-read 26,485,260, cost 0.0 (free model, not meaningful),
+    **215 tool calls**. Cache-read is **~41x** input, so the run is overwhelmingly cache-bound:
+    cutting redundant large-context reads beats cutting turns. proposal: put the verified
+    `nix develop` pytest command in every teammate brief as literal text (see above) — two
+    hand-built python envs cost more than the `nix develop` builds the briefs told them to skip.
 ---
 
 ## Guardrails
