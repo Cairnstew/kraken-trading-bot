@@ -418,6 +418,40 @@ real Kraken data, 2026-09-28); adapt the commands to the chosen outcome.
    if applicable. Then this repo's `pytest` to confirm the adapter broke
    nothing (expected: pre-existing count + new adapter tests, all green).
 
+   **Then run the structural checks as ONE command, not by hand.** Do not
+   write a throwaway probe for them:
+
+   ```bash
+   just audit-verify --prereg <pre-registration-commit> --since <last-code-identical-commit>
+   ```
+
+   `--prereg` is the commit that pre-registered any gate threshold:
+   `tools/model_matrix.py` must come back **byte-identical**. `--since` is the
+   last commit you believe is code-identical. **These are usually different
+   commits** -- pointing `--since` at the pre-registration commit reports
+   `CHANGED` for files a later review round legitimately rewrote, which looks
+   exactly like a regression and is not one. Add `--frame <parquet>
+   --expect-obs <sha> --expect-arr <sha>` for the observation-matrix
+   fingerprint when a cached frame exists.
+
+   Paste the receipt into VALIDATION.md **verbatim**. Do not restate a check
+   from its intent: a previous pass described a docstring clause as "second"
+   while the file said "first real", and a reviewer caught it only by reading
+   the source. A `SELF-TEST BROKEN` line means the AST proof itself is
+   untrustworthy -- fix that before believing anything else it reports.
+
+   **When this pass's outcome is the CAND-5 dispersion gate**, re-derive the
+   published figures rather than restating them:
+
+   ```bash
+   just cost-aware-replay --records <cost-dir> --control-records <ctrl-dir> \
+     --cells live=<id>:<seed>,... --cells store=<id>:<seed>,...
+   ```
+
+   Annotate every cell `id:seed`: these backtest records all carry the *same*
+   `seed` field, so arm pairing cannot be verified from them, and unannotated
+   pairing is positional only.
+
 2. **Seed the data source live** (needs network, keyless source): for the
    market-data store,
    `cd ~/Projects/kraken-market-data && nix develop --command bash -c
@@ -495,7 +529,9 @@ main repo alike.
    sibling project (store extraction/CLI bugs) or `kraken-trading-bot` (the
    `read_ohlc_dataframe` adapter, config wiring, dev-shell imports). The
    builder commits in its worktree; merge, re-run the Phase 6 integration test,
-   and repeat until the gate passes.
+   and repeat until the gate passes. Re-run `just audit-verify` after every
+   fix slice and paste the receipt; a fix that does not move the receipt to
+   green has not been shown to work.
 2. **Iterative development loop** (the normal happy path): after a PASS, and
    whenever the user asks for further development, spawn one developer at a
    time on a named slice (e.g. "surface `since`/`until` on the train CLI",
@@ -529,6 +565,26 @@ runs cheaper and less error-prone.
 2. **Audit the guidance you relied on** against the run and the current repos:
    are the paths real? do the CLI commands work as written? is the project
    registry current (new repos pushed, URLs updated)? is any step now redundant?
+
+   **Run these three before writing any summary.** Each is read-only and each
+   exists because this pass's hand-rolled equivalent produced a wrong answer:
+
+   ```bash
+   just audit-closeout     # pushed-state check + the ordered close-out below
+   just audit-findings     # every F<n> has a decision-level disposition
+   just audit-evidence     # nothing cited is /tmp-only; a falsification record exists
+   ```
+
+   `audit-findings` finds findings whose disposition lives only in a diff -- the
+   2026-10-02 pass shipped two that way (F5, F7) across four review rounds. A
+   check that has never been *tried and broken* proves nothing, so `audit-evidence`
+   also asks whether any falsification attempt is on record.
+
+   **Close-out order, and two steps exist because the reverse order lied:**
+   verify -> `git push` -> **verify again in the pushed state** -> `audit-findings`
+   -> `audit-evidence` -> this checkpoint -> shut down every teammate ->
+   `team_cleanup`. A receipt from the working tree says nothing about what is on
+   the remote.
 
 3. **Act per grounded lesson** (append-only to the RUN LOG below, or fix the
    guidance directly):
@@ -912,7 +968,8 @@ because the lessons generalise to any future pass that spawns builders.
   - **Evidence has to be re-derivable or it is only trust.** The gate's width-hash assertion
     depended on a script in `/tmp`, so nobody could reproduce the pass's central invariant. The
     cost-aware figures came from a scratch scorer. Both are now committed: `tools/width_check.py`
-    and `tools/cost_aware_gate.py`. Phase 6/8 now have `just audit-verify` / `just cost-aware-replay`.
+    and `tools/cost_aware_gate.py`. Phase 6/8 invoke them via `just audit-verify` /
+    `just cost-aware-replay` rather than re-deriving the checks by hand.
   - **Keep the estimator file byte-identical, put new drivers beside it.** The replay driver
     *imports* `DISPERSION_RATIO_THRESHOLD` / `pooled_within_spread` / `dispersion_verdict` from
     `tools/model_matrix.py` rather than adding a subcommand to it. A subcommand would have
