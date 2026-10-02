@@ -934,10 +934,40 @@ reason this record exists: the lead described the wording in a message as "secon
 said "first real", and only a reviewer reading the source rather than the description caught it.
 **The lesson recorded for this pass: a repair that cites its own prose is not finished when the
 prose is corrected — it is finished when every falsifiable clause in the cited text has been
-measured.**
+measured. But measured *by someone who re-derives it*, not by a script the repair wrote about
+itself.**
 
 **Mechanical evidence, not self-certification.** Each round was verified by: an AST comparison with
 docstrings stripped (itself self-tested against six mutants after two real bugs in the proof were
-found); a width-hash re-run; the full suite; and a `tools/` zero-diff check against `97a2a52`. The
-final state is also covered by a script asserting all 19 falsifiable clauses in the repaired
-docstring true by measurement.
+found); a width-hash re-run; the full suite; and a `tools/` zero-diff check against `97a2a52`. Those
+four are structural and hold: no executable line changed, the width hash is byte-identical, 455
+tests pass, and the measurement track is untouched.
+
+**The confirmation rests on the reviewer's own 12-clause probe — explicitly NOT on a script.** A
+clause-checking script was written during this pass and an earlier draft of this record cited it as
+covering the final state. **That citation was withdrawn: the script was proved inert.** The reviewer
+cloned the final commit, restored *both* round-4 defects in the docstring while leaving the
+executable body untouched — `(A)` back to "``avg_gain`` is ``-0.0``" with its **correct** outcome
+clause intact, `(B)` back to "the whole frame" — and ran the script against it. Result: **11 of 11
+reason checks PASS, exit 0, "ALL CLAUSES AND ALL STATED REASONS MEASURED TRUE"**, against a
+docstring asserting both defects. Two reasons, both structural:
+
+- **No binding.** Every assertion measures pandas' behaviour. None is bound to any word of the
+  docstring, so "avg_gain is never -0.0" passes *because pandas behaves that way* — orthogonal to
+  what the docstring *says*. Measuring the right things is not the same as checking the text.
+- **The extraction never found the clause.** The clause-splitter breaks on the `.` inside `-0.0`,
+  `0.0` and `1.001`, so it prints mid-sentence fragments; and it requires the literal "so that", so
+  the very clause whose stated reason was wrong last round ("clipped at zero below, so avg_gain
+  cannot be negative") is one it never displayed.
+
+This is the **same failure mode the whole pass exists to remove**, one level up: a verification
+artifact that reports green while the defect it was built to catch is present. It is recorded here
+rather than quietly deleted because the fact that it was *proved* inert — by mutation, at the
+reviewer's initiative — is the actual evidence for the verdict. A gate whose evidence is only ever
+green is worth nothing; this one survived an attempt to falsify it and the falsification attempt is
+published alongside.
+
+**To actually close the class**, each assertion would have to name the docstring substring it
+defends and fail when that substring is absent or altered. Not done here: the script is scratch
+state outside the repo, and adding a docstring-lint harness to the repository is a scope decision
+this pass did not take for itself. Carried as an open follow-up, not as a claim.
