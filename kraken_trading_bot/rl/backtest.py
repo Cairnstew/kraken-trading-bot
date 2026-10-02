@@ -45,7 +45,23 @@ model was trained with, against the one this run would use).
 Data-window pinning (``data_window`` in the config, see
 :mod:`kraken_trading_bot.rl.data_window`) lets a caller pin the window
 and take the out-of-sample tail, so a run stops comparing data against
-data.  With the window unpinned — the default — nothing here changes.
+data.
+
+**And every result now says which kind of measurement it is.**  With the
+window unpinned — the shipped default — :func:`training_frame` and
+:func:`evaluation_frame` return the *same object*, so the replay covers
+the bars the model was fitted on and the return describes the fit, not a
+prediction.  Rather than leave that to be inferred, the verdict is
+*derived* from the two halves by
+:func:`~kraken_trading_bot.rl.data_window.evaluate_scope` and lands on
+the result as ``evaluation_is_out_of_sample`` /
+``evaluation_scope_label`` / ``evaluation_scope_reason``, so it reaches
+``--json``, the human output and ``export-data``.  It is derived rather
+than requested precisely so it cannot be wrong: a nominally pinned
+window that yields 0/0 bars is a *failed* measurement, and
+:func:`evaluation_frame` refuses that outright with a
+:class:`~kraken_trading_bot.rl.data.PinnedWindowUnavailableError` naming
+the overlap that missed and the recipe to fix it.
 """
 
 from __future__ import annotations
@@ -60,7 +76,13 @@ import pandas as pd
 
 from .agent import RLAgent
 from .data import add_derived_ohlcv_features, read_ohlc_dataframe
-from .data_window import DataWindow, evaluation_frame, resolve_data_window
+from .data_window import (
+    IN_SAMPLE_LABEL,
+    DataWindow,
+    evaluate_scope,
+    evaluation_frame,
+    resolve_data_window,
+)
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, check_feature_width, normalize_ticker_id
 from .registry import ModelRecord, scan_model
@@ -153,6 +175,20 @@ class BacktestResult:
             for a realistic one.
         slippage: Fractional adverse fill move actually applied.
         action_space: Action space the replay actually used.
+        evaluation_is_out_of_sample: Whether the replayed bars were
+            disjoint from the bars the model was fitted on.  Derived from
+            the resolved window by
+            :func:`~kraken_trading_bot.rl.data_window.evaluate_scope`,
+            never from a flag the caller set.  With the shipped default
+            this is ``False``: both halves are the same object, so the
+            number above describes the fit and not a prediction.
+        evaluation_scope_label: ``"OUT-OF-SAMPLE"`` or ``"IN-SAMPLE"``,
+            word-matched with the matrix harness so the two read alike.
+        evaluation_scope_reason: The one sentence naming which clause
+            decided the verdict.
+        n_train_bars: Bars the training half held, so a reader can see
+            the disjointness rather than take it on trust.
+        n_eval_bars: Bars available to the evaluation half.
     """
 
     ticker_id: str
@@ -173,6 +209,16 @@ class BacktestResult:
     fee_rate: float = 0.0
     slippage: float = 0.0
     action_space: str = "continuous"
+    # Fail closed: a result that nobody labelled reads as in-sample,
+    # which is the safe direction to be wrong in.
+    evaluation_is_out_of_sample: bool = False
+    evaluation_scope_label: str = IN_SAMPLE_LABEL
+    evaluation_scope_reason: str = (
+        "labelled IN-SAMPLE by default: nothing claimed this result was "
+        "measured out-of-sample."
+    )
+    n_train_bars: int = 0
+    n_eval_bars: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict view of the result."""
@@ -195,6 +241,13 @@ class BacktestResult:
             "fee_rate": self.fee_rate,
             "slippage": self.slippage,
             "action_space": self.action_space,
+            # The verdict, in --json so a report cannot read a return as
+            # OOS because the JSON it parsed happened to omit this.
+            "evaluation_is_out_of_sample": self.evaluation_is_out_of_sample,
+            "evaluation_scope_label": self.evaluation_scope_label,
+            "evaluation_scope_reason": self.evaluation_scope_reason,
+            "n_train_bars": self.n_train_bars,
+            "n_eval_bars": self.n_eval_bars,
         }
 
 
@@ -363,7 +416,8 @@ def backtest_model(
     Returns:
         The :class:`BacktestResult` for the run, including the
         buy-and-hold benchmark, ``excess_return``, the applied
-        ``fee_rate``/``slippage`` and the realized ``n_bars``.
+        ``fee_rate``/``slippage``, the realized ``n_bars`` and the
+        derived ``IN-SAMPLE``/``OUT-OF-SAMPLE`` verdict.
 
     Raises:
         ValueError: If neither ``data`` nor a way to fetch it exists, or
@@ -375,6 +429,10 @@ def backtest_model(
         ActionSpaceMismatchError: If the model was trained under a
             different action space than this run would use.
         NotEnoughDataError: If the resolved window leaves no tradable bar.
+            A pinned window whose range misses every available bar raises
+            the ``NotEnoughDataError`` subclass
+            :class:`~kraken_trading_bot.rl.data.PinnedWindowUnavailableError`,
+            which names the cause, the failed overlap and the fix.
     """
     ticker_key = normalize_ticker_id(ticker_id)
     env_kwargs = dict(env_kwargs or {})
@@ -437,11 +495,37 @@ def backtest_model(
 
     # Pinned window + train/eval split.  With an unpinned window this
     # returns the frame itself, so the default path is untouched.
+    #
+    # The verdict is taken from the FULL frame, before the eval slice is
+    # cut, because that is the only point where both halves still exist
+    # and disjointness can be *measured* rather than assumed.  With the
+    # shipped default (`since`/`until` null) the two halves are the same
+    # object, so the result below is IN-SAMPLE -- the honest label for a
+    # return over the bars the model was fitted on.
+    scope = evaluate_scope(df, window)
     df = evaluation_frame(df, window)
-    if window.is_pinned:
+    if scope.is_out_of_sample:
+        _LOGGER.info(
+            "Backtest window %s -> %d replayable bars (%d training bars "
+            "held out) — OUT-OF-SAMPLE",
+            window.describe(),
+            len(df),
+            scope.n_train_bars,
+        )
+    else:
+        # Prominent on purpose: this is the default path, and an
+        # unlabelled IN-SAMPLE return is the thing being read as OOS.
+        _LOGGER.warning(
+            "Backtest %s/%s is IN-SAMPLE: %s Replayed %d bar(s); no "
+            "out-of-sample claim is supported.",
+            ticker_key,
+            model_name,
+            scope.reason,
+            len(df),
+        )
         _LOGGER.info(
             "Backtest window %s -> %d replayable bars (training took the "
-            "leading %d%%, this replays the out-of-sample remainder)",
+            "leading %d%%, this replays the remainder)",
             window.describe(),
             len(df),
             int(window.eval_split * 100),
@@ -601,13 +685,19 @@ def backtest_model(
         fee_rate=fee_rate,
         slippage=slippage,
         action_space=action_space,
+        evaluation_is_out_of_sample=scope.is_out_of_sample,
+        evaluation_scope_label=scope.label,
+        evaluation_scope_reason=scope.reason,
+        n_train_bars=scope.n_train_bars,
+        n_eval_bars=scope.n_eval_bars,
     )
     _LOGGER.info(
-        "Backtest %s/%s: %d/%d bars replayed, return=%.2f%% "
+        "Backtest %s/%s [%s]: %d/%d bars replayed, return=%.2f%% "
         "buy&hold=%.2f%% excess=%.2f%% max_dd=%.2f%% trades=%d win=%.2f%% "
         "fee=%.4f%% slip=%.4f%%",
         ticker_key,
         model_name,
+        scope.label,
         n_replayed,
         len(closes),
         total_return * 100.0,
