@@ -558,3 +558,36 @@ code is right, but the harness never hands it the text. One line
 whole-grid failure is delivered or swallowed. The commit's own reasoning — "matching is on
 the message the real CLI prints" — is right about matching and wrong about capture, and the
 synthetic-record test could not see it.
+---
+
+## GATE RE-CHECK AFTER THE PHASE 7 FIX — **PASS**
+
+The Phase 7 fix (`bb8a997`, from fixer `8fe6fb1`) took the stderr tail per leg instead of over
+the concatenation. Re-run by the lead against a live single-cell matrix whose base config points
+`funding_features_file` at an absent path, so the failing condition (d) second half is exercised
+by the real `cmd_run`, not by a synthetic record:
+
+```
+$ nix develop --command bash -c "python tools/model_matrix.py run /tmp/gate/spec.yaml"
+[1/1] 8d8a4bf2092c  pages=2, seed=42, ticker=ETH_USD, timesteps=600
+    INVALID: process_failed, signal_file_not_found
+    ERROR: train rc=1, backtest rc=1; ... Training ETH_USD/mtx_8d8a4bf2092c failed:
+    funding_features_file is set to '/tmp/gate/definitely-absent-funding.jsonl' but no file
+    exists at /tmp/gate/definitely-absent-funding.jsonl. Produce it with: just funding-pull. Or ...
+```
+
+The reason code now fires. Before the fix this same run recorded `INVALID: process_failed` alone.
+
+| condition | verdict |
+|---|---|
+| (a) seam consumed by name | **PASS** |
+| (b) 7 gate names in the fitted artifact, by name | **PASS** (non-vacuity proven: 52 wide / 0 of 7 with the key nulled) |
+| (c) magnitude | **PASS** — n_bars 697 = 721 − 24 warm-up, num_trades 350 |
+| (d) negative direction | **PASS** — null key trains silently at 52 features; unresolvable key raises by name and classifies as `signal_file_not_found` |
+
+Suite: **331 passed** (was 314 before the pass). `nix flake check`: **all checks passed**.
+
+Observed feature width **60**, re-derived from `normalization.npz` `feature_names`; the delta
+against no-channel is exactly 8 (the 7 gate names plus `open_interest`).
+
+**FINAL GATE VERDICT: PASS.**
