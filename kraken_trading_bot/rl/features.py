@@ -1093,18 +1093,22 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     NaN", so that ``compute``'s seam (which maps a non-finite close to
     NaN *before* ``diff()`` runs) made ``gain``/``loss`` see a NaN, ``rs``
     came out NaN, and ``fillna(50.0)`` mapped that NaN to the neutral
-    reading.  **None of that happens.**  Measured on pandas 3.0.4, ``ewm``
+    reading.  **None of that chain holds.**  Measured on pandas 3.0.4, ``ewm``
     *skips* a non-finite input exactly as it skips an infinity: it carries
-    the previous bar's average forward and returns a **finite** number.
-    With the seam applied and a zero price at one bar, measured on a 400-bar
-    frame that has losses: ``avg_gain`` and ``avg_loss`` both stay finite
-    and non-zero, ``rs`` stays finite, and ``fillna(50.0)`` never fires --
-    ``rsi_4`` reports the *previous* bar's value again (85.5634 carried
-    across the poisoned bar in the recorded probe).  The 50.0 that
-    ``fillna`` does supply in the pinned test comes from the
-    both-sides-zero guard above, not from the seam: that test's frame is a
-    monotonically rising ramp, so it has no down-bars at all.  On a frame
-    with losses the route cannot fire.
+    the previous bar's average forward and returns a **finite** number.  So
+    the chain does break at its first real link -- ``gain``/``loss`` are
+    genuinely NaN at the bad bar, and ``ewm`` is what refuses to carry that
+    NaN forward.  With the seam applied and a zero price at one bar, measured
+    on a 400-bar frame that has losses: ``avg_gain`` and ``avg_loss`` both
+    stay finite and non-zero, ``rs`` stays finite, and ``fillna(50.0)`` does
+    not fire **at the poisoned bar** (it does fire at bar 0 on every frame,
+    where ``diff()`` makes the first delta NaN, and on runs of consecutive
+    gains -- neither of which is the seam's doing).  ``rsi_4`` reports the
+    *previous* bar's value again (85.5634 carried across the poisoned bar in
+    the recorded probe).  The 50.0 that ``fillna`` does supply in the pinned
+    test comes from the both-sides-zero guard above, not from the seam: that
+    test's frame is a monotonically rising ramp, so it has no down-bars at
+    all.  On a frame with losses the route cannot fire.
 
     So the residual hazard is real and this docstring does not make it
     unreachable.  A bar skipped by the ``ewm`` recursion leaves a *finite,
