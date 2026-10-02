@@ -645,3 +645,53 @@ implementation with verification. This pass therefore separates them: `builder-i
 `builder-inlabel` implement (disjoint file ownership: `features.py` vs
 `data.py`/`backtest.py`/`export.py`), and the reviewer verifies. **No teammate both implements and
 verifies its own claim.**
+
+---
+
+## 13. PRE-REGISTERED DISPERSION RULE — committed BEFORE the cost-aware re-run
+
+**Written and committed before any cost-aware number exists.** That ordering is the entire point
+of this section: the threshold below is fixed now, so it cannot be tuned to produce a preferred
+verdict once the result is known.
+
+**Background (Phase 6 finding F1).** The frictionless gate yielded `NOT SEPARATED` on both return
+metrics, and §9A.2 attributed that to seed noise. That attribution is **wrong**. At Kraken taker
+costs the store arm's within-group IQR collapses from 1961.45pp to 11.68pp (168×) while the
+return goes from +2015% to −88%. The frictionless dispersion was measuring **cost sensitivity**,
+not seed variance. §9A.2 is therefore superseded, not patched — see §13.2.
+
+### 13.1 The rule, fixed now
+
+| | |
+|---|---|
+| **Cost basis for every quoted number** | **Kraken taker: `fee_rate: 0.0026`, `slippage: 0.0005`** (31 bp round-trip) |
+| **Estimator** | unchanged — the shipped `pooled_within_spread` = **median** of per-group IQRs over groups with `n >= 3`, and `dispersion_verdict` |
+| **Ratio** | `gap / pooled`, `gap = abs(median_A − median_B)` over adjacent arms. **The ratio is a fact.** |
+| **Threshold** | **`DISPERSION_RATIO_THRESHOLD = 1.0`, UNCHANGED** |
+| `ratio >= 1.0` | `RESOLVED` |
+| `0 < ratio < 1.0` | `NOT SEPARATED` |
+| `n < 3`, or `pooled == 0`, or missing arm median | `UNDEFINED` (no number invented) |
+| **Ordering** | must sit **BEHIND** the count gate and require `n >= 3 AND pooled > 0` |
+| **Never tuned post hoc** | the threshold stays 1.0 whatever the re-run returns |
+
+**Pre-registered expectation, stated before the run:** with IQR ≈ 11.7pp under costs, the
+`excess_return` gap (16.24pp) gives a ratio of roughly **1.4**, i.e. it may well come back
+`RESOLVED` — and if it does, **`RESOLVED` is not a claim that the store helps.** A resolved
+return difference at 31 bp costs on a churn-dominated strategy means the arms differ measurably
+in *cost sensitivity*, nothing more. **The verdict will be reported as it falls, in either
+direction, with no "store improved" or "store hurt" framing.**
+
+### 13.2 §9A.2 is SUPERSEDED, not patched
+
+The frictionless rows in §9A.2 (`excess_return` 0.037, `total_return` 0.503, `sharpe` 1.400,
+`max_drawdown` 10.736) are retained **only as a labelled diagnostic** of the churn effect. They
+are not seed-variance measurements and must never be quoted as such. Both `RESOLVED` rows are
+churn artifacts (seed 44 Sharpe 2.717 → −0.550 under costs), so they are re-derived from scratch
+under §13.1 rather than carried forward.
+
+### 13.3 What the report must state regardless of the verdict
+
+If the cost-aware numbers show the strategy losing money in **both** arms — which Phase 6's
+frictionless→taker swing suggests — the report **says so plainly**. No "store arm improved"
+language in either direction. What CAND-3a delivered remains: *an out-of-sample measurement
+became possible at all.*
