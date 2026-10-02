@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,25 @@ JUSTFILE = REPO_ROOT / "justfile"
 #: Kraken's REST ceiling, measured repeatedly: a paged live fetch returns
 #: 721 bars and older data is not retrievable at all.
 LIVE_CEILING = 721
+
+
+class _RecordingStore:
+    """Stand-in for ``market_data.store.MarketDataStore``.
+
+    Installed as ``sys.modules["market_data.store"]`` by the tests that
+    need the *path* branch of ``_resolve_store`` to reach the store rather
+    than the sibling-import branch, so those tests never import the real
+    sibling package (which would be a plain, un-undoable import).
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def upsert(self, *args, **kwargs):
+        return None
+
+    def read(self, *args, **kwargs):
+        return pd.DataFrame()
 
 
 def _load(path: Path) -> dict:
@@ -292,6 +312,21 @@ def test_unreadable_store_error_reaches_the_read_seam(tmp_path, monkeypatch):
     function, so a check that only ``_resolve_store``'s own callers see
     would not protect them.
     """
+    # A stand-in sibling module, so reaching the store seam here never
+    # imports the REAL ``market_data.store``.  It would succeed in this
+    # repo's dev shell and, being a plain import rather than a
+    # monkeypatch, could not be undone -- leaving ``market_data.store``
+    # cached in ``sys.modules`` for the rest of the session and silently
+    # disarming any later test that hides the sibling to exercise the
+    # ImportError branch.  The root-status refusal is checked *before* the
+    # store is constructed, so a stand-in exercises exactly the same
+    # assertion without the leak.
+    module = types.ModuleType("market_data.store")
+    module.MarketDataStore = _RecordingStore
+    package = types.ModuleType("market_data")
+    package.store = module
+    monkeypatch.setitem(sys.modules, "market_data", package)
+    monkeypatch.setitem(sys.modules, "market_data.store", module)
 
     class Source:
         def ohlc(self, pair, interval=60, since=None):

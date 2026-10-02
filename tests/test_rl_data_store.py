@@ -221,7 +221,18 @@ def test_read_ohlc_dataframe_empty_window_raises() -> None:
 
 def test_read_ohlc_dataframe_path_branch_requires_sibling_package(monkeypatch) -> None:
     """A store *path* with the sibling package absent fails loudly, not silently."""
+    # Both names must go, not just the package.  ``from market_data.store
+    # import MarketDataStore`` resolves ``market_data.store`` straight out
+    # of ``sys.modules`` when some earlier test in the same session already
+    # imported it for real -- which is exactly what the sibling package
+    # being importable in this repo's dev shell makes likely -- and a
+    # ``None`` entry for ``market_data`` alone does NOT hide that cached
+    # submodule.  Purging only the parent silently turned this assertion
+    # into a test of the *root-status* refusal instead of the ImportError
+    # one, i.e. an order-dependent test.  The expectation itself is
+    # unchanged: the ImportError branch still has to name the package.
     monkeypatch.setitem(__import__("sys").modules, "market_data", None)
+    monkeypatch.setitem(__import__("sys").modules, "market_data.store", None)
     with pytest.raises(ValueError, match="kraken-market-data"):
         read_ohlc_dataframe("ETH/USD", 60, market_data_store="/tmp/no-such-store")
 
