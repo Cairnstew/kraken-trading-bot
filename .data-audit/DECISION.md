@@ -967,7 +967,32 @@ reviewer's initiative — is the actual evidence for the verdict. A gate whose e
 green is worth nothing; this one survived an attempt to falsify it and the falsification attempt is
 published alongside.
 
-**To actually close the class**, each assertion would have to name the docstring substring it
-defends and fail when that substring is absent or altered. Not done here: the script is scratch
-state outside the repo, and adding a docstring-lint harness to the repository is a scope decision
-this pass did not take for itself. Carried as an open follow-up, not as a claim.
+**To actually close the class**, each assertion would have to name the docstring substring it defends and fail when that substring is absent or altered.
+
+### 15.1 OPEN FOLLOW-UP — a docstring gate that is actually bound to the text
+
+**Status: OPEN. Not claimed as done. Not deferred.** This is a real gap with a named trigger, not
+work quietly dropped at the end of a pass.
+
+**The class, stated so it is recognisable next time.** *A verification script whose assertions
+measure library behaviour but are not bound to any docstring text can report fully green while the
+docstring is wrong.* It is the R1 failure mode one level up. The tell is a script that asserts facts
+about a dependency and prints "PASS" — it is checking pandas, not the prose, and the two can drift
+apart without anything going red. The fix is not more assertions; it is a binding from each
+assertion to the exact substring it defends.
+
+**Trigger.** *A mechanism-asserting comment or docstring is added or edited in
+`kraken_trading_bot/rl/features.py` again.* At that point, and not before, each assertion must
+(a) name the docstring substring it defends and (b) fail when that substring is absent or altered.
+A script that satisfies (a) and (b) is worth having; a script that only adds assertions is what was
+withdrawn above, and adding more of them would be worse than useless — it would look like coverage.
+
+**Why it is not being built now, on the merits rather than for the sake of the record.** The
+docstring it would guard is correct and independently verified. A harness maintained for one
+docstring costs more to keep honest than the defect it would catch, and it would still compare
+*text against text* — it would not check text against pandas behaviour, which is the thing that was
+wrong in every round of this pass. Building it now would mostly be a way to feel finished.
+
+**The `/tmp` script is withdrawn and is not part of the evidence for this gate.** It lives in
+scratch state outside the repository, it was proved inert, and nothing in §15 rests on it. The
+verdict above rests on the reviewer's independent 12-clause probe plus the four structural checks.
