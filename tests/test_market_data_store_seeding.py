@@ -230,8 +230,16 @@ def test_missing_store_root_refuses_with_the_seed_recipe_and_its_cost(tmp_path):
     assert "just store-seed" in message
     assert "~158s" in message and "~13MB" in message
     assert str(root) in message
-    # And the way out for a host that has no store at all.
+    # And the way out for a host that has no store at all. F3 (2026-10-02):
+    # the old text said "set market_data_store: null in the config", which
+    # does NOT work for a store-trained model -- a YAML null is skipped by
+    # `_resolve_env_setting` and the model's own config wins. The remedy is
+    # the MODEL's config.yaml, and the message must say so.
     assert "market_data_store: null" in message
+    assert "MODEL'S OWN training config" in message
+    assert "models/<TICKER>/<MODEL>/config.yaml" in message
+    # It must not send the reader back to a --config run file.
+    assert "in the config to go back to" not in message
     # The typing contract is unchanged: still a ValueError, so every
     # existing caller and test that catches one keeps working.
     assert isinstance(excinfo.value, ValueError)

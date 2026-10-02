@@ -264,8 +264,22 @@ class MarketDataStoreUnavailableError(ValueError):
             f"years of history from Kraken, whose REST API serves up to 720 "
             f"of the most recent candles and states outright that older data "
             f"cannot be retrieved regardless of `since`. To fix: {STORE_SEED_HINT}"
-            f" Set market_data_store: null in the config to go back to the "
-            f"live paginated fetch (~721 bars)."
+            # Corrected 2026-10-02 (Phase 6 finding F3).  This message used to
+            # say "Set market_data_store: null in the config to go back to the
+            # live paginated fetch", which is **not** how a store-trained
+            # model resolves: `_resolve_env_setting` (backtest.py) treats a
+            # YAML `null` as "unset" and skips that source, so a run config
+            # saying `market_data_store: null` falls straight through to the
+            # MODEL's own config.yaml -- which is where the store path comes
+            # from -- and the store stays on.  The advice now names the file
+            # that actually wins.
+            f" To go back to the live paginated fetch (~721 bars), set "
+            f"market_data_store: null in the MODEL'S OWN training config "
+            f"(models/<TICKER>/<MODEL>/config.yaml) -- not in a --config run "
+            f"file: settings resolve strongest-first as env kwargs > run "
+            f"config > model config > default, and a YAML `null` counts as "
+            f"'unset' rather than 'set to nothing', so the run config is "
+            f"skipped and the model's value wins."
         )
 
 

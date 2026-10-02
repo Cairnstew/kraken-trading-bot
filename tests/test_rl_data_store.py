@@ -762,3 +762,91 @@ def test_missing_vwap_count_still_reads_at_the_narrower_width() -> None:
     assert "trade_count_zscore_20" not in without.columns
     assert "volume_per_trade" not in without.columns
     assert "vwap_dev" in without.columns
+
+
+# ── F3: a run config cannot turn the store OFF (resolution order) ──────────
+#
+# Phase 6 finding F3. `_resolve_env_setting` skips a source whose value is
+# `None`, because YAML `key: null` means "unset". So a run config
+# (`--config`) saying `market_data_store: null` against a model trained
+# with a store resolves to **the model's own store**, not to the live fetch.
+# These tests pin that behaviour directly, because the error message now
+# tells the reader to edit the MODEL's config.yaml and that advice has to
+# be true.
+
+
+def _resolve(name, env_kwargs, run_cfg, record_cfg, default=None):
+    from kraken_trading_bot.rl.backtest import _resolve_env_setting
+
+    return _resolve_env_setting(name, env_kwargs, run_cfg, record_cfg, default)
+
+
+def test_a_run_config_null_cannot_turn_the_store_off_for_a_store_trained_model():
+    """The behaviour the corrected error message now depends on.
+
+    If this ever starts returning ``None`` (live), the message's advice
+    would still be correct but this repo would have gained a way to turn
+    the store off from a run file -- and, more importantly, the resolution
+    order documented in `_resolve_env_setting` would be a lie.
+    """
+    assert (
+        _resolve(
+            "market_data_store",
+            env_kwargs={},
+            run_cfg={"market_data_store": None},
+            record_cfg={"market_data_store": "/m/store"},
+        )
+        == "/m/store"
+    )
+
+
+def test_an_explicit_env_kwarg_does_override_the_models_store():
+    """Source 1 is honoured even when it is ``None`` -- the one real escape."""
+    assert (
+        _resolve(
+            "market_data_store",
+            env_kwargs={"market_data_store": None},
+            run_cfg={"market_data_store": "/run/store"},
+            record_cfg={"market_data_store": "/m/store"},
+        )
+        is None
+    )
+
+
+def test_a_fresh_clone_with_no_model_config_still_goes_live():
+    """The regression the F3 remedy could have caused, pinned explicitly.
+
+    A fresh clone has no model config at all, so source 3 is absent and
+    the shipped default (`null` -> live fetch) must survive untouched.
+    """
+    assert (
+        _resolve(
+            "market_data_store",
+            env_kwargs={},
+            run_cfg={},
+            record_cfg={},
+            default=None,
+        )
+        is None
+    )
+    # ...and an explicit run-config path still wins over the default.
+    assert (
+        _resolve(
+            "market_data_store",
+            env_kwargs={},
+            run_cfg={"market_data_store": "/run/store"},
+            record_cfg={},
+            default=None,
+        )
+        == "/run/store"
+    )
+
+
+def test_the_full_precedence_order_is_still_what_the_message_claims():
+    """env kwargs > run config > model config > default, strongest first."""
+    record = {"market_data_store": "/m/store"}
+    default = "/default/store"
+    assert _resolve("market_data_store", {"market_data_store": "/env/store"}, {"market_data_store": "/run/store"}, record, default) == "/env/store"
+    assert _resolve("market_data_store", {}, {"market_data_store": "/run/store"}, record, default) == "/run/store"
+    assert _resolve("market_data_store", {}, {}, record, default) == "/m/store"
+    assert _resolve("market_data_store", {}, {}, {}, default) == "/default/store"
