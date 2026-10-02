@@ -395,12 +395,29 @@ class FeaturePipeline:
         features = self.compute(df).ffill().fillna(0.0)
         mean = features.mean()
         std = features.std(ddof=0)
+        # Non-finite stats are made finite here rather than trusted.
+        # `normalize` subtracts this mean from EVERY row, so one
+        # non-finite cell anywhere in the frame propagates to the whole
+        # episode and the policy is handed inf/NaN on every step -- the
+        # documented "transform output is an affine image of the
+        # observation" invariant silently inverts.  The builders all emit
+        # NaN rather than inf by construction now, but this is the one
+        # place where the guarantee is enforced instead of assumed: a
+        # column that is still not finite after the observation fill
+        # carries no usable scale, so it normalizes to a flat zero and
+        # says so here, rather than taking the episode down with it.
+        raw_stats: dict[str, tuple[float, float]] = {}
+        for name in features.columns:
+            m = float(mean[name])
+            s = float(std[name])
+            if not np.isfinite(m):
+                m = 0.0
+            if not np.isfinite(s):
+                s = 1.0
+            raw_stats[name] = (m, s)
         stats = NormalizationStats(
             ticker_id=ticker_id or "",
-            stats={
-                name: (float(mean[name]), float(std[name]))
-                for name in features.columns
-            },
+            stats=raw_stats,
             feature_names=list(features.columns),
         )
         self._stats[ticker_id or ""] = stats
@@ -529,16 +546,27 @@ class FeaturePipeline:
     def _add_price_features(
         self, out: pd.DataFrame, close: pd.Series, high: pd.Series, low: pd.Series
     ) -> None:
-        ret = close.pct_change()
-        log_ret = np.log(close / close.shift(1))
+        # ``replace(0, np.nan)`` before every division, as the rest of
+        # this module already does (see ``_add_microstructure_features``,
+        # ``_rsi``, ``_bollinger``): ``pct_change`` divides by the prior
+        # value, so a zero bar yields +/-inf rather than NaN, and inf is
+        # the one value the ffill+fillna(0) observation policy cannot
+        # repair.  A zero bar has no percentage change to report, which is
+        # absence (NaN), not an infinite one.
+        safe_close = close.replace(0, np.nan)
+        ret = safe_close.pct_change()
+        # The NUMERATOR needs the guard too, not just the denominator:
+        # `log(0)` is -inf, so a zero *current* close poisons the column
+        # just as a zero prior close would.
+        log_ret = np.log(safe_close / safe_close.shift(1))
         out["return_1"] = ret
         out["log_return_1"] = log_ret
-        out["range_1"] = (high - low) / close
+        out["range_1"] = (high - low) / close.replace(0, np.nan)
         for w in self.windows:
             sma = close.rolling(w).mean()
-            out[f"return_{w}"] = close.pct_change(w)
-            out[f"log_return_{w}"] = np.log(close / close.shift(w))
-            out[f"price_ratio_sma_{w}"] = close / sma - 1.0
+            out[f"return_{w}"] = safe_close.pct_change(w)
+            out[f"log_return_{w}"] = np.log(safe_close / safe_close.shift(w))
+            out[f"price_ratio_sma_{w}"] = close / sma.replace(0, np.nan) - 1.0
 
     def _add_technical_features(
         self, out: pd.DataFrame, close: pd.Series, high: pd.Series, low: pd.Series
@@ -565,7 +593,7 @@ class FeaturePipeline:
     def _add_volume_features(
         self, out: pd.DataFrame, close: pd.Series, volume: pd.Series
     ) -> None:
-        out["volume_change_1"] = volume.pct_change()
+        out["volume_change_1"] = volume.replace(0, np.nan).pct_change()
         vol_mean = volume.rolling(20).mean()
         vol_std = volume.rolling(20).std(ddof=0)
         out["volume_zscore_20"] = (volume - vol_mean) / vol_std.replace(0, 1.0)
