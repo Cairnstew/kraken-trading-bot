@@ -1,165 +1,263 @@
-# Plan — audit-pipeline IMPROVE-EXISTING pass, 2026-10-01 (post-fix)
+# PLAN — data-pipeline audit pass 2026-10-02 (`IMPROVE-EXISTING`, gap **G1**)
 
-Companion to `VALIDATION.md`, which carries the **GATE verdict: PASS**. The previous
-revision of both files described the pre-fix state; §1 records what changed and §4 replaces
-the "blocking" item the prior plan called out.
+**Architect:** `architect`, team `data-audit-1002`. **Validation:** `reviewer`
+(`VALIDATION.md` carries the **GATE verdict: NEEDS_FIX**).
+**Repo state:** `kraken-trading-bot` @ `3f9708e`; sibling `kraken-funding-rates` @ `935dfc0`.
+
+This supersedes the 2026-10-01 revision, which planned and gated a *different* pass (the
+sparse-exogenous `first_tradable_index` fix). That work is done and stays done; the numbers
+below corroborate it — that pass measured width **60** and **697 bars**, and this pass
+measured width **60** and **697 bars** again, independently, on a different day.
 
 ---
 
-## 1. What changed since the NEEDS_FIX gate
+## 1. What was audited
 
-Five commits on `master`; the fifth is the fix this re-verification gates:
+The claim under audit was the one the whole repo's usefulness rested on:
+
+> *"Exogenous signals ride JSONL seams: news, funding/basis, social"* — **TRUE as code,
+> FALSE in practice.** `AUDIT.md:154`
+
+Three seams exist, all three are well built, and **none was populated**: the two others
+were `null`, and the third pointed at a path under a `signals/` directory that did not
+exist — and was **structurally unreadable even once it did**.
+
+Gap **G1** was that structural unreadability, and it was worse than a dropped column. The
+skipped merge does not only lose the funding columns; it loses `signal_observed` and
+`signal_age_hours` too, because the same seam writes the freshness pair. **The diagnostic
+designed to make the absence auditable inside the observation was itself absent.** Width
+as-shipped (52) was identical to width-with-the-broken-path-configured (52), so
+`check_feature_width` — which checks width, not NaN — could not see it. Nothing downstream
+flagged it, which is why it survived.
+
+## 2. What was built (and it worked)
 
 | Commit | Change |
 |---|---|
-| `a39e184` | `rl`: widen the observation 49 → 55 and guard the width |
-| `28fcfb0` | `tests`: cover the Gap-1 widening end to end, both width probes fixed |
-| `eb3771e` | `configs`: name the funding CLI that actually exists |
-| `8f6ab7b` | `README`: state the real observation widths instead of the fixture's 55 |
-| `b45a7a4` | `rl`: **do not let a sparse exogenous column consume the trading window** |
+| `444fe1f` | audit + research artifacts |
+| `3e0186f` | DECISION committed for worktree teammates |
+| `8569c08` | **G1** — `_resolve_config_path()` on all five path sites; `_SIGNAL_CHANNELS` pairs every key with its producer; `SignalFileNotFoundError` |
+| `3f9708e` | matrix: name a missing signal file instead of reporting `process_failed` |
+| `935dfc0` *(sibling)* | funding records now emit `ticker` = the **spot** pair |
 
-### 1.1 The defect that is now fixed
+Five design decisions in `8569c08` are worth keeping:
 
-A one-record funding file left `spread` NaN on 720/721 rows (the merge seam zero-fills `bid`
-for absence; the microstructure builder computes `(ask - bid) / bid.replace(0, nan)` and
-correctly refuses to invent a spread). `TradingEnvironment._first_valid_index()` selected
-the first row valid on **all** columns, so it picked 720 and every funding-backed episode
-replayed **1 bar with 0 trades** — silently, with the width guard passing because it checks
-width, not NaN. The 143 tests missed it because every fixture populated funding on every
-row, which is the one shape the shipped configuration does not produce.
+1. **One helper for all five path sites** — `data.py` ×2, `train.py` ×1, `export.py` ×2.
+   The second instance of the same tilde bug (`data.py:1054`, `market_data_store`) was
+   silently blocking that path too; fixing it once fixes both.
+2. **Off is now distinct from broken.** A null key is silent, so a fresh clone with no
+   sibling repos still runs on price alone. A *set* key that cannot be used is a
+   configuration error. Verified both directions (`VALIDATION.md` §8.1, §8.2).
+3. **A log with records but no overlap stays a WARNING.** The expected state of a young
+   forward-only log is not a fault; raising there would train the feature off.
+4. **Refusals name the fix.** Key, raw `~`-spelled value, expanded path, producer command —
+   verified present 2× each through the real CLI.
+5. **One channel table for both read legs.** `_SIGNAL_CHANNELS` (`data.py:118`) makes the
+   live-fetch and store-backed legs structurally unable to drift about which key feeds which
+   merge or how a refusal reads.
 
-The fix adds `first_tradable_index()` + `POINT_IN_TIME_EXOGENOUS_COLUMNS` in `rl/features.py`
-and makes **both** `environment.py::_first_valid_index` and `export.py::_warmup_mask`
-delegate to it. The start index now gates on indicator warm-up only; a NaN in a
-point-in-time exogenous column means "no reading on this bar" and is resolved by the
-environment's pre-existing, documented `ffill().fillna(0.0)` policy — which the freshness
-pair exists to keep unambiguous.
+And it fixed a **test** that had been lying: `test named 'config points at a REAL funding
+file'` only asserted the string was non-empty and ended `.jsonl` — it passed for
+`/definitely/not/here/nope.jsonl`, which is exactly why this shipped.
 
-Measured live before/after on the real one-record file (`VALIDATION.md` §2): **1 bar / 0
-trades → 697 bars / 374 trades**, width 60 both sides. Null-funding and no-new-inputs legs
-are unchanged at `_start_index == 24`, so the bug was not traded for a changed warm-up
-semantic.
+## 3. What is BROKEN — needs a scoped fix before this pass closes
 
-Provenance rather than a NaN-pattern heuristic is the load-bearing part: with one record on
-the last bar, `spread` is NaN on rows 0..719 — byte-identical to a 720-bar rolling window,
-so a "leading prefix" test cannot distinguish warm-up from absence.
+### 3.1 The blocking item
 
-### 1.2 The test that pins it
+**`tools/model_matrix.py:1726` swallows the refusal it was written to explain.**
 
-`tests/test_rl_environment.py::test_sparse_funding_coverage_does_not_consume_the_window`
-builds the sparse shape (721 bars, one funding record) and asserts
-`n_bars - _start_index > 0.9 * n_bars` plus a real step loop. Verified **non-vacuous**: with
-only `rl/{features,environment,export}.py` reverted it fails with
-`a one-record funding file left only 1 of 721 bars tradable (start index 720)`. Three
-sibling tests pin the warm-up boundary (24), its invariance across the two legs, and the
-49-width presence-gating path. Suite is **147 passed**, `nix flake check` green.
+```python
+stderr_tail = (err_tr + err_bt).strip().splitlines()[-4:]
+```
 
----
+Train stderr and backtest stderr are concatenated and then truncated to the last 4 lines of
+the whole. When `train` fails, `backtest` also runs and also fails, and *its* output — the
+downstream consequence, "No trained model" — is what lands in the tail. The train leg's
+refusal, the one message that names the fix, is discarded before
+`classify_process_failure` ever sees it. Measured: the refusal is at line 8 of a 10-line
+`err_tr`, 19 lines survive concatenation, the slice keeps 4, and it does not survive.
 
-## 2. What was validated on this re-verification
+Live result: `INVALID: process_failed`, not `signal_file_not_found`.
 
-- **Suite**: 147 passed / 0 failed; `nix flake check --no-build` green (run once).
-- **Live gate scenario**: real keyless one-record funding file, train + backtest at pages 2 /
-  timesteps 3000 / seed 42 / discrete. 697/697 bars, 374 trades, width 60. The pre-fix
-  failure was reproduced on a reverted scratch tree first (1 bar / 0 trades), so the
-  before/after is measured rather than asserted.
-- **Widths**: 49 / 52 / 60 — all three reproduced.
-- **Consumed proof**: the six names reach the model via export CSV, trained
-  `normalization.npz` `feature_names`, and the train log's `Obs features: 60`.
-- **Guard**: proven end-to-end through the real CLI (a 52-wide artifact against a 60-wide
-  frame raises `FeatureWidthMismatchError` and names the eight columns). Untouched by the
-  fix.
-- **Identity**: the 52 pre-existing columns are bit-identical with and without the funding
-  file (`max|delta| = 0.0`, same-frame method).
-- **Baseline**: null-funding control trained and backtested, same seed and budget, 697 bars /
-  298 trades. PPO's cross-run stochasticity is recorded, not papered over.
+**Why it matters in scale, not in principle.** `configs/default.yaml` ships
+`funding_features_file` non-null. So on any checkout without that file — a fresh clone, a
+CI runner, the second machine in DECISION §7 — *every cell of a matrix* fails the same way,
+and the one opaque code explains none of them. The control run proves the shape: the
+identical cell with the record present is `0 invalid, 0 errored`. One line decides whether
+the single fix that would rescue the whole grid is delivered or swallowed.
 
-### Correction the next reader needs (unchanged from the prior plan)
+**Why the test missed it.** `3f9708e`'s
+`test_a_refused_signal_file_is_named_and_not_mistaken_for_another_cause` feeds
+`classify_process_failure(_real_errored(REAL_SIGNAL_FILE_REFUSED))` — a synthetic
+`stderr_tail` built directly. It never runs `cmd_run`, so it never builds the tail that
+broke. The commit's reasoning ("matching is on the message the real CLI prints") is right
+about matching and wrong about **capture**. This is the same class of error as the one
+`8569c08` fixed in the source: *a test that pins the intended value without exercising the
+path that produces it.*
 
-`DECISION.md` §2.1 pins the gate at **55**. That is the width of a *synthetic fixture*
-carrying exactly the six new columns. The width is dynamic because every builder is
-presence-gated; the real numbers are **49 / 52 / 60**. `8f6ab7b` fixed the README; the
-DECISION's "55" should still carry an explicit correction note in a later docs pass so the
-next reader does not gate on it.
+**Fix (one line, verified sufficient):** take the tail **per leg**.
 
----
+```python
+stderr_tail = (err_tr.strip().splitlines()[-4:] + err_bt.strip().splitlines()[-2:])
+```
 
-## 3. What remains: Gap-2, signal QUALITY
+With the refusal present in the tail, `classify_process_failure` returns
+`['process_failed', 'signal_file_not_found']` — confirmed live.
 
-**The fix restored the window; it did not enrich the signal.** These are separate and the
-distinction is the whole point of recording it:
+**And the regression test must pin the capture, not just the classifier.** Assert that
+`err_tr`'s content survives into `record["stderr_tail"]`, ideally by building a record the
+way `cmd_run` builds it from a real train-fails/backtest-fails pair. A second synthetic
+`stderr_tail` would leave this exactly as findable as it was.
 
-| | Before the fix | After the fix |
-|---|---|---|
-| Trading window | 1 of 721 bars | 697 of 721 bars |
-| Bars carrying a funding reading | 1 of 721 | **1 of 721** |
+Not done here — out of scope for a reviewer.
 
-A freshly-configured deployment points at a funding file that covers recent hours only.
-Kraken funding settles ~8-hourly, so at `signal_max_age_hours: 12` a file with one record
-informs exactly one bar of a 721-bar window and the remaining bars observe zeros. That is
-now *honest* rather than *destructive*: `signal_observed` (1.0 on one row) and
-`signal_age_hours` (max 0.0) are in the observation, so the agent can tell "no reading" from
-a genuine zero instead of guessing. But a mostly-zero funding column is a weak signal, and
-three of the six new columns (`funding_rate_prediction`, `vol24h`, `spread`) are currently
-non-zero on 1 bar in 721.
+### 3.2 Non-blocking, worth folding in
 
-Remaining Gap-2 work, in the order I would take it:
+- **`backtest --config` must agree with the model's recorded `action_space`.** `train
+  --action-space discrete` records the override in the model's `config.yaml`, but the YAML
+  you hand `backtest` still says `continuous`, and `action_space` is one of the six keys a
+  backtest config *does* honour — so the first replay fails with `ActionSpaceMismatchError`
+  on a model that is perfectly fine. Documented in the `model-matrix` skill.
+- **Refusal wording asymmetry.** `SignalTickerMismatchError` renders `found` in canonical
+  form (`ETHUSD`) against a request in pair form (`SOL/USD`). Correct, mildly confusing.
+- **`_SIGNAL_COLUMNS` is 19 entries.** RESEARCH-1 reports "3 / 18" and "10 / 18". Anyone
+  re-deriving a denominator should count the tuple.
 
-1. **Make the funding timer actually run long enough to matter.** The shipped
-   `systemd.user` timer (`kraken-trading-bot-funding.timer`, `just funding-timer`) plus the
-   `signal_max_age_hours: 12` setting are the whole mechanism; a file that has been pulling
-   for weeks turns 1/721 coverage into a usable series. This is operational, not code, and
-   it is the cheapest remaining win.
-2. **News and social signals remain unscheduled.** This pass shipped exactly **one** timer.
-   The merge seam and the freshness bound already accept all three files, so scheduling them
-   is configuration, not a new seam.
-3. **Coverage telemetry**, so a thin signal is visible rather than inferred. A count of
-   `signal_observed` per file, logged at merge and recorded in the model artifact, would
-   have surfaced both this pass's defect and the present thinness without anyone having to
-   notice a 0-trade backtest. This is the cheap half of the
-   `data_window` / `feature_fingerprint` provenance item below, and it is now better
-   motivated: the width guard answers "can this model consume this pipeline?", not "did this
-   pipeline receive any signal?".
-4. **`signal_max_age_hours` default.** 12 is a compromise chosen when coverage was ~300/721.
-   It should be re-derived from the timer cadence and the settling interval once the file
-   has run long enough to measure, not carried forward on the strength of one run.
+## 4. Known caveats
 
----
+1. **A fresh clone now needs `just funding-pull` before it can train.** Previously it
+   trained silently on 52 features; now it stops and tells you to run the producer. This is
+   the intended trade — but it is a **behaviour change on the shipped default**, and any CI
+   runner, container or second machine that trains from `configs/default.yaml` will now
+   fail until it either runs the producer or sets the key to `null`. It failed my own
+   matrix run for exactly this reason, which is the best possible evidence that it works.
+   DECISION §7 already lists seeding the file as a documented prerequisite.
+2. **`configs/default.yaml` is only valid for one ticker.** It ships a single, ETH-named
+   `funding_features_file`. Combined with `signal_require_ticker: true` now genuinely
+   filtering (because the record carries `ticker` = `ETH/USD`), a second ticker **raises**
+   `SignalTickerMismatchError` rather than silently merging — the intended direction, and
+   strictly better than the old BTC-onto-ETH merge, but user-visible. A per-ticker
+   `funding_features_file: null` default (opted into per model) would make the shipped
+   config valid everywhere.
+3. **A loud error does not make the signal any better.** It makes its **absence visible**.
+   With a 1-record log, `signal_observed` is true on 13 of 240 bars. This pass establishes
+   that the observation *contains* the signal — not that the signal *predicts*. Nothing
+   here should be quoted as evidence of edge. And `excess_return` was deliberately not
+   asserted, because per G4 it is not resolvable at this design (detection floor 2.82 pp
+   against a 0.25–0.8 pp effect); a gate keyed on it is a coin flip.
+4. **`--pages` buys no depth.** 2, 4 and 8 pages all return 721 bars at 60 min — Kraken's
+   REST ceiling is ~720 candles per pair/interval regardless of page count. Pre-existing
+   and documented in `configs/matrix.example.yaml`; re-measured here. **No gate may assert
+   depth from a page count.**
+5. **`market_data_store` is fixed but unexercised.** `data.py:1054` was the second instance
+   of the tilde bug; `_resolve_config_path` fixed it, and the shipped `null` keeps its
+   pass-through behaviour. But it was validated by call-site inspection, not against a
+   populated store. **Needs a dedicated check the moment a real store exists** — that is
+   also the first thing G3 depends on.
+6. **Single seed.** Everything here is seed 42. `configs/matrix.example.yaml` records PPO
+   swinging 576 → 374 trades on an identical config from the seed alone, so `num_trades:
+   350` is a count, not a stable quantity. Gates should assert `> 0`, never a value.
+7. **Feature width is 60 *today*.** It is a function of `feature_windows` and
+   `feature_groups` as configured. Re-derive from the artifact; never hardcode — which is
+   precisely why 49/52/59/60/67 were all "true" in different documents.
 
-## 4. What was deferred (unchanged, with re-ranking)
+## 5. Deferred — the other gaps, and what each would take next
 
-| Deferred item | Why | Rank for next |
-|---|---|---|
-| **Microstructure recorder** as a NEW-DATA-SOURCE | 3/5 difficulty, needs a new sibling repo + a recorder process. Substantively overlaps this pass (`volume_per_trade` is the bar-scale analogue of `mean_trade_size`; `vwap_dev` overlaps `vwap_pressure`). `RESEARCH-3` frames it as the fallback. | **Runner-up. Next NEW-DATA-SOURCE.** Its genuinely-new scalars (taker side split, `realized_spread_bps`) are the justification. Must use `realized_spread_bps`, never compete for `spread` — `_SIGNAL_BUILDER_INPUT_COLUMNS` reserves that name and a future recorder must not become a second writer. |
-| **`order_book_imbalance`** (+1) | Needs the `bid_vol`/`ask_vol` producer — Gap-3 / recorder territory. `_add_microstructure_features` already has the branch. | With the recorder. |
-| **`mark_price` / `index_price`** | `DECISION.md` §2.1's borderline internal runner-up. `basis = (mark − index)/index` is already merged, so the incremental information is marginal. The sibling does emit both. | If the interface budget ever permits, they ride the same `_SIGNAL_COLUMNS` edit and the same retrain. Not required by any gate. |
-| **`until` clip fix** | Independent defect, orthogonal to this pass. | Unchanged priority; small. |
-| **`data_window` / `feature_fingerprint` provenance** | `n_features` shipped (a width). A *fingerprint* — which inputs were live, and how many bars carried a reading — is what would have caught this pass's own defect automatically. The failure was a provenance gap: nothing recorded that 720 of 721 funding bars were zero-filled. | **Strongly justified, now for a second reason** — see §3.3, which is the cheap version of it. |
-| **Provenance of `vwap`/`count` themselves** | **Next NEW-DATA-SOURCE**, and the one that most directly improves signal quality: `vwap_dev` / `trade_count_zscore_20` / `volume_per_trade` currently depend on the exchange feed happening to carry `vwap`/`count`. The live Kraken OHLC endpoint does return them — which is why widths 52/60 are reachable at all, and a venue that omits them drops to 49 — so this is durability of the pass's own gains, not a new signal. | After the recorder, or before it if a second venue is ever planned. |
+All eight were audited in `AUDIT.md`; RESEARCH-1/2/3 corrected it six times. G1 was chosen
+as the smallest honest change with the highest leverage. What each remaining gap costs:
 
----
+### Runner-up #1 — **G4: make measurement power a number, not a literal**
 
-## 5. Follow-ups that did not block the gate
+`tools/model_matrix.py:230` hard-codes `MIN_REPLICATES_FOR_A_CLAIM = 3` and never compares
+it against any **observed** spread. The harness documents in its own words why a fixed 3
+isn't enough (576 → 374 trades on an identical config).
 
-- **Sibling ticker field**: `kraken-funding-rates` writes `spot_pair`, not `ticker`, so the
-  seam logs a WARNING and merges every record as an explicitly one-ticker file. Documented,
-  correct behaviour — but it means `signal_require_ticker: true` cannot be satisfied by that
-  producer. A producer-side field rename would enable the per-ticker filter;
-  consumer-side is unaffected either way.
-- **DECISION.md §2.1's "55"**: add the correction note (§2 above).
-- **EFFICIENCY-PROPOSALS**: none this run — the pass was one test run, one flake check, a
-  live train/backtest pair and a targeted revert experiment, with no repeated multi-call
-  pattern worth collapsing.
+**Next:** ~30–60 lines, **no new runs**. Compute an observed spread per config group from
+the records already in the JSONL, compare it to the effect being claimed, and turn "3 seeds"
+into "the seeds you have resolve this effect". RESEARCH-3 §8.3 sizes it. **No gate can be
+keyed on `excess_return` until this lands** — which is why the G1 gate was written to
+assert names, widths and bar counts instead. *This is the highest leverage per line left,
+and it is the prerequisite for ever answering "is the signal worth trading".*
 
----
+### Runner-up #2 — **G3: lift the ~721-bar cap**
 
-## 6. What the defect still teaches about the audit framing
+Swap `kraken-deep-history`'s seeder to Kraken's own OHLCVT bulk archive (free, public, no
+key). **Unblocked by this pass at zero extra cost** — `data.py:1054` was the last blocker
+and `8569c08` fixed it as a side effect of the shared helper.
 
-The width guard did its job exactly as designed: it caught a **stale artifact against a
-widened pipeline** and refused it loudly, and after the fix it still does. What it cannot
-catch — before or after `b45a7a4` — is a model and a pipeline that agree perfectly on width
-(60 vs 60) while the *data* behind those 60 columns is 99.86% zero-fill. The fix addresses
-the consequence (the window was consumed); it does not address the condition (the signal is
-thin). Provenance — a count of live readings per column, recorded with the model — is the
-mechanism that turns the second from something a reviewer has to notice into something the
-pipeline asserts. That is Gap-2 work, and it is the natural next pass.
+**Next:** a research pass to confirm archive coverage and rate limits, then a seeder swap.
+Caveat from RESEARCH-3: **G5 must land with it, not after it** (below). And note DECISION's
+correction — σ(L) ∝ √L, so depth buys σ *measurement*, not σ reduction; a longer window is
+a **noisier** read. Depth is worth having for resolution, not for certainty.
+
+### Runner-up #3 — **G2-R1: `vwap_close_gap_zscore_20` + `count_per_range`**
+
+Two derived columns from data the OHLCV frame **already carries** (`vwap`, `count`) — no
+new source, no new network dependency. **Next:** ~2 columns in `features.py` plus a width
+test. Cheap; do it in the same pass as anything else that touches the feature pipeline,
+because every width change invalidates every artifact in `models/`.
+
+### Runner-up #4 — **G2-R2: a `kraken-microstructure` sibling** (`NEW-DATA-SOURCE`)
+
+`/public/Depth` never was, and `/public/Spread` is **not backfillable** (RESEARCH-2 §1.2 —
+the audit's Depth-vs-Spread contrast is half wrong; the real asymmetry is Depth vs Trades).
+Building it before G3's venue hazard is fixed would repeat the mistake, and this pass's own
+§4.4 is the cautionary example: every cell of a matrix fails the same way for one missing
+file. **Do not build until G3 + G5 land.**
+
+### The rest
+
+- **G5 — retry/backoff/partial-failure on every fetch path.** `data._page_candles` is a bare
+  loop with no `try`, no backoff, no resumption; one transient 5xx aborts `train`,
+  `backtest` and `paper-trade` mid-read. The *sibling* producers already document
+  retry/backoff-on-429 — this repo is the weaker half of the pipeline. RESEARCH-3's stated
+  **precondition** for any G3 push-down: it must land *with* G3, not after.
+- **G6 — the exogenous channel is forward-only.** The funding service file says so itself:
+  "it is a log, not state". The exogenous channels therefore have **no history before the
+  log's start**, which is the structural reason no Phase 6 gate for G3/G4 can be written
+  yet. Closing it means a backfill producer, i.e. work in the sibling repos.
+- **G7 — `--ticker` is a blind `_`→`/` substitution.** `USD_SOL` produces
+  `Unknown Kraken pair: 'USD_SOL'` from Kraken instead of a config error naming base/quote.
+  Confirmed again this pass (`ETH_USD` works, `USD_SOL` does not). **Next:** validate
+  against `AssetPairs` before the first fetch and name the reversal in the error.
+- **G8 — walk-forward is unreachable.** `reset(options=...)` is ceremonial ("Unused;
+  reserved for future start-bar overrides"), and three episode-slicing mechanisms coexist.
+  Without walk-forward, σ_win is not measurable at all, which is the other half of why G4
+  is the runner-up.
+
+## 6. Next steps, in order
+
+1. **Dispatch the §3.1 fix** — one line in `tools/model_matrix.py:1726`, plus a test that
+   pins the *capture*. Re-run the two matrix specs in `VALIDATION.md` §8.3 and require
+   `signal_file_not_found` on the failing cell and `0 invalid, 0 errored` on the control.
+   This is the only thing standing between this pass and **PASS**.
+2. **Add the §3.2 skill note** on `backtest --config` vs. recorded `action_space`, and
+   correct the `model-matrix` skill's invalid-cell table with the capture lesson.
+3. **Decide the fresh-clone posture** (§4.1): either ship `funding_features_file: null` as
+   the default and document `just funding-pull` as opt-in, or keep the loud default and
+   accept that every non-ETH environment must act. The current loud default is defensible
+   for a personal repo and wrong for CI. *Your call — I would keep it loud and add the file
+   to any CI setup explicitly.*
+4. **Exercise `market_data_store` end to end** (§4.5) the moment a real store exists. That
+   is the last unverified path this pass touched, and it is G3's entry point.
+5. **Then G4** — it is the only gap that changes what any future gate can assert.
+6. **Then G5 + G3 together**, never G3 alone.
+
+## 7. What a future gate may and may not assert
+
+Derived from this pass, so it does not have to be rediscovered:
+
+| assert | verdict |
+|---|---|
+| `n_features` / `n_bars` / `num_trades` **as counts** | **yes** — `> 1`, `> 0` |
+| the 7 names **by name** in `normalization.npz` | **yes** — and null the key to prove it |
+| `signal_observed` **present** and `.any()` | **yes** — never `== 0.0`, which asserts the bug |
+| `signal_age_hours` present | **yes** |
+| null-key train returns rc=0 **and** logs no signal word | **yes** — the false-failure guard |
+| unresolvable key names key + raw + expanded + producer | **yes** |
+| that cell classifies as `signal_file_not_found` | **yes** — *currently false* (§3.1) |
+| `n_bars` consistent with the span | **yes** — 697 = 721 − 24 warm-up; `--pages` is not depth |
+| width equals a hardcoded number | **no** — re-derive; 49/52/59/60/67 were all "true" |
+| depth implied by `--pages` | **no** — 2/4/8 pages all give 721 bars |
+| `excess_return` sign or magnitude | **no** — G4 detection floor 2.82 pp vs a 0.25–0.8 pp effect |
+| a specific `num_trades` value | **no** — seed swing is 576 → 374 |
