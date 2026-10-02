@@ -45,6 +45,30 @@ _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 # the observation fill already knows how to repair it.
 _NON_FINITE_INPUTS = [0.0, np.inf, -np.inf]
 
+# The **infinity-only** subset, for the one site where zero is data.
+#
+# ``_NON_FINITE_INPUTS`` includes ``0.0`` because zero is a *division
+# hazard*: it makes a denominator ``0`` and a ratio undefined, so it is
+# absence in the same sense a NaN is.  That reasoning is specific to a
+# computed ratio, and it does **not** transfer to a passthrough column.
+# :meth:`FeaturePipeline._add_signal_columns` copies exogenous columns
+# straight through with no arithmetic at all, and two of them use zero and
+# a negative sentinel as *load-bearing data*:
+# ``signal_observed`` is 0.0/1.0, and ``signal_age_hours`` carries
+# ``-1.0`` for "no reading" (``data._NO_SIGNAL_AGE``).  Those are exactly
+# the two columns that exist so a zero-filled value can be told apart
+# from a genuine 0 -- see the ``_SIGNAL_COLUMNS`` comment above.  Mapping
+# their 0.0/-1.0 to NaN erases that distinction and lets
+# ``ffill().fillna(0.0)`` re-flatten it, which is what broke three
+# freshness/signal regression tests when this list was first used here.
+#
+# What still applies at a passthrough column is the infinity argument, and
+# it applies just as strongly: an infinity arrives from the same sources
+# (a store row, a parse of an empty field, a corrupt CSV) and is the one
+# value the observation fill cannot repair.  So this site guards +/-inf
+# and leaves 0.0 and -1.0 alone.
+_NON_FINITE_INPUTS_NO_ZERO = [np.inf, -np.inf]
+
 # Columns added by :func:`merge_extra_features` in ``data.py`` (which
 # imports this tuple — this module is the single canonical source so the
 # allow-list cannot drift between the merge seam and the observation).
@@ -966,12 +990,22 @@ class FeaturePipeline:
         files and from ``data.add_derived_ohlcv_features``
         (``vwap_dev``, ``volume_per_trade``, ``trade_count_zscore_20``),
         so no guard inside this module can have run before they arrive.
+
+        Only ``+/-inf`` is mapped.  **Not** zero: ``signal_observed`` is
+        0.0/1.0 and ``signal_age_hours`` carries a ``-1.0`` "no reading"
+        sentinel, so zero is a load-bearing value in exactly the columns
+        that let a zero-filled cell be told apart from a genuine 0.
+        Nothing here divides, so the zero-is-a-denominator reasoning that
+        motivates ``_NON_FINITE_INPUTS`` does not apply; see
+        ``_NON_FINITE_INPUTS_NO_ZERO``.
         """
         for col in _SIGNAL_COLUMNS:
             if col in _SIGNAL_BUILDER_INPUT_COLUMNS:
                 continue
             if col in df.columns:
-                out[col] = df[col].astype(float).replace(_NON_FINITE_INPUTS, np.nan)
+                out[col] = df[col].astype(float).replace(
+                    _NON_FINITE_INPUTS_NO_ZERO, np.nan
+                )
 
     # ------------------------------------------------------------------
     def n_features(self) -> int:
