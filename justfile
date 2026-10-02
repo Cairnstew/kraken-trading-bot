@@ -243,12 +243,30 @@ store-stats *ARGS="":
 
 # Gap-scan one source for missing bars. Exits non-zero when the window is
 # not contiguous, which is the check to run before trusting a pinned
-# window: a hole inside the training slice is a silent bias. Everything is
-# passed straight to the sibling CLI (which requires --ticker).
+# window: a hole inside the training slice is a silent bias.
+#
+# Both tools get the SAME ARGS. The sibling seeder owns the contiguity
+# verdict and its exit code; `tools/store_gap_scan.py` (Phase 6 finding
+# F6) then counts the missing bars, lists the gaps, and **names any gap at
+# the seed/live-append seam** -- the month-file boundary where the archive
+# seed ends and this repo's live append leg takes over, which is the region
+# a live deployment actually trades. It detects and labels only; the fix is
+# CAND-3b.
+#
+# `set -e` is deliberately NOT used: the seeder's verify exits non-zero
+# precisely when the series has gaps, which is exactly when the gap report
+# matters most. Both commands must run; the seeder's status is what this
+# recipe returns.
 # e.g. just store-verify --ticker ETH/USD --interval 60
 #      just store-verify --ticker ETH/USD --since 2020-01-01 --until 2026-01-01
 store-verify *ARGS="":
+  #!/usr/bin/env bash
+  set -uo pipefail
+  root="{{justfile_directory()}}"
   {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli verify --store {{store_root}} {{ARGS}}'
+  status=$?
+  {{dev}} 'python '"$root"'/tools/store_gap_scan.py --store {{store_root}} {{ARGS}}' || true
+  exit "$status"
 
 # ── Tests / checks ───────────────────────────────────────────────────────
 

@@ -167,6 +167,21 @@ signal_require_ticker: true
 # into an error, for a store that clone does not have. The flip belongs in
 # a per-model `config.yaml` or in `configs/deep-history.example.yaml`,
 # which is why those files carry the header explaining how to seed first.
+#
+# KNOWN LIMITATION OF A SEEDED STORE — read before trusting a store-arm
+# number. The store reader globs the month files and concatenates, so a
+# hole in the series is invisible downstream: features are computed on BAR
+# COUNTS, not wall-clock. Measured on the shipped ETH/USD 60m store: 158
+# missing bars across 28 gaps, largest 39h, including a 38-bar hole at the
+# SEED/LIVE-APPEND SEAM (2026-08-31 23:00 → 2026-09-02 14:00) — the
+# month-file boundary where the archive seed ends and this repo's live
+# append leg takes over, i.e. the region a live deployment trades. Across
+# that hole `return_1` reports a 39-hour return as though it were 1-hour,
+# and the 24-row warm-up can span more than a day. No guard here can catch
+# it: every value is finite and correctly computed from the rows given.
+# Run `just store-verify` — it counts the missing bars, lists the gaps and
+# names any seam hole. DETECTED AND LABELLED, not fixed; the real fix is
+# time-aware feature windows over a reindexed bar grid (DECISION.md §14).
 market_data_store: null
 
 # --- Store venue provenance (label only) ---------------------------------

@@ -298,6 +298,19 @@ def _resolve_env_setting(
     A source that *has* the key set to ``None`` is skipped rather than
     honoured, because YAML ``key: null`` is how a config says "unset",
     not "set to nothing".
+
+    Consequence worth knowing, because it surprised a reader and cost a
+    Phase 6 finding: **a run config cannot turn a setting OFF.** For
+    ``market_data_store`` in particular, ``--config`` with
+    ``market_data_store: null`` against a store-trained model resolves to
+    the store, because source 3 (the model's own ``config.yaml``) is the
+    one that holds the path.  The remedy is therefore to edit the MODEL's
+    ``models/<TICKER>/<MODEL>/config.yaml``, which is what
+    :class:`~kraken_trading_bot.rl.data.MarketDataStoreUnavailableError`
+    now tells the reader.  See ``tests/test_rl_data_store.py`` for the
+    pinned behaviour.  ``env_kwargs`` (source 1) *is* an explicit
+    override and is honoured even when ``None``, but it is a Python-side
+    argument, not something a YAML file can express.
     """
     if name in env_kwargs:
         return env_kwargs[name]

@@ -543,11 +543,21 @@ Two further facts that fall out of the measurement:
   live arm it yields **0 train / 0 eval**. The store is a *precondition* for pinning, not an
   optional extra.
 - **The store flip is not deliverable without the non-finite guard** (`bfe32aa`). The seeded
-  archive carries a zero-volume bar at each partial-month boundary (4 across the store); `pct_change`
+  archive carries 4 zero-volume bars; `pct_change`
   turns it into `inf`, which the documented `compute → ffill → fillna(0)` policy cannot repair, and
   one such bar inside the training slice poisoned all 36,804 rows and killed PPO. **The live arm was
   unaffected** (721 Kraken bars contain no zero-volume bar), so this was invisible until the store
   was switched on.
+  > **CORRECTION (2026-10-02, Phase 6 finding F4) — the diagnosis above was wrong, the
+  > finding was not.** The original wording here read "a zero-volume bar at each partial-month
+  > boundary", implying a Binance monthly-file artifact. That is **factually false**: all 4 bars are
+  > **mid-month**, **0 of the 106 month-first bars** in the archive are zero-volume, and 2 of the 4
+  > (`2020-12-21 14:00`, `2021-02-11 03:00`) sit *immediately before* a missing-bar gap. They are
+  > **exchange-outage no-trade bars** (`2019-06-07 21:00`, `2020-12-21 14:00`, `2021-02-11 03:00`,
+  > `2023-03-24 12:00`) — a data-integrity problem in the upstream exchange feed, not a
+  > month-partitioning artifact. The **symptom, the non-finite guard and the requirement are
+  > unchanged**; only the attributed cause was wrong. Git history is left intact deliberately —
+  > `bfe32aa`'s commit message still carries the old wording.
 
 ---
 
@@ -698,80 +708,61 @@ became possible at all.*
 
 ---
 
-## 14. COST-AWARE GATE RESULT (Phase 7) — and a correction to §13.1's own prediction
+## 14. KNOWN LIMITATION — features are computed on bar counts, not wall-clock
 
-Run by `reviewer-cost`. **Parameters applied unchanged**, as pre-registered: threshold read from
-the shipped module (`tools/model_matrix.py:376`) and `assert`ed equal to 1.0 at scoring time, not
-passed as a literal; cost basis `fee_rate: 0.0026` / `slippage: 0.0005`; estimator the shipped
-`pooled_within_spread` + `dispersion_verdict`; ticker `ETH_USD`, seeds 42/43/44, `timesteps` 10000;
-**no retraining** — only the backtest leg re-run. §9A.1 two-separate-matrices method.
+**Status: DETECTED AND LABELLED, NOT FIXED.** Recorded 2026-10-02 from Phase 6 finding F6.
+**This section is a standing caveat on every number computed from the store arm.**
 
-### 14.1 The gate, at Kraken taker costs
+### 14.1 What was measured
 
-| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
-|---|---|---|---|---|---|---|
-| `excess_return` (headline) | −12.44% | −341.22% | 3.97% | 328.79pp | **82.91** | **RESOLVED** |
-| `total_return` | −5.26% | −99.76% | 3.89% | 94.51pp | **24.29** | **RESOLVED** |
-| `sharpe` | −0.719 | −4.976 | 1.404 | 4.257 | **3.03** | **RESOLVED** |
-| `max_drawdown` | 8.51% | 99.85% | 1.69% | 91.34pp | **53.91** | **RESOLVED** |
+`just store-verify` now runs `tools/store_gap_scan.py` alongside the sibling seeder's own
+contiguity check. On the shipped ETH/USD 60-minute store (106 month files):
 
-**§13.1's framing held:** `RESOLVED` here is a statement about **cost sensitivity**, not about
-model quality or data depth. Both arms are cost-dominated to a loss; the store arm's larger
-notional churn simply drives it further under the floor.
+| | |
+|---|---|
+| bars present | **76,564** (was 76,563 at Phase 6 review; the live append leg adds ~1 bar per run) |
+| span | `2018-01-01T00:00Z` → `2026-10-02T17:00Z`, **76,721 hours** |
+| **missing bars** | **158** across **28 gaps** (157 at review time; the +1 is the live leg) |
+| largest gap | `2026-08-31 23:00` → `2026-09-02 14:00` — **38 missing bars**, spanning **39 elapsed hours** |
+| other gaps | 32 (2018-02, off-grid boundary), 10 (2018-06-26), 10 (2019-05-15), 8 (2019-08-15), 7 ×2, 6, … |
 
-### 14.2 The strategy loses money in BOTH arms, in all six cells
+**Units, because this gap has already been reported both ways and read as a contradiction:**
+*38 missing bars* and *39 hours* are both correct. `N` missing bars means the two surviving bars
+are `N+1` steps apart.
 
-| arm | seed | trades/bar | total return | final equity |
-|---|---|---|---|---|
-| live | 42 / 43 / 44 | 0.822 / 0.839 / 0.811 | −5.26% / −9.38% / −1.87% | $9,474 / $9,062 / $9,813 |
-| store | 42 / 43 / 44 | 0.606 / 0.700 / 0.878 | **−99.76% / −99.88% / −91.82%** | **$23.68 / $12.03 / $818.02** |
+### 14.2 Why it matters
 
-The policy re-enters roughly every 1.2 bars in **both** arms. Notional cost at 31 bp on a $10,000
-book is ~$1.8 per live seed and $144–$208 per store seed; the store arm pays ~145× more in
-absolute cost while replaying 110× more bars.
+Every feature in `features.py` is computed over a **window of rows**, and the environment's
+`start_index = 24` skips 24 **rows**:
 
-**Stated plainly, as §13.3 required: this strategy loses money after costs in both arms.** The
-store arm loses catastrophically (99.85% max drawdown — a wipeout, not a drawdown statistic).
-**No "store arm improved" claim is made in either direction.** What CAND-3a delivered is unchanged
-and orthogonal to these numbers: *an out-of-sample measurement became possible at all.*
+- `return_1` reports the return between whichever two rows happen to be adjacent. Across the
+  39-hour seam that is a **39-hour return presented as a 1-hour return**.
+- `sma_24`, `rsi_24`, `obv_slope_24` and `bollinger_24` span 24 rows that may cover **more than
+  a day**.
+- After z-scoring, a 39-bar jump is indistinguishable from a 1-bar jump. **No guard in this repo
+  can detect it**, because every value involved is finite and correctly computed from the rows it
+  was given. Only the timestamps know.
 
-### 14.3 The two previously-RESOLVED rows, re-derived
+**The 38-bar hole is at the seed/live-append seam**, in the most recent month: the month-file
+boundary where the Binance-archive seed ends and this repo's live append leg takes over. That is
+precisely the region a live deployment trades, so the hole is not confined to the training slice.
+The tool labels that gap **by name** (`seed/live-append seam`) and flags it on its own line.
 
-| metric | frictionless | cost-aware | survives as verdict? | survives as evidence? |
-|---|---|---|---|---|
-| `sharpe` | RESOLVED 1.298 | RESOLVED 3.033 | **yes** | **NO — the sign of the gap FLIPS** (+1.005 higher frictionless → 4.257 lower under costs; every cell negative) |
-| `max_drawdown` | RESOLVED 10.79 | RESOLVED 53.91 | **yes** | **NO — magnitude inflates 5× on a larger numerator, not more signal** |
+### 14.3 What was deliberately NOT done
 
-### 14.4 CORRECTION — §13.1's pre-registered magnitude prediction was wrong
+**No reindexing, no interpolation, no gate.** `store_gap_scan.py` detects and labels; it does not
+repair and does not fail the run. Adding a hard failure would have broken the store arm on data
+that is otherwise usable, which is a bigger decision than a bug-fix pass should make.
 
-§13.1 predicted `excess_return` would land at ratio **≈1.4** (pooled IQR ~11.7pp against a
-16.24pp gap). Measured: pooled IQR **3.97pp**, gap **328.79pp** → ratio **82.91**, ~59× the
-prediction.
+### 14.4 The real fix, and why it is not called CAND-3b
 
-**The error was mine, in the pre-registration itself:** §13.1 held the *gap* fixed at its
-frictionless value while swapping in a cost-aware *pooled IQR*. But the gap is the variable that
-moved most — 16.24pp frictionless → 328.79pp cost-aware, because the store arm's return travels
-−322pp. Holding one side of the ratio constant across a change that moves it 20× is not a valid
-projection.
+The fix is to compute features over a **reindexed, gap-filled bar grid**, so a window means N
+*hours* rather than N *rows* — i.e. make the windows time-aware and decide explicitly what a
+window spanning a gap means (hold last value, or mask the row).
 
-**The verdict is unaffected**: 1.4 and 82.91 sit on the same side of a threshold that was fixed
-and committed beforehand. **The threshold was not touched to reconcile this**, and the discrepancy
-is recorded rather than quietly adopting the smaller number. What the pre-registration did buy —
-the *direction* call, and the rule that `RESOLVED` is not a claim the store helps — both held.
-
-### 14.5 Frictionless control (labelled DIAGNOSTIC — not a seed-variance measurement)
-
-| metric | live median | store median | pooled IQR | gap | ratio | verdict |
-|---|---|---|---|---|---|---|
-| `excess_return` | −2.90% | −16.67% | 439.32% | 13.77pp | 0.031 | NOT SEPARATED |
-| `total_return` | +4.27% | +224.86% | 439.23% | 220.59pp | 0.502 | NOT SEPARATED |
-| `sharpe` | +0.620 | +1.625 | 0.774 | 1.005 | 1.298 | RESOLVED |
-| `max_drawdown` | 4.80% | 66.97% | 5.76% | 62.17pp | 10.79 | RESOLVED |
-
-Control fidelity vs §9A.2: the store arm reproduces almost exactly (+224.86 / +52.98 / +1800.10 vs
-recorded +225.13 / +53.17 / +1800.10; ratio 0.031 vs 0.037). **The live arm drifts slightly**
-(+4.27 / −1.14 / +8.65 vs +4.07 / −0.44 / +8.87) because it re-fetches a **rolling** REST window —
-`n_bars` held at 697 and trades within 2 of recorded, so the window rolled a bar or two.
-**A live-arm backtest cannot be replayed bit-identically across days; a store-backed one can.**
-Store `n_bars` drifted 76,538 → 76,540 (+2), the same direction as the 76,562/76,561 discrepancy
-and consistent with the live-upsert-leg hypothesis (F5).
+**It is not called CAND-3b here on purpose.** `CAND-3b` is **already taken** in this document:
+§10.4 defines it as `since`/`until` push-down plus a venue label in `_meta.json` — a ~21-line,
+store-only **efficiency** item, explicitly DEFERRED as not load-bearing (whole-store read 0.142 s
+vs windowed 0.010 s). Reusing that id for a correctness fix would be the same false-claim failure
+this pass exists to remove, so this item needs its own registration before it is referred to by
+id. *Raised with the lead rather than invented here.*

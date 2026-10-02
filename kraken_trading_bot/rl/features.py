@@ -29,7 +29,10 @@ _FEATURE_GROUPS = ("price", "technical", "volume", "microstructure", "signals")
 # ``.replace(0, np.nan)`` convention.
 #
 # **Zero** was the original case (the seeded Binance archive's
-# partial-month bars) and is still the common one.  **+/-inf** joins it
+# exchange-outage no-trade bars -- corrected 2026-10-02, they were first
+# misattributed to "partial-month boundaries"; 0 of 106 month-first bars
+# are zero-volume and all 4 are mid-month) and is still the common one.
+# **+/-inf** joins it
 # because it reaches a frame by exactly the same routes -- a store row, a
 # parse of an empty field on the wire, a corrupt CSV export -- and every
 # conclusion below applies identically: a ``pct_change``/``log``/ratio
@@ -287,7 +290,8 @@ class NonFiniteFeatureError(ValueError):
             f"cannot repair, and because fit() subtracts the mean from "
             f"every row, one bad cell takes the whole episode with it. "
             f"Check the source frame for zero-volume or zero-price bars "
-            f"(a store's partial-month rows carry exactly that), and for "
+            f"(a store seeded from exchange outages carries no-trade bars "
+            f"that look exactly like that), and for "
             f"exogenous signal columns carrying NaN/inf; the builders now "
             f"map those to NaN themselves, so a column named here is one "
             f"that arrived already non-finite."
@@ -790,6 +794,37 @@ class FeaturePipeline:
         # (`sma`/`ema`/`rsi`/`macd`/`bollinger`/`atr`), which no
         # per-expression guard reaches.
         #
+        # WHAT THE SEAM ACTUALLY BUYS, measured on pandas 3.0.4 -- and it is
+        # not infinity suppression, which is what this comment used to
+        # claim.  The two pandas aggregations disagree about non-finite
+        # input, and neither one produces an infinity:
+        #
+        # * ``rolling(w)`` **masks** the bad value to NaN, so the bad bar
+        #   and its whole window read NaN and the contamination is visible.
+        # * ``ewm()`` **skips** the bar entirely and carries on, returning a
+        #   value that is finite *and wrong* (0 infinities, 0 NaNs).
+        #
+        # So `sma`/`bollinger` would have masked an infinity anyway, and no
+        # `isinf` assertion can ever observe this seam.  What it does buy is
+        # on the **zero** path: `_NON_FINITE_INPUTS` contains `0.0` as well as
+        # the infinities, and a zero price is reachable in real OHLCV.  With
+        # the seam a zero price makes its window read NaN (or the module's
+        # documented neutral constant); without it the zero enters the window
+        # as a real number and the rolling group reports a plausible, finite,
+        # completely wrong answer -- measured on a 400-bar frame with one zero
+        # price: `sma_4` 91.41 for a ~122 price, `bb_lower_4` **-14.14**,
+        # `bb_width_4` **2.3094**, `rsi_4` **0.2979**, `atr_4` **30.87**
+        # against a healthy 0.487.  A -83% price print and a 63x range spike,
+        # silently, as model input.
+        #
+        # KNOWN GAP, not fixable here: because `ewm` returns a finite wrong
+        # number rather than a NaN, the `ema`/`macd`/`rsi`/`atr` families
+        # survive a skipped bar and `_require_finite` cannot see it.  That
+        # hazard is pinned by
+        # ``tests/test_feature_nonfinite_guards.py::
+        # test_rolling_masks_but_ewm_skips_a_non_finite_price_this_guard_cannot_see``
+        # and fixing it is out of scope for this pass.
+        #
         # ``volume`` is deliberately NOT sanitized here.  A zero-volume
         # bar is a *valid reading* -- it is information, and
         # `volume_zscore_20`/`obv` are right to model it as such -- so the
@@ -1050,10 +1085,22 @@ def _rsi(close: pd.Series, period: int) -> pd.Series:
     ``100 - 100/(1+inf)`` would be 100.0 rather than the 100.0 the
     ``fillna`` then produces anyway -- so the guard is cosmetic for the
     all-gains case and load-bearing for the both-sides-zero case, where
-    ``fillna`` supplies the neutral 50.0.  No infinity guard on
-    ``avg_gain`` is needed: pandas' ``ewm`` masks a non-finite input as
-    NaN (measured), so an infinite close yields a NaN RSI rather than an
-    infinite one.
+    ``fillna`` supplies the neutral 50.0.
+
+    No infinity guard on ``avg_gain`` is needed, but not for the reason
+    previously documented here.  That comment claimed pandas' ``ewm``
+    "masks a non-finite input as NaN"; measured on pandas 3.0.4 it does
+    not -- ``ewm`` **skips** the bar and returns a finite value.  The
+    conclusion still holds by a different route: ``compute``'s seam maps a
+    non-finite close to NaN *before* ``diff()`` runs, so ``gain``/``loss``
+    never see an infinity, and a NaN input makes ``rs`` NaN, which
+    ``fillna(50.0)`` then maps to the neutral reading.
+
+    The residual hazard is that ``ewm`` never yields a NaN of its own: a
+    bar skipped by the recursion leaves a *finite, wrong* RSI behind, and
+    ``fillna`` cannot distinguish it from a genuine one.  The seam is what
+    keeps that unreachable from here.  See the module-level note in
+    ``compute`` for the measurements.
     """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
@@ -1096,9 +1143,21 @@ def _bollinger(
       price is exactly at the band centre.
 
     Neither needs an infinity guard: ``mid``/``std`` come from pandas
-    rolling aggregations, which propagate a non-finite input as NaN
-    (measured), so the numerators are finite whenever the denominators
+    rolling aggregations, and pandas' ``rolling`` **masks** a non-finite
+    input to NaN rather than propagating it as an infinity (measured on
+    pandas 3.0.4), so the numerators are finite whenever the denominators
     are.
+
+    That masking is pandas' behaviour, not this module's guarantee, and it
+    is worth being precise about what it does and does not buy: it stops
+    the bad *value* escaping, but the poisoned window then reads NaN rather
+    than unknown-and-flagged, and it is the reason a caller reaching
+    ``_bollinger`` directly with an unsanitized series gets NaN bands
+    without any error.  The seam in ``compute`` is still what keeps a
+    **zero** price -- also in ``_NON_FINITE_INPUTS``, and far likelier in
+    real data -- out of ``mid`` in the first place; without it a zero
+    produces a finite, wrong band (``bb_lower_4`` -14.14, ``bb_width_4``
+    2.3094 measured) that ``_require_finite`` cannot reject.
     """
     mid = close.rolling(period).mean()
     std = close.rolling(period).std(ddof=0)
@@ -1118,9 +1177,18 @@ def _atr(
 
     No division and no log anywhere in here: ``tr`` is a ``max`` of three
     differences and the average is an ``ewm``.  Finite inputs therefore
-    give finite outputs, and a non-finite input gives a NaN (pandas'
-    ``ewm`` masks it, measured) rather than an infinity -- which the
-    observation fill then repairs.  Safe by construction.
+    give finite outputs, so nothing here can emit an infinity.
+
+    A non-finite input does **not** give a NaN, though.  This docstring
+    previously said it did, on the grounds that "pandas' ``ewm`` masks it,
+    measured" -- measured on pandas 3.0.4, ``ewm`` **skips** the bar
+    instead, returning a finite value with no NaN anywhere.  ``compute``'s
+    seam is what actually protects this function: it maps a non-finite
+    close/high/low to NaN first, and ``DataFrame.max(axis=1)`` then skips
+    the NaN rows, so ``tr`` is finite across the bad bar.  Without the seam
+    a zero price (also in ``_NON_FINITE_INPUTS``) inflates ``tr`` to 30.87
+    against a healthy 0.487 -- finite, 63x wrong, and invisible to
+    ``_require_finite``.
     """
     prev_close = close.shift(1)
     tr = pd.concat(
