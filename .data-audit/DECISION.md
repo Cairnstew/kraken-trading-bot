@@ -1,771 +1,660 @@
-# DECISION — data-pipeline audit pass 2026-10-02
+# DECISION.md — Phase 3 architecture decision
 
-**Architect:** `architect`, team `audit-pipeline-1002`.
-**Inputs:** `.data-audit/AUDIT.md` @ `ca107fa` (CAND-1..7) · `.data-audit/RESEARCH.md` @ `a4c14d4`
-(the assembly) · `RESEARCH-1.md` / `RESEARCH-2.md` / `RESEARCH-3.md` for the detail behind each
-claim relied on here.
-**Repo state:** `kraken-trading-bot` @ `a4c14d4`. Read-only pass: nothing outside this file was
-written, committed, deleted or tidied.
+**Pass:** 2026-10-02 · **Phase:** 3 (architect) · **Author:** architect
+**Inputs:** [`AUDIT.md`](AUDIT.md) (7 gaps, `4fd3b77`), [`RESEARCH.md`](RESEARCH.md)
+(synthesis + 24-check receipt), [`RESEARCH-1.md`](RESEARCH-1.md) / [`RESEARCH-2.md`](RESEARCH-2.md) /
+[`RESEARCH-3.md`](RESEARCH-3.md).
 
-**Supersedes** the `.data-audit/DECISION.md` from the `data-audit-1002` pass, which chose **G1**
-(the `~`-expansion defect in the signal seam). G1 has since landed — `_resolve_config_path`
-(`data.py:133`) now calls `expanduser()` — so G1 is not an open gap and is not re-chosen here.
+This file is the only thing this pass wrote. No source file was modified.
+
+Every `file:line` below was re-derived against the tree at `e027621` this pass, and every
+number was **measured**, not quoted — including a live call to the Kraken Futures history
+endpoint, which re-confirmed RESEARCH-2 §1.5 independently (see §7.1).
 
 ---
 
-## 1. THE DECISION
+## 1. Decision
 
 | | |
 |---|---|
 | **Outcome type** | **`IMPROVE-EXISTING`** |
-| **Gap** | **CAND-3a** — the local market-data store is a config key away and has never been built, so `train` is capped at Kraken's ~721-bar REST ceiling and **no pinned `data_window` older than 30 days is reachable at all** |
-| **Library** | **`kraken-market-data`** — already an in-repo flake input, pinned at rev `055d7f6`; **no new dependency.** `kraken-deep-history` is used as an already-written seeder, also **not built** |
-| **Project name + path** | **N/A — no new repo.** Not a submodule, not nested, no naming step. |
-| **Improvement scope** | `kraken-trading-bot` (primary; the builder's own worktree) + the acceptance instrument in `tools/model_matrix.py` |
-| **Required code** | **~50 lines** (the CAND-5 dispersion gate) + **~10 lines** (venue provenance label). The store flip itself is **0 lines** — it is a YAML value. |
-| **Required data** | **158 s, 13 MB**, seeded once into a shared local path |
+| **Gap** | **G2** — the checked-in exogenous signal log is one record deep |
+| **Library** | **none.** No new dependency. `requests` is already in `kraken-funding-rates/pyproject.toml:11`. |
+| **Primary repo** | `~/Projects/kraken-funding-rates` — a new `backfill` subcommand |
+| **Wiring repo** | `~/Projects/kraken-trading-bot` — one `just` recipe, two comments, one string |
 
-**One line:** stop measuring this bot on one month of data — build the store it already has a
-config key for, so `train`/`backtest` can reach bars Kraken's REST API will never serve, **and** land
-the dispersion gate that decides whether the resulting two-arm comparison means anything.
+**In one sentence:** add `--backfill` to `kraken-funding-rates`, reading Kraken's own keyless
+`/historical-funding-rates`, appending the **full 13-key record** into the **existing**
+`signals/eth_usd_funding.jsonl` — which takes `funding_rate` from **2 distinct values on 13 of
+721 bars** to **720 distinct values on 721 of 721 bars** at an **unchanged observation width
+of 57**.
 
 ---
 
-## 2. WHY CAND-3a — the blocker I measured myself
+## 2. Why `IMPROVE-EXISTING`, considered as a first-class option
 
-I did not take RESEARCH-3's 76,561-bar figure on trust. I drove the real
-`read_ohlc_dataframe` (`data.py:1052`) with a duck-typed store — the exact contract
-`_resolve_store` (`data.py:1211`) accepts — and measured what a pinned window does on each leg:
+`NEW-DATA-SOURCE` was evaluated first and is not a weak reading. RESEARCH §1.2's argument
+against a new repo is specifically about **G1**, and I am not obliged to accept it — but for
+**G2** it is stronger than "already wrapped", and it is a supply-chain fact as much as a
+plumbing one:
 
-```
-SHIPPED default.yaml -> is_pinned=False has_split=False [unbounded, unbounded) eval_split=0.7
+1. **The producer's plumbing for this record already exists and is already correct.**
+   `export.py:120-156 write_jsonl` already hour-floors the timestamp; `models.py:51-83
+   to_dict()` already emits the 13-key record with `ticker` = the **spot** pair — and its
+   docstring already explains *why*, naming the exact failure I would otherwise have to
+   rediscover (a `PF_ETHUSD` ticker would trip `signal_require_ticker: true` on every
+   record). That reasoning was paid for in commit `935dfc0` and is reusable verbatim.
+2. **The new source is not a new venue, not a new host, and not a new stack.**
+   `GET futures.kraken.com/derivatives/api/v3/historical-funding-rates` is the **same host**
+   the client already calls twice (`client.py:105 /tickers`, `client.py:157 /instruments`),
+   on the same `_BASE_URL` (`client.py:23`), through the same `_get` that already retries
+   429/5xx with backoff (`client.py:53-95`, `_MAX_RETRIES = 3` at `:25`).
+3. **The delta is a subcommand, not a project.** Measured against the real files:
+   `client.py` 172 lines, `cli.py` 148, `export.py` 192, `models.py` 226. The whole change is
+   one method, one dataclass, one extractor, one subparser, plus tests. RESEARCH-2 §8 puts it
+   the same way. A new repo would add a flake, a Nix module, a CI pipeline and a license
+   question to house ~90 added lines inside an existing 738-line package.
+4. **Supply chain — the decisive point, and it is the mirror image of RESEARCH §1.10.**
+   `flake.nix:4-7` pins exactly two siblings: `kraken-python` (lock rev `81de5974…`) and
+   `kraken-market-data` (lock rev `055d7f6…`). **`kraken-funding-rates` is not a flake input
+   at all.** `justfile:157` and `systemd/kraken-trading-bot-funding.service.in` invoke it as
+   `nix run ~/Projects/kraken-funding-rates#kraken-funding-rates`, and its own
+   `flake.nix:26` builds `src = ./.` — a path build with no self-pin. So an edit there is
+   **live in the recipe the operator types, immediately, with no `flake.lock` bump and no
+   push to a GitHub remote**. RESEARCH §1.10 established that an edit to the *pinned*
+   `kraken-python` would be live under pytest and **invisible to `just bench`** until a lock
+   bump. This target sits on the good side of that asymmetry; G3's upstream half sits on the
+   bad side.
+5. **Nothing in the consumer needs writing.** `_SIGNAL_COLUMNS` (`features.py:94-125`) already
+   carries `funding_rate`; `merge_extra_features` (`data.py:591-842`) is the hardened seam;
+   `first_tradable_index` (`features.py:176-206`) already exempts
+   `POINT_IN_TIME_EXOGENOUS_COLUMNS`, and its docstring already records the exact
+   2026-10-01 bug a dense series was feared to re-expose. A new source landing on an already-
+   complete consumer is an `IMPROVE-EXISTING` by construction.
 
-LIVE 721-bar frame, unpinned      -> train 721 / eval 721   (IDENTICAL OBJECT: True)
-PINNED 2020-01-01..2026-01-01 on the LIVE 721-bar frame
-                                  -> train 0 / eval 0
-                                     prepare_episode RAISES NotEnoughDataError
-PINNED 2020-01-01..2026-01-01 on a 76,561-bar STORE frame
-                                  -> train 36826 / eval 15782
-```
+**Which gap *would* have justified a new repo, and why not now.** AUDIT G7's on-chain /
+macro / options-surface set is the honest `NEW-DATA-SOURCE` territory — different host,
+different auth model, no existing sibling, and `data.py:144-156` + `features.py:94-125` are
+genuinely additive there. G1's only backfill route is **Tardis.dev, paid** (RESEARCH-1 §3.8,
+the sole verified source of Kraken L2 history from 2019-06-04). Neither is a good Phase-4
+slice: G7 has no consumer at all today (`Directness: none *today*`), and G1-with-Tardis adds
+a paid dependency to buy history for a feature whose consumer is two tuple edits away. If a
+new repo is ever the right answer, **G1-on-Tardis is the one**, and it should be its own pass
+with its own budget conversation.
 
-Three consequences, each one load-bearing:
+---
 
-1. **The shipped default config cannot produce a single out-of-sample measurement.**
-   `since: null, until: null` (`default.yaml:200-203`) ⇒ `is_pinned` False ⇒ `has_split` False
-   (`data_window.py:82-101`) ⇒ `training_frame` and `evaluation_frame` return **the same object**
-   (verified `is` identity True). So every `train`/`backtest` pair today is a backtest on training
-   bars — which `configs/default.yaml:188-192` itself calls out as *in-sample*. And
-   `tools/model_matrix.py:2229-2232` already emits the consequence: *"A matrix with zero
-   out-of-sample cells supports NO generalization claim at all."*
-2. **Pinning is the documented fix and it is unreachable past 30 days.** `data_window.py:5-8`
-   records that two fetches of the same pair "disagree by 16% on a fitted std" — pinning exists
-   precisely so a comparison compares configs, not data. But with the REST ceiling at 721 bars,
-   pinning to anything older clips to **empty** and raises `NotEnoughDataError`. The store is the
-   **only** route past that, and 721 is a hard limit: Kraken's OpenAPI says *"Returns up to 720 of
-   the most recent entries (older data cannot be retrieved, regardless of the value of `since`)"*,
-   and RESEARCH-3 confirmed it with four live probes.
-3. **Therefore CAND-3a is the precondition for this pass's own Phase 6.** Not "an optimisation" —
-   the instrument.
+## 3. Why G2, against the RL pipeline's real shape
 
-### Why this is the highest-directness improvement, and why it is not a footnote
+### 3.1 What the agent actually sees today, measured
 
-`AUDIT.md:271-275` ranks CAND-3 "Directness to the RL observation: **Highest of any candidate** —
-this *is* the training window." Every rolling feature, the 24-bar warm-up boundary and the
-normalization stats are fitted on whatever the read returns. Nothing else on the board changes
-that. And it is the **only** candidate that changes it by **106×**.
+On a 721-bar 60-minute frame ending at the record's right edge, with the **real**
+`signals/eth_usd_funding.jsonl` (1 line) and `feature_windows: [1, 4, 24]` plus all five
+`feature_groups` (`configs/default.yaml:43,48`):
 
-**It is also width-neutral, which no other candidate is.** Measured, same funding file, same
-`feature_groups`/`feature_windows` as `configs/default.yaml`, via `prepare_episode` +
-`TradingEnvironment`:
-
-| configuration | `n_bars` | `n_features` | `start_index` |
+| Observation column | nonzero bars | distinct values | column std over the frame |
 |---|---|---|---|
-| live 721 bars, bare (no signal files) | 721 | **52** | 24 |
-| live 721 bars + the 1-record funding file **[SHIPPED]** | 721 | **60** | 24 |
-| **store, 76,561 bars, bare** | **76,561** | **52** | 24 |
-| **store, 76,561 bars + the 1-record funding file [THIS DECISION]** | **76,561** | **60** | 24 |
+| `funding_rate` | **13 / 721** | **2** | **0.00336** |
+| `basis` | 13 / 721 | 2 | — |
+| `open_interest` | 13 / 721 | 2 | — |
+| `funding_rate_prediction` | 13 / 721 | 2 | — |
+| `vol24h` | 13 / 721 | 2 | — |
+| `spread` | 24 / 721 | 2 | — |
+| `signal_observed` | 13 / 721 | 2 | — |
 
-So: **no `models/{TICKER_ID}/{model_name}/` artifact is invalidated by this change.** The width
-guard `check_feature_width` (`features.py:262`) compares *by name* against the artifact's
-`feature_names`, and that set is unchanged. What changes is `n_bars` (`train.py:298`), which is
-recorded as provenance precisely so a report can tell the two apart. That is the safest possible
-shape for a first real measurement in this repo.
+`funding_rate` is **98.2% the literal constant `0.0`** (the historical fill at `data.py:816`).
+After z-scoring, 708 of 721 rows carry the *same* value in that column. That is a
+near-dead input to the policy: it is not "sparse", it is constant.
 
----
+**DEV-1 — correction to AUDIT.md.** AUDIT.md:153 says *"≈709 of 721 bars read these six
+columns as their historical `0.0` fill"*, i.e. 12 observed. Measured: **13 of 721**. The
+record sits at its own bar plus the 12-hour carry (`signal_max_age_hours: 12`), and because
+the record is at the *right edge* of a trailing window the carry is clipped by the frame end,
+not by the bound. 13 is the number the gate should use.
 
-## 3. THE LANDING POINT — exact, per ticker
+### 3.2 What it becomes after the backfill, measured
 
-This is where the change is **read**, once per `(ticker, interval)` read:
+Same frame, same config, same seam — a `backfill` file appended with the full 13-key record:
 
-**The store adapter — `kraken_trading_bot/rl/data.py:1052` `read_ohlc_dataframe`, with
-`_resolve_store` at `data.py:1211`.**
+| Observation column | nonzero bars | distinct values | column std over the frame |
+|---|---|---|---|
+| `funding_rate` | **721 / 721** | **720** | **0.02332** (×6.9) |
+| `basis` | 13 / 721 | 2 | — *(unchanged)* |
+| `open_interest` | 13 / 721 | 2 | — *(unchanged)* |
+| `funding_rate_prediction` | 13 / 721 | 2 | — *(unchanged)* |
+| `vol24h` | 13 / 721 | 2 | — *(unchanged)* |
+| `spread` | 24 / 721 | 2 | — *(unchanged, byte-for-byte)* |
+| `signal_observed` | **721 / 721** | 2 | — |
 
-```
-config key  market_data_store            (configs/default.yaml:161)
-   -> train.py:225     market_data_store=cfg.get("market_data_store")
-   -> backtest.py:412  market_data_store=_resolve_env_setting(...)   # run config may override
-   -> export.py:175    market_data_store=cfg.get("market_data_store")
-   -> data.py:1216     store = _resolve_store(...)      # lazy `from market_data.store import MarketDataStore`
-   -> data.py:1174     candles = _page_candles(pair, interval, pages, source, since)
-   -> data.py:1176     store.upsert(pair, interval, candles)          # fetch -> upsert
-   -> data.py:1191     df = store.read(pair, interval, since=since, until=until)
-   -> data.py:1196     add_derived_ohlcv_features(df)                  # SAME derivation as the live leg
-   -> data.py:1197     merge_extra_features x3                        # SAME seam, same order
-```
+And on the source series itself, over the same trailing 721 hours: `max` inter-record gap
+**1.0 h**, **721 distinct** rates, `min −0.03619`, `max +0.12163`, **619 positive / 102
+negative** — it genuinely crosses zero, so this is a distribution, not a level.
 
-All three RL consumers already read the key. `pages` stops meaning depth on the store leg — it only
-bounds the live *append*. `since`/`until` default to `None` so `store.read` returns the whole store.
+**This is the largest single change to what the agent sees available anywhere in this repo.**
+G1 adds a column; G3 adds none; G4 adds none. G2 replaces a constant column with a real
+one across an entire training run.
 
-**Config inputs the outcome consumes:** `market_data_store` (the store root path; `null` = live
-fetch) and, for the acceptance comparison, the existing `data_window.{since,until,eval_split}`.
+### 3.3 Why it is the *cleanest* of the three top gaps, not merely the largest
 
-**`train` / `backtest` knobs that matter and their real defaults** (measured, not quoted):
+* **`ohlcv_interval_minutes: 60` (`configs/default.yaml:11`) makes the hourly series map 1:1
+  onto the bar grid** — no resampling, no aggregation choice, no fudge factor. Contrast G1:
+  a `/Depth` response is an *instant* with **no timestamp of its own** (RESEARCH-1 §4.4), so
+  landing it on a bar grid forces a last-sample-vs-mean decision that has to be settled
+  before anything can be written. G2 has no such decision.
+* **Width is provably unchanged, so no model artifact is invalidated.** `available_cols`
+  (`data.py:765-769`) is an intersection, so the record's key *set* is load-bearing — but
+  writing the same 13 keys the live producer writes keeps the intersection identical.
+  `check_feature_width` (`features.py:483`) compares by **name** against the artifact's own
+  `feature_names`, so 57 → 57 means every existing
+  `models/{TICKER_ID}/{model_name}/normalization.npz` stays valid and no
+  `FeatureWidthMismatchError` can fire. G1, by contrast, **must** edit `features.py:94-125`
+  and `features.py:149` — and `features.py` is in `tools/audit_checks.py`'s `PY_FILES`
+  executable-AST guard.
+* **`just audit-verify`'s `executable-ast` check stays MATCH.** `features.py` and the seam
+  logic in `data.py` are untouched. The one `data.py` edit (§5.2) is a **string literal**
+  inside `_SIGNAL_CHANNELS`, and `executable_ast` blanks docs and strings by design
+  (`audit_checks.py:186`).
+* **Not episode truncation, and provably so.** `first_tradable_index` measured **24** before
+  and **24** after, on both frames. RESEARCH §1.6's reading is confirmed.
+* **Keyless, one HTTP request, no new dependency, no scraping.** Measured §7.1.
 
-| knob | default | effect here |
+### 3.4 The exact landing point
+
+There are three, and **all three already exist** — that is the point.
+
+1. **Config key** — `funding_features_file`, `configs/default.yaml:92`. Already non-null,
+   already a "DECLARED INTENT to use the channel" per its own comment (`:85-91`). **No new
+   config key.**
+2. **Read site, per ticker, per run** — `train.py:220-221` and the equivalent in `backtest.py`
+   pass `cfg.get("funding_features_file")` and `cfg.get("signal_max_age_hours")` into
+   `read_ohlc_dataframe`, which iterates `_SIGNAL_CHANNELS` (`data.py:144-156`) at both the
+   fetch leg (`:1194`) and the store leg (`:1387`) and calls `merge_extra_features`
+   (`data.py:591`). The seam floors to the hour (`:759`), intersects against `_SIGNAL_COLUMNS`
+   (`:765-769`), bounds the carry by measured age (`:798-804`), and zero-fills absence
+   (`:816`).
+3. **Feature-engineering steps that turn it into observation columns** —
+   `_add_signals_features` (`features.py:1017`, passthrough at `:1052-1059`) for
+   `funding_rate` / `basis` / `open_interest` / `funding_rate_prediction` / `vol24h`, and
+   `_add_microstructure_features` (`features.py:986-1015`) for `bid`/`ask → spread`. Then
+   `normalization.npz`'s `feature_names` (`features.py:377`) → `environment._builtin_features`
+   (`environment.py:498`).
+
+**No step of the pipeline is modified to read this feature. It is read today.** That is the
+cleanest possible outcome shape and the reason G2 beats G1 despite G1's larger information
+content.
+
+### 3.5 Honest cost of G2, stated up front
+
+**§1.7 is respected literally: this recovers 1 of 6 columns, not 6.**
+
+| Column | Verdict | Evidence |
 |---|---|---|
-| `--pages` | `6` (`cli.py:154-158`) | bounds only the live append on the store leg. **Does not buy depth** — `--pages 2/4/8` all return 721 bars live (RESEARCH-3 §3.2: the `last` cursor never advances, so calls 2..N are byte-identical replays) |
-| `--episode-bars` | `None` = **all** (`cli.py:160-164`, `train.py:157`) | **critical and favourable**: the episode is *not* re-capped, so a seeded store's 76,561 bars flow straight into training |
-| `--timesteps` | `10_000` (`cli.py:167-171`) | **honest caveat**: PPO's step budget is unchanged, so 76,561 bars buys *diverse* experience and a longer evaluation span, **not** 106× more gradient steps |
-| `data_window.eval_split` | `0.7` (`default.yaml:203`) | inert while unpinned; becomes real the moment a bound is set |
-| `signal_max_age_hours` | `12` (`default.yaml:126`) | unchanged — the store changes bars, not signals |
+| `funding_rate` | **recovered exactly** | bit-identical, hourly, 366 d — §7.1 |
+| `basis` | **NOT recovered.** Kraken's history has no `markPrice`/`indexPrice`, so `basis = (mark−index)/index` is not derivable. Writing `relativeFundingRate` here is a **silent unit substitution** and is forbidden. | field union is exactly 3 |
+| `funding_rate_prediction` | **NOT recoverable, provably** — a forward estimate cannot be in a history | absent |
+| `open_interest` | **NOT recoverable** — Kraken publishes no historical OI | 3 spellings 404 |
+| `vol24h` | **NOT recoverable at sane cost** — trade history is 100 trades/request | 10⁵–10⁶ requests |
+| `spread` | **NOT recoverable** — the trade payload has no bid/ask at all | absent |
 
-**Artifact layout the outcome must leave trainable and measurable:**
-
-```
-models/{TICKER_ID}/{model_name}/
-    model.zip           stable-baselines3 policy
-    normalization.npz   per-ticker feature_names + mean/std  (registry.py:32)
-    config.yaml         the exact training config — train.py:288 writes n_features,
-                        train.py:298 writes n_bars, and market_data_store rides
-                        along because build_train_config keeps every YAML key
-```
-
-`models/` is empty today (`.gitkeep` only), so **no width or coverage figure in any of the four
-artifacts is read off a shipped model.** This decision is chosen partly because it is the one whose
-acceptance can be settled by a *trained artifact's own recorded provenance* (`n_bars`) rather than
-by a width comparison — the thing Phase 6 has never been able to do.
+The Phase 6 receipt and the config comment must say **"1 of 6"** in those words.
 
 ---
 
-## 4. LIBRARY
+## 4. Deviation: do **not** widen `_SIGNAL_COLUMNS` for `relativeFundingRate`
 
-| Library | Verdict |
-|---|---|
-| **`kraken-market-data`** — the store reader (`market_data.store.MarketDataStore`) | **CHOSEN.** Already a flake input (`flake.nix:7`), pinned `rev 055d7f6` in `flake.lock`, and its dev-shell dependency closure (pandas/pyarrow/requests) is already carried by *this* repo's `flake.nix:62,74` + `PYTHONPATH` at `flake.nix:71`. Zero install work. |
-| **`kraken-deep-history`** — the Binance-archive seeder (`seed`/`plan`/`verify`/`stats`) | **USED, NOT BUILT.** Already written; `plan` is a free zero-network dry-run and `stats`/`verify` are exactly what a gate needs. **Not a flake input of this repo** — see the hermeticity trap in §7. |
-| `krakenex` / `krakenapi` / `ccxt` | Rejected (RESEARCH §5): two are ~2 y stale; `ccxt` is current but coarser and would erase the exact endpoint detail. None is needed — `/0/public/OHLC` is already wrapped by `kraken-python`. |
-| `tenacity` / `urllib3.HTTPAdapter` | Rejected — the retrying client already ships in `market_data.client.KrakenClient`, and both hide policy from the repo's `log_event` convention. (CAND-4, deferred — see §9.) |
-| **Any new library / new repo** | **None.** |
+RESEARCH-2 §2 recommends adding `relativeFundingRate` as a **new** column rather than
+overloading `basis`, describing it as optional. **I am declining to add it, and here is the
+measurement.**
 
----
+Over the trailing 721-hour window, `corr(funding_rate, relativeFundingRate) = **0.99753**`.
+`relativeFundingRate` is `fundingRate / indexPrice` — RESEARCH-2 measured the ratio at 4147.45
+and 2664.89 across the span, tracking the ETH price, so it is the funding rate re-expressed
+per dollar of notional. Adding it to the observation buys **+1 width** (a new column, new
+`feature_names`, a new artifact contract, a `FeatureWidthMismatchError` risk against every
+existing model) for a column that is **0.9975 collinear with one you already have**.
 
-## 5. IMPROVEMENT SCOPE — repos and in-scope files
-
-### 5.1 `kraken-trading-bot` — PRIMARY (the builder's own worktree)
-
-| # | Unit | What | ~size |
-|---|---|---|---|
-| **R1** | `tools/model_matrix.py` | **The CAND-5 dispersion gate.** Required. Full spec in §6. | ~50 ln |
-| **R2** | `justfile` | `just store-plan` / `just store-seed` / `just store-stats` / `just store-verify` — the **hermetic** seeding path (§7). Uses the existing `dev := "nix develop --command bash -c"` convention. | ~40 ln |
-| **R3** | `configs/deep-history.example.yaml` | Already sets `market_data_store: ~/Projects/kraken-market-data/store` (`:81`). Add a **pinned-window** example (`data_window.since/until/eval_split`) — today the file offers deep OHLCV bundled with an inert signal block (`AUDIT.md:267`) — plus the venue label from R4. | ~15 ln |
-| **R4** | `configs/default.yaml` + `kraken_trading_bot/rl/data.py` | **Venue provenance label.** R3 measured the seeder is Binance-\*USDT spot and the basis is a **+5.41 bp level shift against a 58.30 bp hourly sigma** — harmless for z-scored features, but it must be *labelled*, not silently assumed. Add a declared `market_data_store_venue` key (default `"kraken-live-rest"`) and log it once on the store leg so the run log states which venue the bars came from. **COMMENT-ONLY in `default.yaml`; the key must stay `market_data_store: null`.** | ~10 ln |
-| **R5** | `tests/` | Tests for R1's gate (the 4 RESEARCH-3 §5.2 cases, incl. the n=1 degenerate case) and for R2's `store_mode` assertion. | ~60 ln |
-
-**R4's `default.yaml` rule is load-bearing and easy to get wrong:** `market_data_store` **stays
-`null`** in the shipped default. A non-null value that does not resolve raises `ValueError` from
-`_resolve_store` (`data.py:1244-1251`), so pointing the shipped default at a store path that does
-not exist on a fresh clone would turn every first run into an error. The flip belongs in
-`configs/deep-history.example.yaml` and in a per-model `models/{TICKER_ID}/{NAME}/config.yaml`.
-
-### 5.2 `kraken-market-data` / `kraken-deep-history` — OUT OF SCOPE THIS PASS (explicitly)
-
-R3's prescription was to label the venue in `_meta.json`, which is a sibling-side write. **I am not
-putting that in scope**, for two concrete reasons: (a) they are **separate git repos**, and the
-builder owns a worktree of *this* repo — a sibling commit would land outside the branch under
-review; (b) this repo consumes `kraken-market-data` as a **pinned flake input**
-(`rev 055d7f6`), so a local sibling edit would not even reach `nix develop` without a `flake.lock`
-bump and a push. R4 achieves the same *label* on the artifact the reviewer already inspects
-(`config.yaml`), which is the better home for it anyway. Sibling `_meta.json` is a follow-up.
+So: **record it in the JSONL, do not widen the allow-list.**
+`data.py:765-769` intersects against `_SIGNAL_COLUMNS`, so a key outside it is carried in the
+file for any future analyst and costs the observation **zero** columns. That is the strictly
+dominant third option between RESEARCH-2's two, and it keeps the width gate simple.
 
 ---
 
-## 6. THE ACCEPTANCE INSTRUMENT — CAND-5, and why it is in scope
+## 5. Improvement scope — repos and in-scope files
 
-**This is not a second gap; it is the instrument that makes CAND-3a's own effect claim admissible.**
-The brief is explicit: *"CAND-5 gates the CLAIM of any change, not its BUILD."* CAND-3a's payoff is
-precisely a two-arm comparison ("does 8 years beat 721?"), so shipping the store without the gate
-produces exactly the number the brief says is undefendable. 50 lines, no data, and it lands in the
-same change.
+### 5.1 `~/Projects/kraken-funding-rates` (primary)
 
-**Spec, verbatim from RESEARCH-3 §5.3 with the n=1 constraint honoured:**
-
-1. **Estimator:** `pooled_within_spread(summaries)` = **median** of the per-group `q3 - q1`
-   (`summarize` already returns `q1`/`q3`, `model_matrix.py:328-339`), taken over groups with
-   `n >= MIN_REPLICATES_FOR_A_CLAIM` (`model_matrix.py:243`). `None` if fewer than two such groups
-   or if the result is `0`. **Median, not `max`** — `max` lets one wild group condemn every
-   comparison (measured: case 1 collapsed 53× → 0.21×); `mean` is not robust to the same group.
-2. **Placement — the gate must sit BEHIND the count gate, never beside it.** At n=1 per arm,
-   `q3 - q1 == 0`, so a pooled-IQR gate reports `gap = 5 pp / 0 = inf -> RESOLVED` — blessing the
-   exact anecdote the surrounding prose exists to kill (RESEARCH-3 §5.2 case 4). It must require
-   `n >= 3` **and** `pooled_iqr > 0` before it emits anything.
-3. **Output a RATIO, not a boolean.** `gap / pooled`, where `gap = |median_A - median_B|` over
-   adjacent arms in the headline cohort. The threshold is a judgement call; the ratio is a fact.
-   Verdict wording: `RESOLVED (ratio >= 1)` / `NOT SEPARATED (< 1)` / `UNDEFINED (n < 3 or zero
-   spread)`.
-4. **Sites:** a new `pooled_within_spread()` beside `summarize()` (:328); one line per adjacent
-   arm-pair in `_build_claims` (:2208), replacing the `thin`/else branch at :2259-2280 rather than
-   adding to it; one pooled-IQR line in `_print_group_table()` (:1929) so a reader sees the
-   yardstick the verdicts used.
-5. **Documented limitation, in the docstring:** at n=3 a group IQR is a 50th-percentile-of-two
-   estimate. This is **necessary, not sufficient**. It stops a noise-ranked difference being
-   *presented* as a finding; it does not manufacture power. More power is still 5+ seeds.
-
-The four worked cases are the regression fixtures: case 1 (gap 4 pp, pooled 0.075 pp, **53×**) →
-RESOLVED; case 2 (gap 3 pp, pooled 19 pp, **0.16×**) → NOT SEPARATED — *today's `len(seeds) >= 3`
-PASSES this*; case 3 (0.91×) → NOT SEPARATED; case 4 (n=1, 0.00 pp) → UNDEFINED, **not** RESOLVED.
-
----
-
-## 7. INTEGRATION SKETCH
-
-**Output contract.** Not a record stream — **a parquet tree**, and that is deliberate.
-
-```
-<store-root>/
-    _meta.json                       # since-cursor sidecar per (PAIR_ID, interval)
-    {PAIR_ID}/{interval_min}/{YYYY-MM}.parquet
-```
-
-read by `MarketDataStore.read(pair, interval, since=..., until=...) -> DataFrame`, written by
-`.upsert(pair, interval, candles)`. Measured contract (RESEARCH-3 §1.5): inclusive `since`, exclusive
-`until`, on bar-bucket start; globs only the months the window touches; an empty window returns an
-empty frame with the same columns and the *caller* decides; `upsert` dedupes on bar `time` keeping
-last, so re-polling overwrites the still-forming bar with Kraken's own revision.
-
-**Why a shared local path and not a pipe.** Three reasons, in order of weight:
-
-1. **The consumer already declares it.** `_resolve_store` (`data.py:1211-1210`) takes exactly a path
-   to a store root, and `configs/default.yaml:139-161` + `configs/deep-history.example.yaml:81`
-   already spell the path `~/Projects/kraken-market-data/store`. This decision changes a value, not
-   a contract. A pipe would mean inventing a second contract for a consumer that has none.
-2. **The data is a growing, append-only, multi-reader asset, not a per-run stream.** `pages` on the
-   store leg bounds only the live append (`data.py:1174`), and `train`, `backtest` and `export` all
-   read the same root independently. A stream would have to be re-fetched per reader.
-3. **Cost is a non-issue and windowing already works.** 60 bytes/bar, 13 MB for 280 months; a
-   whole-store read of 75,840 rows is **0.142 s**, a 2-month windowed read **0.010 s** (14× faster,
-   because it touches 2 parquet files instead of 104). The "reads the whole store every time" cost
-   is not real, so R3's `since`/`until` push-down is **deferred** as the research itself recommends.
-
-**Where the bot picks it up.** One place, already built: `data.py:1216` inside
-`read_ohlc_dataframe`. Nothing in `features.py`, `environment.py` or `train.py` needs to know a
-store exists — they already receive a `DataFrame` with the identical 11-column shape
-(`time, open, high, low, close, vwap, volume, count` + `vwap_dev, trade_count_zscore_20,
-volume_per_trade`), which I verified by measuring the store leg's output column-for-column against
-the live leg.
-
-**Default path:** `~/Projects/kraken-market-data/store` — machine-independent (`~`-spelled, expanded
-by `_resolve_config_path`), shared by every model, matching what the example config already says.
-
-### Build traps the builder must not walk into
-
-1. **Seed where `market_data` + pyarrow are importable, or the seed silently writes unreadable CSV.**
-   `kraken-deep-history`'s own `nix develop` carries **only pytest** — no pandas, no pyarrow — so
-   `_open_store` catches `ImportError` and returns `FallbackStoreWriter`, which writes `.csv`
-   files that `MarketDataStore.read` **cannot see** (it globs `*.parquet`). The JSON report's
-   `store_mode` is the *only* signal. **This is the second time a pass has hit it.** The recipe must
-   run the seeder under **this** repo's dev shell (`flake.nix:62,74` already carries
-   `market_data`/pyarrow/requests) with the local `kraken-deep-history` checkout on `PYTHONPATH`,
-   and must **assert `store_mode == "market-data"` and refuse `fallback-csv`** rather than printing
-   it. A seed that "succeeded" into csv yields a store the bot reads as ~721 live bars — the
-   exact failure this decision exists to remove.
-2. **`kraken-deep-history` is not a flake input here** (inputs are `nixpkgs`, `kraken-python`,
-   `kraken-market-data` — `flake.nix:5-8`). So `nix run ~/Projects/kraken-deep-history#…` from
-   inside the dev shell is not the reliable route; use the `PYTHONPATH` form above. Do **not** add
-   a new flake input this pass — that needs a `flake.lock` bump plus a push before it resolves.
-3. **`--pages` is a replay loop, not a depth knob.** `last` never advances past page 1 on a live
-   pair; `pages=6` → 6 calls, 721 unique bars, 10 dup rows discarded at `data.py:1030-1031`. Set
-   `--pages 1` on store-backed runs; the store supplies the depth.
-4. **A seeded store is Binance-\*USDT spot** (`kraken-deep-history/export.py:45-48`). Label it (R4).
-   Do **not** build a Kraken OHLCVT reader to "fix" this — RESEARCH-3's judgement, which I accept:
-   the newest Kraken archive is **94 days stale** (MANIFEST `coverage.end = 2026-06-30`,
-   `generated = 2026-08-17`, today 2026-10-02, Q3 unpublished) so it does **not** replace the
-   forward poller, and Kraken's bulk OHLCVT has **no `vwap`** (MANIFEST is 7 columns, the store
-   contract is 8) so a Kraken-seeded store would **silently lose `vwap_dev`** through the presence
-   gate. 10.5 GB and 300 lines to buy a 5.4 bp level shift that z-scoring already removes.
-
----
-
-## 8. WHAT THE GATE CAN AND CANNOT PROVE FOR THIS OUTCOME
-
-**Can prove (and Phase 6 will be held to exactly these):**
-
-- `n_bars` in `models/{TICKER_ID}/{NAME}/config.yaml` and in the `BacktestResult` is **≥ 1000**
-  on the store leg and **≈ 721** on the live leg. This is the primary magnitude assertion, it is
-  read off the artifact's own recorded provenance (`train.py:298`, `backtest.py:147`), and it is
-  the assertion that would have caught the 2026-10-01 pass's failure mode.
-- `n_features` and `feature_names` are **unchanged** by the flip (measured: 60 vs 60, 52 vs 52), so
-  `check_feature_width` passes on both arms and the comparison is not confounded by width.
-- `first_tradable_index` / `start_index` is **24** on both arms, so no arm gained or lost warm-up.
-- `num_trades > 0` and `n_bars == frame - 24` on both arms (the arithmetic the last pass validated:
-  697 = 721 − 24 exactly).
-- The two arms' frames are **disjoint**: `training_frame` vs `evaluation_frame` over a pinned
-  window yield 36,826 / 15,782 bars with no overlap. This is the assertion that makes the run
-  out-of-sample rather than in-sample.
-- The CAND-5 gate itself: the four §6 cases, and on the real matrix a **ratio** per arm-pair.
-
-**Cannot prove — stated so Phase 6 is not asked for it:**
-
-- **It cannot prove 76,561 bars is *better* than 721.** It can prove the store was read, and it can
-  report the between-arm gap as a ratio against measured within-arm spread. Whether the gap clears
-  the ratio is an *empirical* question this pass cannot pre-answer — and the honest gate, given the
-  16%-on-fitted-std instability `data_window.py:5-8` already records, is that **the verdict may
-  legitimately be `NOT SEPARATED`**. A `NOT SEPARATED` verdict on a store-vs-live comparison is a
-  *finding*, not a failure: it would say the extra 7 years did not resolve the effect at n=3 seeds,
-  which is exactly what the gate exists to be able to say.
-- **It cannot measure `total_timesteps`.** 10,000 PPO steps against 76,561 bars means the policy
-  still takes ~13% of the store (with resets). Depth buys *normalization-sample size*,
-  *regime diversity* and a *longer evaluation span* — **not** more gradient steps. No report may
-  describe this as "106× more training".
-- **It cannot separate Kraken venue from Binance venue.** The store is cross-venue by
-  construction. R4 labels it; nothing in this pass models the 5.41 bp basis away, because
-  z-scoring removes a level shift and the hourly-return correlation is 0.999081. A store-vs-live
-  comparison therefore measures *history + venue together* and must be described that way.
-- **If the honest gate degrades to name/width/bar-count, say so.** The bar-count + width +
-  disjointness set above is a *configuration* assertion, not an *effect* assertion. Phase 6 should
-  record explicitly which of the two it achieved. The 2026-10-01 pass is the precedent for the
-  failure: a run completed cleanly while replaying **1 bar of 721** (a sparse-exogenous file moved
-  `first_tradable_index` from 24 to 720 and the width guard still passed — which is why
-  `POINT_IN_TIME_EXOGENOUS_COLUMNS`, `features.py:123-125`, now excludes exogenous columns from
-  the warm-up gate). Any run whose `n_bars` is a small fraction of its frame is **NOT** evidence,
-  whatever its exit code.
-
----
-
-## 9. RUNNER-UPS — and plainly why each lost
-
-All four are cheap and defensible. I beat them on one axis each, stated explicitly.
-
-### Runner-up 1 — **CAND-2, exogenous coverage** (funding backfill + F&G + the timer). *The closest call.*
-
-**What I am giving up, honestly:** 1.80% → **100%** coverage (`13/721` → `721/721`), distinct
-`funding_rate` values **1 → 721** (lag-1 autocorr 0.75), and `signal_observed` z-scoring correctly
-to **0.000** instead of a **+7.4σ step**. The lever is real: one `just funding-timer` that **has
-never been run** (the only timer in the repo, funding-only, absent from `nix/module.nix` which
-declares zero timers, and not installed on this host) is most of the fix. On raw
-information-recovered-per-hour this beats CAND-3a.
-
-**Why CAND-3a still wins — four reasons:**
-
-1. **The information content is ~1 bit, replicated 8 times.** R2 measured **seven of the eight
-   exogenous columns at Spearman ρ = 1.000 exactly** — a correctness item, not a depth nicety.
-   Recovering coverage to 100% on a channel that is 8-wide and 1-dimensional inflates the
-   observation's *width* by 8 collinear columns. CAND-3a is **width-neutral** (§2). For a policy
-   learner, 7 years of independent bars beats 8 collinear columns of one bit.
-2. **CAND-2's fix must land a 24-hour look-ahead landmine in the hot path, and no plausible number
-   will catch it.** The F&G daily value is *final-at-fetch*; emitting it hourly at 00:00 of day D
-   asserts day D's close. 19 polls over 9 min held the value at 72 while `time_until_update`
-   counted 40017 → 39472s. **Fix: stamp at D+1 00:00Z.** This *inflates* results, so a reviewer's
-   "numbers look reasonable" check passes on corrupted data.
-3. **Its fix depends on two live defects in a sibling that has one commit and no LICENSE.** R2
-   measured: the shipped `Mozilla/5.0 (compatible; …)` UA **loses the Cloudflare gate** → HTTP 403,
-   and `_get` treats 403 as non-fatal → **silently produces nothing** (a full Chrome UA → 200); and
-   pagination reads a cursor key the API never returns (`cursor.after` vs actual `{more, since,
-   max}`), so pages 1/2/3 are byte-identical and the hard ceiling is 30 messages ≈ 3.9h, making the
-   `--lookback-hours 24` default **unreachable**. The F&G backfill must therefore **not** depend on
-   StockTwits succeeding.
-4. **Its landing point is inert until CAND-3a lands.** The signal seam joins onto bars. With 721
-   bars there is ~30 days for 721 hourly funding records to cover — feasible but on one month. The
-   substrate has to exist first.
-
-*(CAND-2 is the correct **next** pass, ideally immediately after this one, once a store exists to
-join onto. It is deferred, not rejected.)*
-
-### Runner-up 2 — **CAND-1, a `kraken-microstructure` trade-tape source** (`NEW-DATA-SOURCE`). The best NEW-DATA-SOURCE candidate, and it still loses.
-
-**What I am giving up:** a keyless, paginable `/0/public/Trades` reaching each pair's **full
-listing history** (XBT/USD to 2013-10-06, ETH/USD to 2015-08-07, SOL/USD to 2021-06-17) — *not*
-subject to the 721 ceiling; **6 point-in-time scalars + 1 rolling** per (ticker, bar) with **0 lines
-of parsing** (typed models already exist in `kraken-python`); **zero marginal warm-up**; and a
-strict-superset property — a fully-paged 1h bar deduplicated on `trade_id` reproduces the candle's
-`volume`, `count` and `vwap` with **delta exactly 0.0**. That is a genuinely excellent source, and
-if the brief's premise were "we must ship a new repo" this would be it.
-
-**Why it loses:**
-
-1. **It backfills FEATURES, not BARS — and it does not touch the 721 ceiling at all.** The tape's
-   features land on a frame that is still 721 bars long. Its payoff is measured on the same ~30-day
-   substrate CAND-3a exists to end.
-2. **Its consumer cannot be lit by one line.** `_add_microstructure_features`
-   (`features.py:577-590`) is keyed on `bid_vol`/`ask_vol`, which a *tape* cannot produce — the tape
-   carries no book. So the `microstructure` group stays at 0 → 1 columns and new feature-builder
-   code is required. The claim "zero consumer-code change, the machinery is waiting" holds for a
-   *Depth* producer, which R1 proved is snapshot-only and silently ignores `since`; it does **not**
-   hold for the tape.
-3. **Three undocumented traps, all load-bearing:** `Trades.last` is a **nanosecond** cursor returned
-   as a bare `str` — passed back verbatim it lands in **1970** (`Spread.last` is in *seconds*: same
-   param name, incompatible units, so a generic paginator silently corrupts one of them); rows are
-   **7 fields, not 6**, and `Trade.from_public_row` silently drops `trade_id` — measured **7.278×
-   volume inflation** without it; throttle arrives as **HTTP 200 with `{"error":["EGeneral:Too many
-   requests"]}`**, not 429, at ~30 burst, and `KrakenTransport.min_interval` defaults to **0.0**.
-4. **Highest cost of anything on the board** — a new repo, a timer, a packaging/flake/lock cycle —
-   for features measured on 721 bars.
-5. **Honest negative I'd respect anyway:** realized spread is **structurally unbuildable** from the
-   tape (no book, and the only mid source ignores `since`); roll was **+260,551 bps** where defined
-   and undefined on 13/16 one-minute bars; Corwin-Schultz went negative on 11/15. Dropped.
-
-### Runner-up 3 — **CAND-5 alone** as the outcome. It beats everything on cost and loses on being an outcome.
-
-50 lines, no data, no new repo, and R3 is right that it should not wait behind anything. But it
-feeds **no feature**, changes **no observation**, and — decisively for this brief — its landing point
-is the *report*, not the RL pipeline. Phase 6's mandatory evidence template ("bars replayed, trades
-taken, new columns present **BY NAME**") has nothing to bind to for a change that moves no bar and
-adds no column. So it is **in this outcome as the instrument** (§6) rather than *as* the outcome.
-That is the honest resolution, not a hedge: the brief says the highest-directness improvement must
-be a candidate outcome, and CAND-3a's directness is higher.
-
-### Runner-up 4 — **CAND-4**, retry/backoff/salvage on `_page_candles`. *Deferred with a trigger.*
-
-~40 lines, **no new dependency** (the retrying client already ships at
-`market_data.client.KrakenClient`), and it kills a **measured 5-of-6 wasted API calls** via a
-1-line `if last == cursor: break`. It is **not a precondition** for CAND-3a — R3 proved the
-pushed-down read and the post-hoc clip agree to **1.5e-13**. But R3 is right that it should land
-*with* the store change, because the store leg calls `_page_candles` too (`data.py:1174`) and after
-the flip a read failure means "the tail of my training window is missing". **Scope call:** I am
-keeping it out of this outcome to keep one clean target, and **I am recording the trigger**: if
-Phase 6 sees any store-backed run log a `_page_candles` failure or a salvage warning, CAND-4 is
-promoted immediately. Scope CAND-4 as **transient-failure resilience, not rate-limit compliance** —
-Kraken's counter limits did not reproduce on the keyless path (16 rapid + 8 at 2.5/s both 100% OK).
-
-### Deliberately NOT chosen (with reasons)
-
-- **A Kraken OHLCVT reader** — RESEARCH-3 §2.4, accepted verbatim: 94 days stale, no `vwap` (silently
-  loses `vwap_dev`), basis is a 5.4 bp level shift vs a 58 bp hourly sigma. 10.5 GB. Label the
-  venue instead.
-- **Realized spread** (R1) — structurally unbuildable from the tape.
-- **Cross-venue funding sources** (Deribit/Binance, R2) — on-venue funding beats 7× shallower
-  because it introduces no unmodelled basis. Consistent with refusing cross-venue bars. Both
-  researchers refused cross-venue independently, from opposite directions; that position holds.
-- **CAND-6** (`pair_from_ticker_id` blind `_`→`/`) — real, cheap, but zero feature effect. It is
-  *falsified in practice by this pass*: `--ticker USD_SOL` fails while `ETH_USD` works, and
-  `train.py:138` is exercised on every Phase 6 run, so the correct spelling is simply used.
-- **CAND-7** (walk-forward) — structurally unreachable, and it depends on CAND-3a landing first. A
-  store makes it *possible*; making it *implemented* is a separate change.
-
----
-
-## 9A. POST-DECISION AMENDMENTS — recorded after the Phase 4B measurement
-
-The builder's measurement (commit `bfe32aa`, real keyless data, store seeded 2018-01→2026-10)
-confirmed the gate assertions and surfaced three things §8 did not anticipate. They are recorded
-here so the reviewer reads them as **known limitations of the harness**, not as new findings.
-
-### 9A.1 A live-vs-store pair inside ONE matrix is structurally uncomparable (DEFECT — Phase 7)
-
-`tools/model_matrix.py report` emits **no dispersion section at all** for a matrix mixing both
-arms. With `min_bar_ratio: 0.5` the degenerate-cell guard scores each cell against the ticker's
-**largest observed `n_bars`**:
-
-| | live arm | store arm |
+| File | Change | Not in scope |
 |---|---|---|
-| `n_bars` | 697 (721 − 24 warm-up) | 76,538 |
-| guard `0.50 × 76,538` | **31,269** — 697 fails by 45× | passes |
-| outcome | **all 3 cells marked INVALID** | valid cells flagged IN-SAMPLE and excluded |
+| `kraken_funding_rates/client.py` | **+1 method** `historical_funding_rates(symbol)` calling `_get("/historical-funding-rates", {"symbol": symbol})`, returning `data.get("rates", [])`. Send **no** `since`/`until` — they are ignored (RESEARCH-2 §3(b); the endpoint is a ~366-day rolling cap, not paginated). | **`_get` must not be touched.** No retry work here — that is G3's runner-up, and a blanket retry in a trading client risks POST replay against a stale nonce (RESEARCH §1.15). |
+| `kraken_funding_rates/models.py` | **+1 dataclass** `FundingHistoryRow` (`symbol`, `spot_pair`, `ticker`, `timestamp`, `funding_rate`, `relative_funding_rate`) with symmetric `to_dict()`/`from_dict()`. `ticker` = **spot pair**, per the existing `FundingSnapshot.to_dict` docstring. | **`FundingSnapshot`'s 11 mandatory fields must not be made optional.** That would let a 3-key history row masquerade as a full snapshot. |
+| `kraken_funding_rates/export.py` | **+1** `@_register("funding_history") extract_history(symbol, since=None, until=None, client=None)`. **Client-side** date filtering. **Reuse `write_jsonl`** — widen its timestamp-flooring to any row exposing a `timestamp`, do not fork a second writer. | Registry keys `funding_snapshot`/`funding_all`/`funding_many` unchanged. |
+| `kraken_funding_rates/cli.py` | **+1** `backfill` subparser (`--pair`, `--since`, `--until`, `--output/-o`, `--append`) and `cmd_backfill`. `pull`/`extract`/`snapshot`/`list` unchanged. | No change to existing subcommands' flags or output. |
+| `tests/test_client.py`, `tests/test_export.py`, `tests/test_models.py` | New cases: endpoint spelling, client-side filter, the 366-day warning, `ticker` = spot pair, full key set. | Existing tests must pass untouched. |
 
-Net effect: **6 recorded cells → 0 usable out-of-sample measurements, no arm-pair, gate never
-fires.** The guard is doing exactly what it was written to do — a cell replaying 0.9% of its
-peers' bars is degenerate *within a comparable cohort* — but a live-vs-store pair is not such a
-cohort: the two arms differ **by construction** in bar count, so the guard measures the treatment
-and discards the arm it is comparing.
+**Explicitly out of scope for this repo:** `errors.py`, `logging_config.py`, `utils.py`,
+`flake.nix`, `flake.lock`, `nix/`, `scripts/verify_live.py`, `README.md` beyond a short
+usage note, and any change to `pull`.
 
-**This is a defect in the harness, not in the store or the gate.** The CAND-5 estimator is sound;
-it is being invoked through a report path that cannot reach it.
+### 5.2 `~/Projects/kraken-trading-bot` (wiring + honesty only)
 
-- **Deferred to Phase 7** by user decision (2026-10-02), NOT fixed in this pass.
-- **Interim method the reviewer MUST use:** score the two arms as **two separate matrices**, each
-  with its own `min_bar_ratio` reference, then apply `pooled_within_spread` /
-  `dispersion_verdict` across the two sets of replicates. The builder did exactly this and got the
-  numbers in §9A.2.
-- Any future report comparing arms of deliberately different depth **must** state this limitation
-  rather than quoting a `report` run that silently produced no verdict.
+| File | Change | Note |
+|---|---|---|
+| `justfile` | **+1 recipe** `funding-backfill`, beside `funding-pull` (`:152-158`), mirroring its `nix run …#kraken-funding-rates --` shape. Also add it to the recipe list in the header (`:11-12`). | `grep -nE "backfill\|replay\|history" justfile` returns only the *store* recipes (`:180-266`) — confirmed no funding backfill exists. |
+| `configs/default.yaml:117-126` | Correct the **factually wrong** claim: the comment says *"kraken-funding-rates settles ~8-hourly"*. Measured cadence is **hourly** (gap histogram `{1.0h: 8783, 2.0h: 6, 3.0h: 1}` over 8,791 records). The same wrong claim is in `systemd/kraken-trading-bot-funding.timer`. Also record, in-file, the recorder-start boundary and the `signal_observed` semantics change (§6). | **Do not change `signal_max_age_hours: 12`'s value** — see DEV-2. |
+| `systemd/kraken-trading-bot-funding.timer` | Same one-line cadence correction. | No schedule change. |
+| `kraken_trading_bot/rl/data.py:150` | The `_SIGNAL_CHANNELS` producer hint for the funding channel is the string `"just funding-pull"`. It becomes `"just funding-backfill # then just funding-pull"`, so `SignalFileNotFoundError` names the recipe that fills history. | **String literal only** — invisible to `executable_ast`, so `just audit-verify`'s executable-AST check stays MATCH. |
 
-### 9A.2 The gate verdict is `NOT SEPARATED`, and that is a finding
+**Explicitly out of scope for this repo — no adjacent rewrites:**
+`kraken_trading_bot/rl/features.py`, the seam logic in `rl/data.py`,
+`rl/train.py`, `rl/backtest.py`, `rl/environment.py`, `rl/registry.py`, `engine.py`,
+`strategies/`, `tools/*`, `tests/`, and `configs/default.yaml:17-18` (`fee_rate`/`slippage`
+are G6, a separate decision).
 
-Six cells (2 arms × 3 seeds), 0 invalid at run time, 0 errored. Measured with the shipped
-`pooled_within_spread` + `dispersion_verdict` (threshold 1.0, `MIN_REPLICATES_FOR_A_CLAIM` 3):
+### 5.3 DEV-2 — overriding RESEARCH-2 §7.2 on `signal_max_age_hours`
 
-| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
-|---|---|---|---|---|---|---|
-| `excess_return` (headline) | −3.23% | −19.48% | 439.01% | 16.24% | **0.037** | **NOT SEPARATED** |
-| `total_return` | +4.07% | +225.13% | 439.06% | 221.06% | **0.503** | **NOT SEPARATED** |
-| `sharpe` | +0.574 | +1.626 | 0.751 | 1.052 | 1.400 | RESOLVED |
-| `max_drawdown` | +4.79% | +66.97% | 0.058 | 0.622 | 10.74 | RESOLVED |
+RESEARCH-2 §7.2 notes 12 h is ~12× looser than the hourly series needs and calls fixing it
+"a free fix alongside the backfill". **I am fixing the comment, not the value.** Reasons from
+the consumer's own code:
 
-**Why the headline is `NOT SEPARATED`:** the store arm's own within-group IQR is **8.73** — its three
-seeds returned **+53%, +225%, +1800%**. The apparent between-arm gap sits entirely inside seed
-noise, so those medians are not ordered by the data. This is precisely the presentation CAND-5
-exists to prevent, and it is working.
-
-**The two RESOLVED rows are NOT evidence of a better model** and must never be reported as such.
-They are **confounded by horizon**: the store arm replays 76,538 bars against the live arm's 697,
-and *both* replay bars they were fitted on (neither arm is pinned here), so a longer in-sample fit
-mechanically produces both a higher Sharpe and a deeper drawdown. `timesteps` was 10,000 on both
-arms — **depth buys normalization-sample size and regime diversity, not gradient steps.**
-
-### 9A.3 Honest out-of-sample result is NEGATIVE
-
-The +225% figure is **in-sample and is not a result**. Both arms above are unpinned, so backtest
-replays the bars the model was fitted on. The pinned store model (`storeP1`) backtested on the
-**disjoint** eval tail:
-
-| | value |
-|---|---|
-| `total_return` | **−34.30%** |
-| `sharpe` | **−0.568** |
-| `max_drawdown` | 54.22% |
-| `num_trades` | 11,866 |
-| bars replayed | 15,749 / 15,773 |
-| buy-and-hold | −19.46% |
-| **excess** | **−14.84%** |
-
-**What CAND-3a actually delivered, stated without inflation:** a store makes an
-**out-of-sample measurement possible at all**. On the shipped default, `since`/`until: null` means
-`training_frame` and `evaluation_frame` return the **same object**, so no OOS number existed to be
-good or bad. It did **not** deliver better returns, and it did not deliver a claim that could be
-adjudicated without the two-matrix method in §9A.1.
-
-**Wording to use in all downstream reports** (user-specified, binding):
-> The store arm reached **76,562 bars** with **disjoint** train/eval splits over a pinned
-> 2020→2026 window. Honest out-of-sample result: **−34.3% return, Sharpe −0.568**. The CAND-5 gate
-> reports **NOT SEPARATED** on both return metrics. **No claim of improvement.**
-
-Two further facts that fall out of the measurement:
-- **Pinning alone is not enough and, without a store, is actively destructive** — pinned on the
-  live arm it yields **0 train / 0 eval**. The store is a *precondition* for pinning, not an
-  optional extra.
-- **The store flip is not deliverable without the non-finite guard** (`bfe32aa`). The seeded
-  archive carries 4 zero-volume bars; `pct_change`
-  turns it into `inf`, which the documented `compute → ffill → fillna(0)` policy cannot repair, and
-  one such bar inside the training slice poisoned all 36,804 rows and killed PPO. **The live arm was
-  unaffected** (721 Kraken bars contain no zero-volume bar), so this was invisible until the store
-  was switched on.
-  > **CORRECTION (2026-10-02, Phase 6 finding F4) — the diagnosis above was wrong, the
-  > finding was not.** The original wording here read "a zero-volume bar at each partial-month
-  > boundary", implying a Binance monthly-file artifact. That is **factually false**: all 4 bars are
-  > **mid-month**, **0 of the 106 month-first bars** in the archive are zero-volume, and 2 of the 4
-  > (`2020-12-21 14:00`, `2021-02-11 03:00`) sit *immediately before* a missing-bar gap. They are
-  > **exchange-outage no-trade bars** (`2019-06-07 21:00`, `2020-12-21 14:00`, `2021-02-11 03:00`,
-  > `2023-03-24 12:00`) — a data-integrity problem in the upstream exchange feed, not a
-  > month-partitioning artifact. The **symptom, the non-finite guard and the requirement are
-  > unchanged**; only the attributed cause was wrong. Git history is left intact deliberately —
-  > `bfe32aa`'s commit message still carries the old wording.
+* On a dense series the bound **cannot change anything observable**: every bar carries its own
+  record, so `_signal_ages` (`data.py:544-588`) returns `0.0` on every bar and the mask at
+  `:800` (`ages <= bound_hours`) passes for any bound ≥ 0. Measured `signal_age_hours` max
+  after the backfill is **1.0** at a bound of 12. Lowering it to 1 h would produce the *same*
+  observation on a backfilled window — so it buys nothing here.
+* But it **would** change behaviour for any *pre-existing* model or forward-only file that
+  relies on the 12-hour carry across missed hourly pulls, and `configs/default.yaml:113-115`
+  documents that the 12 h is deliberately there to bridge more than one missed pull. Changing
+  it is a **behavioural** change to a config key that already ships, bundled silently into a
+  data-provenance change.
+* The **comment** is the actual defect: a stated cadence that is wrong by 8× is what would
+  mislead the next reader into widening it again. Correct that; leave the number alone and say
+  in the comment that 12 h is a deliberate upper bound on a max-3 h-gap series.
 
 ---
 
-## 10. DEVIATIONS — labelled
+## 6. Phase 5 contract — the integration sketch
 
-1. **DEVIATION — CAND-5 is inside the outcome, not a separate one.** RESEARCH-3 §6.3 recommends
-   landing it as item 1 of a five-item order. I collapse items 1 and 3 into one outcome. Justified
-   from the consumer: CAND-3a's acceptance criterion is a two-arm matrix number, and `report`/
-   `_build_claims` is the only thing that produces one — shipping the store without the gate ships
-   an unadjudicable claim. *Visible so a reviewer does not read it as scope creep.*
-2. **DEVIATION — R4 labels the venue in the model's `config.yaml`, not in the sibling's
-   `_meta.json`.** Justified from the consumer: this repo consumes `kraken-market-data` as a pinned
-   flake input (`rev 055d7f6`), so a sibling edit would not reach `nix develop` without a
-   `flake.lock` bump and a push, and the builder owns a worktree of *this* repo. `train.py` already
-   writes `n_features`/`n_bars` into the artifact as provenance; the venue belongs beside them, on
-   the artifact the reviewer already opens. Sibling `_meta.json` is a follow-up, not dropped.
-3. **DEVIATION — `market_data_store: null` STAYS `null` in `configs/default.yaml`.** The literal
-   reading of "flip the config key" would edit the shipped default; that would make
-   `read_ohlc_dataframe` raise `ValueError` from `_resolve_store` (`data.py:1244-1251`) on any host
-   without the store. The flip belongs in `configs/deep-history.example.yaml:81` (already correct)
-   and in a per-model config. *This is the one place a downstream builder could reasonably
-   disagree — the consumer's code is unambiguous that a non-null unresolvable path raises, so the
-   decision stands.*
-4. **DEVIATION — `since`/`until` push-down (CAND-3b, ~21 ln) is DEFERRED**, against RESEARCH-3's
-   own ordering which places it at step 4. Justified from the consumer: `train.py:215-226` and
-   `backtest.py:400-419` never pass `since`/`until` at all, so on the default path the push-down is
-   dead code; and a whole-store read is **0.142 s** against **0.010 s** windowed (RESEARCH-3 §1.5), so
-   the saving is not load-bearing for a 158 s-seeded store. It becomes worth landing the moment
-   Phase 6 pins a window and the split is computed in Python rather than in `store.read`.
-5. **Width figures are my own measurements, and they differ from RESEARCH/AUDIT by one column at the
-   full allow-list.** Measured on this host at `a4c14d4`: bare **52**, shipped funding file **60**,
-   full allow-list **66** (AUDIT.md:116 and RESEARCH §1 quote 65 at the full allow-list; the +1 is
-   the microstructure `spread` column, which I count and the earlier passes evidently did not). I
-   am reporting the measured numbers and flagging the discrepancy rather than quietly adopting
-   either. The two figures this decision actually rests on — **52** and **60** — match both sources.
+**Transport: a shared local path, not a pipe.** The contract that already exists *is* a
+shared local path, and the producer is already a separate repo on the same machine invoked by
+absolute path (`nix run ~/Projects/kraken-funding-rates#kraken-funding-rates`). Reasons:
+
+* `configs/default.yaml:92` already names the path; `justfile:157` writes it; the systemd unit
+  writes it; `merge_extra_features` reads it. A pipe would add a second transport and break
+  the shipped default's offline story (`market_data_store: null`, `configs/default.yaml:185`).
+* The merge seam is **file-based by construction** — `merge_extra_features` takes a path
+  (`data.py:593`), opens it (`:698`), and raises `SignalFileNotFoundError` naming the config
+  key, the value as written, and the expanded path (`:689-694`). A pipe is not representable
+  in that signature, and changing it is out of scope.
+* Append-only JSONL is the producer's existing contract (`justfile:158 --append`).
+
+**Record: one JSON object per `(ticker, floored UTC hour)`, 13 keys, appended to the existing
+file.** Never a second file — `available_cols` is a per-file intersection (`data.py:765-769`),
+so a separate file would narrow the observation (measured: **57 → 52**, §6.1).
+
+| key | source | value |
+|---|---|---|
+| `ticker` | mapped spot pair | `"ETH/USD"` — **never** `PF_ETHUSD` (`signal_require_ticker: true`, `configs/default.yaml:137`) |
+| `symbol` | history `symbol` | `"PF_ETHUSD"` |
+| `spot_pair` | mapped spot pair | `"ETH/USD"` |
+| `timestamp` | history `timestamp`, hour-floored | `"2025-10-01T08:00:00+00:00"` — normalised through the same `write_jsonl` path so the file holds **one** timestamp spelling, not two (RESEARCH-2 §6(b)) |
+| `funding_rate` | history `fundingRate` | **the recovered column** |
+| `relative_funding_rate` | history `relativeFundingRate` | recorded, **not** merged (§4) |
+| `funding_rate_prediction` | not in history | `null` |
+| `mark_price` | not in history | `null` |
+| `index_price` | not in history | `null` |
+| `basis` | not derivable | `null` — **never** `relativeFundingRate` |
+| `open_interest` | not published | `null` |
+| `bid` | not published | `null` |
+| `ask` | not published | `null` |
+| `vol24h` | not affordable | `null` |
+
+### 6.1 The absent value is JSON `null` — DEV-3, and measured as observationally equivalent
+
+RESEARCH-2 §6(2) recommended `0.0` to preserve today's "structurally zero" meaning. I
+measured both, on the identical frame:
+
+| absent value written | `n_features` | `spread` distinct | `spread` nonzero | `spread` max | non-finite obs cells |
+|---|---|---|---|---|---|
+| `null` | **57** | 2 | **24** | 3.695e-05 | **0** |
+| `0.0` | **57** | 2 | **24** | 3.695e-05 | **0** |
+| today (1 live record) | **57** | 2 | **24** | 3.695e-05 | **0** |
+
+**They are observationally identical**, because `data.py:816 fillna(0.0)` already converts
+either NaN or `0.0` to the same value, and the exact-duplicate-hour dedup at `data.py:755`
+(`keep="last"`) lets the appended live record win the overlap hour wholesale. So this choice
+is **purely about record honesty**, and I choose `null`:
+
+* `write_jsonl` does `json.dumps(record, default=str)` (`export.py:153`), so `0.0` is written
+  as `0.0` — **byte-identical to a genuine reading of exactly zero**. For `funding_rate` that
+  is not hypothetical: the measured trailing window has 102 negative hours and crosses zero, so
+  `0.0` is a plausible real value. A file that cannot distinguish "measured zero" from "never
+  read" is the defect class this repo has already been bitten by.
+* The repo's own declared semantics say zero *is* absence here: `features.py:28-48` puts
+  `0.0` in `_NON_FINITE_INPUTS` and says so explicitly. Writing `0.0` for "not read" would
+  contradict the pipeline's own vocabulary, and `_add_microstructure_features` coerces a `0.0`
+  bid to NaN anyway (`features.py:1008-1015`), so `0.0` buys no semantics — only a
+  fabricated-looking number in the file.
+* `null` still keeps `relative_funding_rate` and every `null` field out of the observation for
+  free, because `data.py:765-769` intersects against `_SIGNAL_COLUMNS` and
+  `_SIGNAL_COLUMNS` does not contain them.
+
+**The docstring must say which was chosen and why** (RESEARCH-2 §6(2)'s own instruction).
+
+### 6.2 Scheduler
+
+* **Newest hour:** unchanged — `systemd/kraken-trading-bot-funding.timer`,
+  `OnCalendar=*-*-* *:17:00`, `Persistent=true`.
+* **History:** `just funding-backfill`, run manually and documented as **needing periodic
+  top-up**, because the server window is a rolling ~366-day cap that **ages out** — after ~1
+  year the oldest records fall off the back. A daily or weekly invocation is belt-and-braces,
+  not a new timer. RESEARCH-2 §8 records this; it belongs in the recipe's comment.
 
 ---
 
-## 11. WHAT THE BUILDER OWNS, IN ONE PLACE
+## 7. Acceptance criteria the Phase 6 gate will check
 
-1. **CAND-5 gate** in `tools/model_matrix.py` — behind the count gate, `n>=3 AND pooled_iqr>0`,
-   output a **ratio**. §6. Four regression cases. (~50 ln)
-2. **`just store-plan` / `store-seed` / `store-stats` / `store-verify`** — hermetic, run under this
-   repo's dev shell, **assert `store_mode == "market-data"`, refuse `fallback-csv`**. §7. (~40 ln)
-3. **Pinned-window example + venue label** in `configs/deep-history.example.yaml`, the label key in
-   `configs/default.yaml` (comment-only, `market_data_store` stays `null`), one INFO log line on the
-   store leg naming the venue. (~25 ln)
-4. **Tests** for 1 and 2. (~60 ln)
-5. **Not in scope:** CAND-4, the `since`/`until` push-down, any new repo, any new flake input, any
-   sibling-repo commit.
+### 7.0 First: the two traps this repo has shipped defects through
 
-**Verification the builder must run:** `nix develop --command bash -c "python -m pytest -q"` from
-the repo root (never `.venv/bin/python` — its editable install points at the MAIN checkout and will
-silently test a different tree), then `nix flake check --no-build`, then a store-backed
-`train` + `backtest` against the live-leg baseline showing `n_bars` **76,561 vs 721**, `n_features`
-**60 vs 60**, `start_index` **24 vs 24**, and disjoint train/eval slices over a pinned window.
+**TRAP 1 — width is PER CONFIGURATION. There is no single width.** Because consumers are
+presence-gated, the observation width is dynamic. Measured on a 721-bar 60m frame with
+`feature_windows: [1, 4, 24]` and all five `feature_groups`:
 
----
-
-*End of decision. Written by the architect for team `audit-pipeline-1002`; nothing outside this file
-was modified, committed or deleted.*
-
----
-
-## 12. USER DECISIONS — 2026-10-02, binding on the reviewer
-
-Recorded at the checkpoint between Phase 4B and Phase 5. These are decisions, not proposals.
-
-1. **`configs/default.yaml` stays as-is.** `market_data_store: null` and `since/until: null` are
-   **coupled**: pinning without a store yields 0 train / 0 eval bars, so making out-of-sample the
-   default would break fresh clones. Pinned windows live in `configs/deep-history.example.yaml` and
-   in per-model `models/{TICKER_ID}/{NAME}/config.yaml`.
-2. **When `since`/`until` are null, the output must label the result `IN-SAMPLE`** so it cannot be
-   read as out-of-sample. Implemented by `builder-inlabel`.
-3. **Pinning with no store must fail with a message naming the seed recipe**, not a bare
-   `NotEnoughDataError`. Implemented by `builder-inlabel`.
-4. **The mixed-matrix harness defect (§9A.1) is Phase 7, not this pass.** For this pass's gate the
-   two arms are scored as **two separate matrices**, each with its own `min_bar_ratio` reference.
-   The defect is nevertheless documented in §9A.1 so the limitation is on record before it is fixed.
-5. **Required before the reviewer's gate verdict:**
-   - the non-finite guard swept across every ratio/log/pct_change feature, plus a hard finite-check
-     after normalization on **both** `fit` and `transform`, failing loudly and naming the offending
-     column (`builder-inf`);
-   - **live-arm width-neutrality proven bit-identical** before and after the fix — 60 features,
-     `start_index` 24 — so no `models/` artifact is invalidated;
-   - the **76,562 vs 76,561** bar-count discrepancy resolved and attributed to a specific bar
-     (leading hypothesis: the store arm's live upsert leg contributed one additional bar);
-   - the **+1800% seed** confirmed *not* a degenerate artifact of the zero-volume boundary bars
-     before it is described as seed noise.
-
-### Two-reviewer-group split for this pass (busy-time limit)
-
-Three agents were aborted by the busy-time limit during Phase 4B, all on briefs that bundled
-implementation with verification. This pass therefore separates them: `builder-inf` and
-`builder-inlabel` implement (disjoint file ownership: `features.py` vs
-`data.py`/`backtest.py`/`export.py`), and the reviewer verifies. **No teammate both implements and
-verifies its own claim.**
-
-### 14.0 COST-AWARE GATE RESULT (measurement track, merged after this section)
-
-Parameters applied **exactly** as §13.1 pre-registered: threshold read from the shipped module
-and `assert`ed `== 1.0` (not passed as a literal), cost basis `fee_rate: 0.0026` /
-`slippage: 0.0005`, shipped estimator, ticker `ETH_USD`, seeds 42/43/44, **no retraining**.
-
-| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
-|---|---|---|---|---|---|---|
-| `excess_return` (headline) | −12.44% | −341.22% | 3.97% | 328.79pp | **82.91** | **RESOLVED** |
-| `total_return` | −5.26% | −99.76% | 3.89% | 94.51pp | **24.29** | **RESOLVED** |
-| `sharpe` | −0.719 | −4.976 | 1.404 | 4.257 | **3.03** | **RESOLVED** |
-| `max_drawdown` | 8.51% | 99.85% | 1.69% | 91.34pp | **53.91** | **RESOLVED** |
-
-**Stated plainly, as §13.3 required: the strategy loses money after costs in BOTH arms, in all six
-cells.** Live median −5.26% (equity $9,474 / $9,062 / $9,813). Store median **−99.76%** (equity
-**$23.68 / $12.03 / $818.02**), 99.85% max drawdown — a wipeout, not a drawdown statistic. The
-policy re-enters every **~1.22 bars in the live arm** (1.216 / 1.191 / 1.234, median 1.216) and every
-**~1.43 bars in the store arm** (1.649 / 1.429 / 1.139, median 1.429), while replaying 110× more bars.
-
-**The store arm's cost ratio is NOT directly recomputable, and no single figure is claimed.** The
-backtest records carry `fee_rate`, `slippage`, `n_bars`, `num_trades` and `final_equity` but **no
-notional or position size**, so absolute cost cannot be rebuilt. Two reproducible proxies, and
-**neither is picked as the true ratio**:
-
-| proxy | per-seed | median | what it assumes |
+| Configuration | `n_features` | the 6 funding columns present | `signal_observed` bars |
 |---|---|---|---|
-| seed-matched **trades** ratio (`store num_trades / live num_trades`) | 81.0× / 91.6× / 118.9× | **91.6×** | fixed notional — cost scales with trade count |
-| **final-equity drag** ratio (`ctrl_equity − cost_equity`) | 34.1× / 18.6× / 179.7× | **34.1×** | fractional equity on a compounding curve |
+| all three `*_features_file` = `null` | **49** | 0 / 6 | n/a |
+| shipped default, live 1-record file (**baseline**) | **57** | 6 / 6 | 13 / 721 |
+| shipped default + `backfill --append`, full 13-key records (**target**) | **57** | 6 / 6 | **721 / 721** |
+| full 13-key records minus `bid`/`ask` (loses `spread`) | **56** | 5 / 6 | 721 / 721 |
+| ⚠️ **HAZARD** — backfill writing only `funding_rate` | **52** | 1 / 6 | 721 / 721 |
 
-They disagree by ~2.7× because the store arm's balance collapses (to $23.68 / $12.03 / $818.02), so
-drag is measured over a shrinking notional. The drag proxy's 179.7× outlier is seed 44, whose
-frictionless `ctrl_equity` is **$190,009** — the +1800% seed — so its drag spans a ~19× notional and
-is not comparable to the others; that is why the median, not the mean, is quoted. **The earlier
-`~145×` figure this line carried is withdrawn: it is not derivable from these records under either
-sizing.** Both proxies feed no verdict — §13.3 forbids directional framing either way.
+**Sane range: 49 – 57.** The gate must assert **57 for the shipped-default configuration** and
+**49 for the all-null configuration**, and must treat the range as legitimate. A gate that
+asserts a bare number taken from a synthetic fixture becomes a false gate — and note that
+`features.py:494-496` **already contains one**: *"the shipped `configs/default.yaml` composes
+52"*. Measured, the shipped default composes **57**. The docstring omits the signal-channel
+contribution entirely. Recorded as **F-1** below; it is a docstring defect in a file this
+decision does not edit.
 
-**No "store arm improved" claim is made in either direction.**
-What CAND-3a delivered is unchanged and orthogonal: *an out-of-sample measurement became possible
-at all.*
+**TRAP 2 — every criterion below names the artifact AND the literal token that must be true in
+it.** A check that asserts a fact about a library without being bound to a substring in a
+named file is the defect class that let two restored defects pass 11/11.
 
-**Both previously-RESOLVED rows re-derived: the verdicts survive, the evidence does not.** `sharpe`'s
-gap **sign flips** (+1.005 higher frictionless → 4.257 lower under costs; every cell negative) —
-exactly the churn artifact §13.2 predicted, now measured rather than argued. `max_drawdown`'s
-magnitude inflates 5× on a larger numerator, not more signal.
+### 7.1 Producer correctness
 
-**CORRECTION — §13.1's pre-registered magnitude prediction was wrong, and the error was mine.**
-§13.1 predicted ratio ≈1.4 (pooled IQR ~11.7pp against a 16.24pp gap). Measured: pooled IQR
-**3.97pp**, gap **328.79pp** → ratio **82.91**, ~59× off. The pre-registration held the **gap**
-fixed while swapping a cost-aware **pooled IQR**, but the gap is the variable that moved most
-(16.24pp → 328.79pp, the store arm's return travelling −322pp). Holding one side of a ratio
-constant across a change that moves it 20× is not a valid projection. **The verdict is
-unaffected** — both figures sit on the same side of a threshold fixed and committed in advance —
-and **the threshold was not touched to reconcile it.** What the pre-registration bought — the
-direction call, and the rule that `RESOLVED` is not a claim the store helps — both held.
+| # | Criterion | Artifact | Literal token that must be present |
+|---|---|---|---|
+| A1 | The history endpoint is spelled **kebab-case**. Five other spellings return 404. | `kraken-funding-rates/kraken_funding_rates/client.py` | the string `"/historical-funding-rates"` — assert this **substring**, not merely "the backfill runs" |
+| A2 | The field union is exactly `{fundingRate, relativeFundingRate, timestamp}`; `fundingRate` is written to `funding_rate` | `client.py`, `models.py` | `FundingHistoryRow`, `funding_rate`, `relative_funding_rate` |
+| A3 | **`relativeFundingRate` is NEVER written to `basis`.** This is a silent unit substitution (`relativeFundingRate == fundingRate / indexPrice`, measured ratio 4147.45 / 2664.89 across the span). | `models.py` | `FundingHistoryRow` must exist AND no assignment of `relative_funding_rate` to `basis` anywhere in the file |
+| A4 | `--since`/`--until` are filtered **client-side** and a `--since` older than the earliest returned record **warns with both dates named** | `export.py`, `cli.py` | `funding_history` registry key; the warning text |
+| A5 | `ticker` is the **spot pair**, never `PF_ETHUSD` | `models.py` | `to_dict` emits `self.spot_pair` under `"ticker"` — the existing `FundingSnapshot.to_dict` docstring explains the failure mode; A5 asserts the *history* dataclass does the same |
+| A6 | Timestamps are normalised through the **existing** `write_jsonl` hour-flooring path, so the file has **one** timestamp spelling | `export.py` | `write_jsonl` — assert no second writer function was added |
+| A7 | Bit-identity: `funding_rate` for the checked-in hour equals `0.02527185133308243` exactly | `tests/test_export.py` | the literal `0.02527185133308243` — this value matches **exactly 1 of 8,791** records, at `2026-10-02T00:00:00Z`, and is the strongest available proof the history is the *same series*, not a proxy |
 
-**Control fidelity.** The store arm reproduces frictionless to ~0.1% (+224.86 / +52.98 / +1800.10
-vs recorded +225.13 / +53.17 / +1800.10; ratio 0.031 vs 0.037). **The live arm drifts** (+4.27 /
-−1.14 / +8.65 vs +4.07 / −0.44 / +8.87) because it re-fetches a **rolling** REST window. **A
-live-arm backtest cannot be replayed bit-identically across days; a store-backed one can** — an
-unplanned argument for what this pass built.
+### 7.2 File shape
+
+| # | Criterion | Artifact | Token |
+|---|---|---|---|
+| B1 | `signals/eth_usd_funding.jsonl` holds **≥ 1000** lines (was 1) | the file | line count |
+| B2 | **Every** line carries **exactly the same 13 keys** as the live record | the file | `sorted(set(keys))` identical across all lines |
+| B3 | `ticker == "ETH/USD"` on **every** line | the file | `"ticker": "ETH/USD"` — `PF_ETHUSD` here trips `signal_require_ticker: true` on every record |
+| B4 | The file was **appended to**, not replaced; the original live record is still present | the file | the `2026-10-02T00:00:00+00:00` line survives |
+| B5 | One timestamp spelling only (no mixed `Z` and `+00:00`) | the file | every `timestamp` ends in `+00:00` |
+| B6 | No backfilled record fabricates a measurement: `funding_rate_prediction`, `mark_price`, `index_price`, `basis`, `open_interest`, `bid`, `ask`, `vol24h` are JSON `null` on backfilled rows | the file | `"basis": null` |
+
+### 7.3 Observation-level, on a real end-to-end train/backtest run
+
+Measured on a **synthetic** 721-bar 60m frame. The gate must **re-derive** these on a real
+frame; the fixture-independent ones are marked ★ (those are the ones safe to assert as
+constants), the frame-dependent ones are marked ⚑ with the measured value as *evidence for a
+floor*, never as a constant.
+
+| # | Criterion | Expected | Kind |
+|---|---|---|---|
+| C1 | ★ `n_features` for the **shipped-default** config | **== 57** (baseline 57, target 57; sane range 49–57) | exact |
+| C2 | ★ `n_features` with **all three** `*_features_file` = `null` | **== 49** | exact |
+| C3 | ★ The six funding columns are all present in `FeaturePipeline.compute` output | 6 / 6 | exact |
+| C4 | ★ `tools/width_check.py` / `check_feature_width` does not raise; `normalization.npz`'s `feature_names` set is unchanged | `FeatureWidthMismatchError` absent | exact |
+| C5 | ★ `first_tradable_index` unchanged | **== 24** before and after | exact |
+| C6 | ★ `basis`, `open_interest`, `funding_rate_prediction`, `vol24h` remain **constant 0.0** on the backfilled window | 721/721 zeros — **this is the expected result, not a failure**, and the receipt must say "1 of 6" | exact |
+| C7 | ★ `spread` is **unchanged**: exactly 24 nonzero bars, max `3.695e-05` | identical before and after | exact |
+| C8 | ★ observation has **zero** non-finite cells | 0 | exact |
+| C9 | ⚑ `funding_rate` distinct values over the 721-bar training frame | **≥ 700** (measured 720; baseline **2**) | floor |
+| C10 | ⚑ `funding_rate` column std over the frame | **≥ 0.015** (measured 0.02332; baseline 0.00336 — ×6.9) | floor |
+| C11 | ⚑ `signal_observed` fraction of bars | **≥ 0.98** (measured 721/721; baseline 13/721) | floor |
+| C12 | ⚑ `signal_age_hours` max | **≤ 2.0** (measured 1.0 at a 12 h bound) | ceiling |
+
+### 7.4 The `signal_observed` semantics change — REQUIRED disclosure, not a footnote
+
+**F-2.** `observed = filled.notna().any(axis=1)` (`data.py:812`), combined across sources by
+`_combine_freshness` (`:828`). It is therefore a **per-channel OR**. After the backfill
+`signal_observed` becomes **1.0 on 721 of 721 bars** while **four of the six** funding columns
+are still **100% zero-fill with no reading behind them**.
+
+Today `signal_observed == 0` is what tells the agent those are fabricated. After this change
+that per-column diagnostic is gone at the channel level.
+
+This is **not fixable for free** and must not be papered over. It is the honest price of the
+gap's own definition — per `configs/default.yaml:107-109`, *"1.0 when a record for `ticker`
+landed in the window"*, and a record **does** now land on every bar. The required response:
+
+* state it in `configs/default.yaml` at the `signal_max_age_hours` comment, and
+* state it in the Phase 6 receipt, in the words *"funding covers the most recent year;
+  `basis`/`open_interest`/`funding_rate_prediction`/`vol24h` are still structurally zero and
+  `signal_observed` no longer distinguishes them per column"* — which is precisely the
+  framing RESEARCH §1.17 prescribes for the G4 coupling.
+
+Redesigning `signal_observed` into a per-column mask is **out of scope** (it would widen the
+observation, invalidate every artifact, and is a different decision).
+
+### 7.5 Recorder start — the §1.1 cold-start criterion, as an acceptance criterion
+
+**F-3.** RESEARCH §1.1: G1 and G2 are both forward-only and share one trap. For **G2** the trap
+is *bounded and stated*: the backfilled file's coverage starts at the **earliest record Kraken
+returns**, which is a rolling cap recomputed on every call. Measured now:
+**`2025-10-01T08:00:00Z`**, i.e. **366.58 days / 8,791 hourly bars**. The gate must assert:
+
+* the **earliest timestamp in the file** and the **latest**, and print the span in days and in
+  bars;
+* that the span covers the whole training window
+  (`first_tradable_index`..end), or — if it does not — that the uncovered prefix is explicitly
+  reported with `signal_observed == 0` on exactly those bars;
+* that no bar **before** the file's earliest record is claimed as observed.
+
+Per this repo's own policy (*absence ≠ neutral*, `data.py:806-816`), the honest framing is
+*"funding covers the most recent ~1 year; `signal_observed`/`signal_age_hours` are how you
+tell"*. **Neither feature may be gated on `signal_observed`** — that is G1's feature.
+
+**Coupling to G4 (RESEARCH §1.17), stated in the receipt:** 366 d ≈ 8,766 hourly bars covers the
+~721-bar live ceiling and any hourly store. On **15-minute** bars it is ~35k bars, so a
+multi-year G4 store would have the **last two years** silently zero-filled. That is the honest
+limitation to record, and it is a reason to prefer this keyless feed over chasing deeper
+third-party archives.
+
+### 7.6 Supply-chain and structural regression gates
+
+| # | Criterion | How |
+|---|---|---|
+| D1 | ★ `kraken_trading_bot/rl/features.py` and `rl/data.py` **executable AST unchanged** | `just audit-verify --prereg <ref> --since <ref>` must print `executable-ast  MATCH` and `measurement-track  MATCH` (`tools/audit_checks.py`; `PY_FILES` at `:52-58`). The only `data.py` edit is a **string literal** at `:150`, and `executable_ast` blanks strings. |
+| D2 | ★ `pytest tests/ -q` passes, and `audit-verify`'s `suite` check reports `PASS` | `just audit-verify` |
+| D3 | ★ `tools/model_matrix.py` byte-identical to its pre-registration commit | `cmd_verify` check #1 (`:157-168`) — never edit the measurement track to make a number come out right |
+| D4 | ★ The backfill is reachable through the recipe, not only by hand | `justfile` must contain the literal `funding-backfill` |
+| D5 | ★ The wrong cadence claim is gone from both places | `configs/default.yaml:117-126` and `systemd/kraken-trading-bot-funding.timer` must **not** contain the substring `8-hourly`; both must state the measured hourly cadence |
+| D6 | ★ The refusal names the history recipe | `kraken_trading_bot/rl/data.py:150` must contain `funding-backfill` (string-only edit, so D1 still passes) |
+| D7 | ★ No POST-retry was introduced | `kraken-funding-rates` has no private/order endpoints, and `client.py:_get` is unchanged — no session-level `Retry` was mounted. RESEARCH §1.15: an auto-retried POST risks replaying an order against a stale per-key nonce. Assert `_MAX_RETRIES` is still `3` at `client.py:25` and that `client.py`'s `_get` is byte-identical to its pre-change blob. |
+| D8 | ★ Nothing cited is `/tmp`-only | `just audit-evidence` |
+
+### 7.7 Finding dispositions
+
+`just audit-findings` requires every `F<n>` in `VALIDATION.md` to appear in **this file**
+(`audit_checks.py:358-381`). Dispositions recorded so far:
+
+| id | finding | disposition |
+|---|---|---|
+| **F-1** | `features.py:494-496` states the shipped `configs/default.yaml` "composes 52" width. Measured: **57**. The docstring's explanation ("depends on `feature_windows` and `feature_groups`") omits the signal-channel contribution. | **Accepted, not fixed here** — it is a docstring in a file this decision does not edit, and `features.py` is under the `executable-ast` guard (D1). Phase 6 must confirm the measurement and either correct the docstring in a separate, string-only commit (invisible to D1) or record it as known. **This is the in-tree instance of Trap 1.** |
+| **F-2** | `signal_observed` flips to 1 on 721/721 bars while 4 of 6 funding columns remain zero-fill, removing the per-column absence diagnostic. | **Accepted and disclosed** — §7.4. Structural to `data.py:812`'s per-channel OR. Not fixable without widening the observation. |
+| **F-3** | Forward-only cold start: the file's coverage starts at a rolling ~366-day cap, measured from `2025-10-01T08:00:00Z`. | **Accepted, bounded, and asserted** — §7.5. Not a footnote. |
+| **F-4** | DEV-1: AUDIT.md:153 says 12 of 721 bars observed; measured **13**. | **Correction recorded.** AUDIT's arithmetic ignored that the record sits at the frame's right edge, so the 12 h carry is clipped by the frame end. The gate uses 13. |
+| **F-5** | DEV-3: RESEARCH-2 §6(2) preferred `0.0` for unrecoverable fields; this decision uses `null`. | **Override, measured equivalent** — §6.1 shows the observation is byte-identical either way; the choice is record honesty only. |
+| **F-6** | DEV-2: RESEARCH-2 §7.2 suggested tightening `signal_max_age_hours` 12 → ~1. | **Override: fix the comment, not the value** — §5.3. The bound cannot change the observation on a dense series, and changing a shipped behavioural key inside a provenance change is out of scope. |
+
+Any `F<n>` raised in Phase 6 that is not in this table **must be appended here** before
+`just audit-findings` is allowed to pass.
 
 ---
 
-## 13. PRE-REGISTERED DISPERSION RULE — committed BEFORE the cost-aware re-run
+## 8. Runner-ups, and why they lost
 
-**Written and committed before any cost-aware number exists.** That ordering is the entire point
-of this section: the threshold below is fixed now, so it cannot be tuned to produce a preferred
-verdict once the result is known.
+### 8.1 `NEW-DATA-SOURCE` — a new sibling repo
 
-**Background (Phase 6 finding F1).** The frictionless gate yielded `NOT SEPARATED` on both return
-metrics, and §9A.2 attributed that to seed noise. That attribution is **wrong**. At Kraken taker
-costs the store arm's within-group IQR collapses from 1961.45pp to 11.68pp (168×) while the
-return goes from +2015% to −88%. The frictionless dispersion was measuring **cost sensitivity**,
-not seed variance. §9A.2 is therefore superseded, not patched — see §13.2.
+Lost to §2. The producer already exists, on the same host, through the same client, with the
+same retry policy; the record shape and the `ticker`-is-the-spot-pair rule are already encoded
+and documented; and the target is on the **un-pinned path flake** side of the supply-chain
+asymmetry, so a new repo would add a flake, a Nix module and a CI pipeline to make the fix
+*harder* to reach the actual run path.
 
-### 13.1 The rule, fixed now
+*Best future form of this outcome type:* **G1-on-Tardis** — a `kraken-order-book` sibling
+backed by a paid historical-L2 feed, the only verified route to Kraken depth history
+(RESEARCH-1 §3.8). Separate pass, separate budget conversation.
 
-| | |
-|---|---|
-| **Cost basis for every quoted number** | **Kraken taker: `fee_rate: 0.0026`, `slippage: 0.0005`** (31 bp round-trip) |
-| **Estimator** | unchanged — the shipped `pooled_within_spread` = **median** of per-group IQRs over groups with `n >= 3`, and `dispersion_verdict` |
-| **Ratio** | `gap / pooled`, `gap = abs(median_A − median_B)` over adjacent arms. **The ratio is a fact.** |
-| **Threshold** | **`DISPERSION_RATIO_THRESHOLD = 1.0`, UNCHANGED** |
-| `ratio >= 1.0` | `RESOLVED` |
-| `0 < ratio < 1.0` | `NOT SEPARATED` |
-| `n < 3`, or `pooled == 0`, or missing arm median | `UNDEFINED` (no number invented) |
-| **Ordering** | must sit **BEHIND** the count gate and require `n >= 3 AND pooled > 0` |
-| **Never tuned post hoc** | the threshold stays 1.0 whatever the re-run returns |
+### 8.2 G1 — `microstructure` dead machinery / `order_book_imbalance`
 
-**Pre-registered expectation, stated before the run:** with IQR ≈ 11.7pp under costs, the
-`excess_return` gap (16.24pp) gives a ratio of roughly **1.4**, i.e. it may well come back
-`RESOLVED` — and if it does, **`RESOLVED` is not a claim that the store helps.** A resolved
-return difference at 31 bp costs on a churn-dominated strategy means the arms differ measurably
-in *cost sensitivity*, nothing more. **The verdict will be reported as it falls, in either
-direction, with no "store improved" or "store hurt" framing.**
+Lost, narrowly, and it is the strongest runner-up.
 
-### 13.2 §9A.2 is SUPERSEDED, not patched
+*For:* maximum directness (the consumer is finished, guarded and unit-tested at
+`features.py:1007-1015`); the keyless source is verified live; the producer is two lines of
+arithmetic over a library already in-tree; RESEARCH §1.2 is right that no new repo is needed.
+It is the only gap that adds **information the pipeline cannot otherwise express** —
+contemporaneous liquidity skew vs. lagged price/volume statistics.
 
-The frictionless rows in §9A.2 (`excess_return` 0.037, `total_return` 0.503, `sharpe` 1.400,
-`max_drawdown` 10.736) are retained **only as a labelled diagnostic** of the churn effect. They
-are not seed-variance measurements and must never be quoted as such. Both `RESOLVED` rows are
-churn artifacts (seed 44 Sharpe 2.717 → −0.550 under costs), so they are re-derived from scratch
-under §13.1 rather than carried forward.
+*Why it lost — three reasons, in order of weight:*
+1. **Its gate cannot pass on the artifact this phase can produce.** G1 is **un-backfillable,
+   ever** — Kraken's archive is OHLCVT-only (RESEARCH-1 §3.4) and Binance Vision returns
+   `KeyCount=0` on both `bookDepth` and `depth` prefixes (§3.5). So a Phase 6 run against
+   today's trailing 721-bar window measures `order_book_imbalance` as a **721/721 zero-fill**.
+   The acceptance criterion "the feature appears and is non-degenerate" is *unsatisfiable*
+   until a forward-only recorder has accumulated months of history. G2's criterion is
+   satisfiable today and I measured it.
+2. **It must edit `features.py`** — `_SIGNAL_COLUMNS` (`features.py:94-125`) **and**
+   `_SIGNAL_BUILDER_INPUT_COLUMNS` (`features.py:149`). RESEARCH §1.3 corrected AUDIT here:
+   it is **two** tuple edits, not one, or the observation widens by 3 instead of 1. `features.py`
+   is in `audit_checks.py`'s `PY_FILES`, so `just audit-verify`'s `executable-ast` flips to
+   CHANGED and every existing `normalization.npz` needs a retrain. G2 needs **zero** of that.
+3. **It forces an aggregation decision G2 does not.** A `/Depth` response is an *instant* with
+   no timestamp of its own (RESEARCH-1 §4.4), so last-sample-per-bar vs mean-per-bar must be
+   settled before anything is written — and depth is not comparable across a `count` change, so
+   the depth must be recorded or the series silently breaks.
 
-### 13.3 What the report must state regardless of the verdict
+*G1 is the correct next slice.* This decision does not foreclose it.
 
-If the cost-aware numbers show the strategy losing money in **both** arms — which Phase 6's
-frictionless→taker swing suggests — the report **says so plainly**. No "store arm improved"
-language in either direction. What CAND-3a delivered remains: *an out-of-sample measurement
-became possible at all.*
+### 8.3 G3 — no retry / backoff / rate-limit handling
+
+Lost, but it is the one to do second.
+
+*For:* it protects **every** one of the ~57 columns; only the caller knows
+`cursor`/`collected`/`pages`, so the "page 4 of 6 raised and pages 1–3 were discarded"
+defect is irreducibly a caller bug; RESEARCH §1.12's finding that `except RateLimitError` alone
+misses two of three failure paths is genuinely load-bearing.
+
+*Why it lost:*
+1. **It adds nothing to the observation.** Magnitude today: zero — the bug only fires when
+   Kraken rate-limits, and no backtest number moves.
+2. **Its effective half flips `executable-ast` to CHANGED** — `data.py` is in `PY_FILES`
+   (D1).
+3. **Its upstream half is on the wrong side of the supply chain.** `flake.lock` pins
+   `kraken-python` at rev `81de5974…`, which **equals local HEAD**; the `.venv` has it
+   editable. So an upstream-only fix would be **live under pytest and invisible to
+   `just bench`** (RESEARCH §1.10). RESEARCH §1.11 adds that the throttle is **off by default**
+   (`transport.py:108 min_interval = 0.0`, `auth.py:73 … or 0.0`, `nix/module.nix` `minInterval`
+   default `null`), so "make the throttle adaptive" is a **no-op** as configured.
+4. **The throttle being off is a shared exposure** for any recorder — but it does **not** block
+   this backfill: the history endpoint needs **one** request per symbol, and RESEARCH-2 §3
+   measured 25 back-to-back requests at **25 × HTTP 200, zero 429**. So G3 is not a prerequisite
+   here (RESEARCH §1.9 agrees).
+
+*If taken:* caller in `data.py:_page_candles` first, keyed on
+`(RateLimitError, APIError, requests.RequestException)` — **not** `RateLimitError` alone —
+with **Full Jitter** (`wait_random_exponential`; the AWS post is explicit that the no-jitter
+curve is "the clear loser"), parsing the `EService: Throttled: <epoch>` timestamp Kraken
+already sends in place of a `Retry-After` header, and **any** upstream session `Retry` set to
+`allowed_methods={"GET"}` (RESEARCH §1.15).
+
+### 8.4 G4 — thin historical depth behind `market_data_store: null`
+
+Lost on **sequencing**, not merit. 366 d of funding ≈ 8,766 hourly bars comfortably covers the
+~721-bar live ceiling, but if G4 lands a multi-year store at finer intervals the older span
+would have **no funding and would silently zero-fill** (RESEARCH §1.17). Landing G2 first means
+the two compose correctly; landing G4 first makes G2's coverage the binding constraint sooner.
+G4 is also a scheduler plus a config flip plus a ~158 s / ~13 MB seed per pair — larger surface,
+smaller observation effect.
+
+### 8.5 G5 / G6 / G7
+
+* **G5** (dead `order_book` plumbing, the wrong `interval=60` comment, duplicated
+  `_OHLCV_COLUMNS`): repo hygiene on the **disjoint** engine/strategy program. `rl/` never
+  imports `engine.py`. Real, cheap, not a data-provenance outcome.
+* **G6** (`fee_rate: 0.0`, `slippage: 0.0`): arguably higher leverage per line than anything
+  here — every artifact trained from the default learned a policy under a frictionless market.
+  But it is **two config values**, not a pipeline outcome, and it invalidates every existing
+  model's headline number. A separate decision, explicitly out of scope here (§5.2).
+* **G7** (on-chain / macro / options / cross-venue): the honest `NEW-DATA-SOURCE` territory,
+  but `Directness: none *today*` — no consumer exists. The landing point is cheap when it comes
+  (two tuples plus the hardened seam), which is exactly why it should be a deliberate later
+  pass rather than this one.
+
+---
+
+## 9. What a downstream agent must not do
+
+1. **Do not claim 6 columns.** Say "1 of 6 recovered exactly". `basis`,
+   `funding_rate_prediction`, `open_interest`, `vol24h` and `spread` keep their zero-fill.
+2. **Do not write `relativeFundingRate` into `basis`.** It is funding-per-notional
+   (measured `fundingRate / relativeFundingRate` = 4147.45 and 2664.89 across the span). It is
+   recorded in the JSONL and **not** added to the observation — measured
+   `corr(funding_rate, relativeFundingRate) = 0.99753`, so it is 0.9975 collinear with a column
+   already present (§4).
+3. **Do not widen to Binance/Bybit.** 8 h cadence needs resampling to 60 m, the rate is a
+   fraction (Kraken's is percent-like — a **1000×** scale conversion), Binance's
+   `openInterestHist` retention is **~30 days** on a different venue, and Bybit's OI is a
+   different venue's number. That is a **semantic substitution**, not a recovery.
+4. **Do not scrape anything.** Kraken's own API carries the column.
+5. **Do not write the backfill to a second file.** Measured: **57 → 52**.
+6. **Do not quote a single width.** Per configuration: **49** (all channels null), **57**
+   (shipped default). Range 49–57.
+7. **Do not widen `_SIGNAL_COLUMNS`** in this slice. It is not needed and it would invalidate
+   every artifact.
+
+---
+
+---
+
+**CARRIED-FORWARD SECTION 14 — read below, preserved verbatim.**
+
+> **CARRIED FORWARD UNCHANGED from the superseded 2026-10-02 DECISION.md of the prior pass.**
+>
+> This section is **not** part of the G2 decision above. It is preserved verbatim because four
+> in-tree artifacts cite it by section number, and rewriting this file without it would have
+> left them dangling:
+>
+> | Citing artifact | Reference |
+> |---|---|
+> | `configs/default.yaml:184` | `time-aware feature windows over a reindexed bar grid (DECISION.md §14)` |
+> | `configs/deep-history.example.yaml:35` | `(DECISION.md §14)` |
+> | `tools/store_gap_scan.py:24` | `see DECISION.md section 14` |
+> | `tools/store_gap_scan.py:206` | `feature windows over a reindexed bar grid (DECISION.md 14.)` |
+> | `tools/cost_aware_gate.py:61` | `DECISION.md section 14.0 / finding R3` |
+>
+> **Interaction with the G2 decision above: none, and this is worth stating.** That caveat is
+> about the **store arm** (`market_data_store` non-null, G4). The G2 outcome runs on the **shipped
+> default**, where `configs/default.yaml:185 market_data_store: null` takes the pure live-fetch
+> leg and no store gap exists. If G4 is later enabled, the 366-day funding window (§7.5) and the
+> bar-count window semantics compose as follows: a bar-gap makes `funding_rate` land on a row that
+> is 39 hours after its neighbour, so a "1-hour" funding change may span 39 hours — and
+> `signal_age_hours` is computed from **timestamps** (`data.py:584`, `(index - seen) / hours`),
+> not row counts, so the seam's freshness accounting is **already time-aware** and correctly
+> reports the gap. The feature *window* is not. Both statements are true at once, and the honest
+> framing is that the G2 change does not introduce this hazard and does not fix it either.
 
 ---
 
@@ -897,147 +786,4 @@ overriding it would break every other config layer that relies on it.
 file, but the message no longer *instructs* it. A working override remains the correct future fix.
 
 ---
-
-## 15. GATE CLOSING RECORD
-
-**Final verdict: `NEEDS_FIX on R1, resolved by docs-only repair, confirmed by the reviewer`.**
-
-This is deliberately **not** recorded as a clean pass. The Phase 6 gate returned `NEEDS_FIX` with
-seven findings; F1 was the only MAJOR *result* finding and it was resolved by re-running the gate
-under costs (§14.0, §13), but F2 carried a MAJOR *truthfulness* finding whose repair was incomplete.
-
-**What the narrow re-review established.** A reviewer independent of the implementing agent
-re-examined F1 and F2 only, per the user's exit condition. It returned:
-
-- **F1 — CLEAN on all five checks.** The threshold was not tuned (`tools/` provably zero-diff
-  against `97a2a52`); all 20 figures in §14.0 reproduce from the per-seed records through two
-  independent implementations agreeing to 1e-12; all six cells lose money and the report says so
-  without directional framing; §14.4's self-correction is honest (see §14.5); pre-registration
-  precedes the result commit by direct ancestry.
-- **Width-neutrality held, byte-identical** — obs `93edc733…`, arr `6a88a379…`, 60 features,
-  `start_index` 24, 0 non-finite obs cells. **No `models/` artifact is invalidated.**
-- **F2's structural repair is real.** The vacuous test is dead: deleting the seam now takes down
-  exactly one test, with `sma_4` at 91.41 against a ~122 price — the original symptom. The old
-  infinity assertion was **kept and labelled**, not deleted, and that label is true under mutation.
-  The `ewm` hazard is recorded as a known gap and its pin provably bites in both directions.
-- **R1 — one material defect, in prose only.** `_rsi`'s docstring asserted a pandas mechanism that
-  is the *opposite* of what pandas does, contradicting the `KNOWN GAP` note added in the same
-  commit. Repaired; no executable line changed.
-
-**Why the verdict is not "clean".** R1's blast radius was deliberately bounded — no functional
-regression, no coverage gap — and it was repaired docs-only. But the repair went through **three
-review rounds**, and two of the rounds found further defects: one pre-existing (a swapped
-cosmetic/load-bearing claim that contradicted itself within three lines, in the very paragraph the
-repair cites as governing) and **one introduced by the repair itself** — a clause asserting the chain
-"breaks at its first real link" while the next clause asserted the opposite. That last one is the
-reason this record exists: the lead described the wording in a message as "second" while the file
-said "first real", and only a reviewer reading the source rather than the description caught it.
-**The lesson recorded for this pass: a repair that cites its own prose is not finished when the
-prose is corrected — it is finished when every falsifiable clause in the cited text has been
-measured. But measured *by someone who re-derives it*, not by a script the repair wrote about
-itself.**
-
-**Mechanical evidence, not self-certification.** Each round was verified by: an AST comparison with
-docstrings stripped (itself self-tested against six mutants after two real bugs in the proof were
-found); a width-hash re-run; the full suite; and a `tools/` zero-diff check against `97a2a52`. Those
-four are structural and hold: no executable line changed, the width hash is byte-identical, 455
-tests pass, and the measurement track is untouched.
-
-**The confirmation rests on the reviewer's own 12-clause probe — explicitly NOT on a script.** A
-clause-checking script was written during this pass and an earlier draft of this record cited it as
-covering the final state. **That citation was withdrawn: the script was proved inert.** The reviewer
-cloned the final commit, restored *both* round-4 defects in the docstring while leaving the
-executable body untouched — `(A)` back to "``avg_gain`` is ``-0.0``" with its **correct** outcome
-clause intact, `(B)` back to "the whole frame" — and ran the script against it. Result: **11 of 11
-reason checks PASS, exit 0, "ALL CLAUSES AND ALL STATED REASONS MEASURED TRUE"**, against a
-docstring asserting both defects. Two reasons, both structural:
-
-- **No binding.** Every assertion measures pandas' behaviour. None is bound to any word of the
-  docstring, so "avg_gain is never -0.0" passes *because pandas behaves that way* — orthogonal to
-  what the docstring *says*. Measuring the right things is not the same as checking the text.
-- **The extraction never found the clause.** The clause-splitter breaks on the `.` inside `-0.0`,
-  `0.0` and `1.001`, so it prints mid-sentence fragments; and it requires the literal "so that", so
-  the very clause whose stated reason was wrong last round ("clipped at zero below, so avg_gain
-  cannot be negative") is one it never displayed.
-
-This is the **same failure mode the whole pass exists to remove**, one level up: a verification
-artifact that reports green while the defect it was built to catch is present. It is recorded here
-rather than quietly deleted because the fact that it was *proved* inert — by mutation, at the
-reviewer's initiative — is the actual evidence for the verdict. A gate whose evidence is only ever
-green is worth nothing; this one survived an attempt to falsify it and the falsification attempt is
-published alongside.
-
-**To actually close the class**, each assertion would have to name the docstring substring it defends and fail when that substring is absent or altered.
-
-### 15.1 OPEN FOLLOW-UP — a docstring gate that is actually bound to the text
-
-**Status: OPEN. Not claimed as done. Not deferred.** This is a real gap with a named trigger, not
-work quietly dropped at the end of a pass.
-
-**The class, stated so it is recognisable next time.** *A verification script whose assertions
-measure library behaviour but are not bound to any docstring text can report fully green while the
-docstring is wrong.* It is the R1 failure mode one level up. The tell is a script that asserts facts
-about a dependency and prints "PASS" — it is checking pandas, not the prose, and the two can drift
-apart without anything going red. The fix is not more assertions; it is a binding from each
-assertion to the exact substring it defends.
-
-**Trigger.** *A mechanism-asserting comment or docstring is added or edited in
-`kraken_trading_bot/rl/features.py` again.* At that point, and not before, each assertion must
-(a) name the docstring substring it defends and (b) fail when that substring is absent or altered.
-A script that satisfies (a) and (b) is worth having; a script that only adds assertions is what was
-withdrawn above, and adding more of them would be worse than useless — it would look like coverage.
-
-**Why it is not being built now, on the merits rather than for the sake of the record.** The
-docstring it would guard is correct and independently verified. A harness maintained for one
-docstring costs more to keep honest than the defect it would catch, and it would still compare
-*text against text* — it would not check text against pandas behaviour, which is the thing that was
-wrong in every round of this pass. Building it now would mostly be a way to feel finished.
-
-**The `/tmp` script is withdrawn and is not part of the evidence for this gate.** It lives in
-scratch state outside the repository, it was proved inert, and nothing in §15 rests on it. The
-verdict above rests on the reviewer's independent 12-clause probe plus the four structural checks.
-
-### 15.2 Findings F5 and F7 — dispositions, recorded late on purpose
-
-`just audit-findings` (added after this pass, see §15.3) reported **F5 and F7 as having no
-decision-level record**. That is the R5 defect class the gate already raised once, still live for two
-findings, and it is recorded here rather than quietly patched over. Both resolutions come from
-`VALIDATION.md`; neither was re-derived, and the mechanism is named so a reader can check it.
-
-**F5 — `DECISION.md` internally inconsistent on the bar count. RESOLVED: a moving store, not a
-contradiction.** Four figures were in circulation — 76,561 (`RESEARCH.md`, Phase 2/3), 76,562
-(`DECISION.md` §9A.3), 76,538 replayed, 76,563 (reviewer's later run). All are the **same store at
-different wall-clock times**, and the mechanism is the store arm's live-upsert leg: `data.py:1349`
-re-fetches the trailing Kraken window on *every* read and upserts it, and the newest hourly bar
-advances with wall-clock time, so each run appends ~1 bar. Partition mtimes prove it — the two
-newest monthly partitions were rewritten on each run while the 103 older ones still carry the seed
-timestamp. So: **pre-warm-up** bar counts grow by ~1 per run, and **bars actually replayed** is
-pre-warm-up minus the 24-bar `first_tradable_index` warm-up. The figure quoted in the run summary is
-a **timestamped snapshot, not a constant**; anyone re-deriving it must record the store's as-of time
-or they will read the difference as an error.
-
-**F7 — 4 guard sites + 1 `evaluate_scope` clause are redundant-and-unpinned. ACCEPTED, not fixed.**
-Removing any one leaves the suite green, so none of the five is individually load-bearing. This is
-**coverage redundancy, not a defect**: defence in depth on a guard that is cheap and silent. It was
-not "fixed" because the only fix is to delete guards, and deleting a redundant guard to make a
-mutation go red trades real protection for a cosmetic metric. Recorded as accepted with its
-reasoning, which is what makes it a disposition rather than an omission.
-
-**Residual.** F1, F2, F3, F4 and F6 were already recorded (§14.6 for F2/F3, §9A.3 for F4, §14 for
-F6). F5 and F7 were not, for four rounds. `just audit-findings` now catches that class mechanically,
-which is the durable fix; this subsection is the evidence that the check found a live instance
-rather than a hypothetical one.
-
-### 15.3 The audit checks added after this pass, and why they are separate
-
-Three read-only commands were added so a later pass does not re-derive this one's evidence by hand.
-They live in `tools/` and are invoked through `just`; the reasoning that made each necessary is in
-its own docstring. The one structural consequence worth stating here:
-
-**`tools/model_matrix.py` is still byte-identical to the pre-registration commit `97a2a52`.** That
-invariant is the strongest available evidence that the gate's threshold was never tuned, and adding a
-`cost-aware` subcommand to it would have permanently downgraded the claim to "the estimator and
-threshold are unchanged" — strictly weaker, and unverifiable by a byte compare. So the cost-aware
-replay **imports** the shipped estimator from `model_matrix` and chooses nothing itself; the driver
-is `tools/cost_aware_gate.py`, beside it. Same pattern the scratch scorer used, except this time it
-is committed.
+**DECISION COMPLETE**
