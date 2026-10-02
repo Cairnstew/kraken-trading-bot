@@ -211,11 +211,22 @@ immediately. The last three need a funding file, which
 `configs/default.yaml` now points at:
 
 ```bash
-# Populate it once (or: just funding-pull)
+# Fill HISTORY first (keyless; Kraken's own ~366-day hourly series), then
+# the live snapshot.  Both append into the same file, and the order matters:
+# backfill alone leaves `spread` a literal all-zero column.
+just funding-backfill && just funding-pull
+
+# ...or drive the same command by hand:
 nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
-  pull --pair ETH/USD \
+  backfill --pair ETH/USD \
   --output ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl --append
 ```
+
+`just funding-backfill` recovers **1 of 6** signal columns — `funding_rate`,
+from ~8,800 hourly records instead of one. `basis`, `open_interest`,
+`funding_rate_prediction`, `vol24h` and `spread` are not in that endpoint
+and stay zero-fill. The window is a rolling ~366-day cap that ages out, so
+re-run it periodically as a top-up (`SINCE=`/`UNTIL=` narrow it).
 
 Keep it fresh with the shipped user timer:
 
@@ -223,9 +234,20 @@ Keep it fresh with the shipped user timer:
 just funding-timer   # links + enables systemd/kraken-trading-bot-funding.{service,timer}
 ```
 
-`signal_max_age_hours: 12` matches funding's ~8-hourly settlement (at the
-null→1h default a funding reading covers only 76 of 721 bars, versus 301
-at 12).
+`signal_max_age_hours: 12` is a deliberate **upper bound** on funding's
+hourly settlement, sized to bridge more than one missed pull (measured gap
+histogram over Kraken's own history: `{1.0h: 8783, 2.0h: 6, 3.0h: 1}`) — not
+a statement that records arrive 12 hours apart. How much it matters depends
+entirely on how deep the funding file is:
+
+| funding file | `signal_observed` at 1h | at 12h |
+|---|---|---|
+| one live snapshot (no history) | **2 / 721** bars | **13 / 721** bars |
+| backfilled with Kraken's hourly history | **721 / 721** bars | **721 / 721** bars |
+
+So on a backfilled file the bound cannot change the observation at all —
+every bar carries its own record. It still earns its keep on a shallow file
+and for any pre-existing model that relies on the carry across missed pulls.
 
 **The width is guarded.** `train` records `n_features` in each model's
 `config.yaml` (`kraken-trading-bot models --json` surfaces it), and

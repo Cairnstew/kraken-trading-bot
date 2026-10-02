@@ -151,23 +151,38 @@ funding-timer pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   systemctl --user list-timers kraken-trading-bot-funding.timer --no-pager
 
 # Pull one funding snapshot by hand (the same command the timer runs)
+#
+# `output` is repo-relative by default and absolute if it looks absolute.
+# An earlier revision always prefixed $root, so `just funding-pull /tmp/x.jsonl`
+# wrote to "<repo>//tmp/x.jsonl" — a path under the repo, created by
+# `mkdir -p`, that no caller asked for.  funding-backfill had the same bug and
+# is fixed identically here so the two recipes cannot drift apart again.
 funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   #!/usr/bin/env bash
   set -euo pipefail
   root="{{justfile_directory()}}"
-  mkdir -p "$root/$(dirname {{output}})"
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  mkdir -p "$(dirname "$dest")"
   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
-    pull --pair {{pair}} --output "$root/{{output}}" --append
+    pull --pair {{pair}} --output "$dest" --append
 
 # Fill funding HISTORY from Kraken's own /historical-funding-rates, into the
 # SAME file `funding-pull` writes (--append).  This is the difference between
-# a funding channel with one record and one with ~8,791: the endpoint is
+# a funding channel with one record and one with ~8,800 (measured 8,792 on
+# 2026-10-02; the count grows about a record a day, since the window is
+# recomputed on every call): the endpoint is
 # keyless, one request, and serves a rolling ~366-day HOURLY window.
 #
-# Why the same file and not a second one: the merge seam intersects each
-# file's keys against a fixed allow-list, so a history-only file carrying
-# just the recoverable fields would drop `bid`/`ask` and, with them,
-# `spread` — measured 57 -> 52 observation columns.  One file, one key set.
+# Why the same file and not a second one — and note the reason is NOT width.
+# A history-only file does NOT narrow the observation: measured on a 721-bar
+# 60m frame, a full 14-key history file with every quote field null still
+# composes 60 observation columns, the same as the baseline, because
+# `available_cols` intersects against the file's keys and the history file
+# carries all of them (as null).  The real cost is that `spread` goes DEAD:
+# 24 nonzero bars (max 3.695e-05) with the live leg present, 0 without — a
+# literal constant-zero column at unchanged width, which `check_feature_width`
+# cannot see.  So run BOTH legs, in this order.
 #
 # Recovery is "1 of 6": `funding_rate` only.  `basis`, `open_interest`,
 # `funding_rate_prediction`, `vol24h` and `spread` are not in that endpoint
@@ -186,15 +201,19 @@ funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
 # silently overwrote `output` with "--since" and moved X into the passthrough.
 # An env var cannot be stolen by that binding, and it is also the spelling
 # `funding-pull`'s callers already have in their shell.
+# `output` is repo-relative unless absolute — see the note on funding-pull.
 #   just funding-backfill
 #   SINCE=2026-01-01 just funding-backfill
 #   SINCE=2026-01-01 UNTIL=2026-06-01 just funding-backfill XBT/USD
+#   just funding-backfill ETH/USD /tmp/scratch.jsonl
 funding-backfill pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   #!/usr/bin/env bash
   set -euo pipefail
   root="{{justfile_directory()}}"
-  mkdir -p "$root/$(dirname {{output}})"
-  args=(backfill --pair {{pair}} --output "$root/{{output}}" --append)
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  mkdir -p "$(dirname "$dest")"
+  args=(backfill --pair {{pair}} --output "$dest" --append)
   if [ -n "${SINCE:-}" ]; then args+=(--since "$SINCE"); fi
   if [ -n "${UNTIL:-}" ]; then args+=(--until "$UNTIL"); fi
   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- "${args[@]}"

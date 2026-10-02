@@ -156,9 +156,9 @@ _SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread")
 # window has not filled yet, so the bar is genuinely not computable and
 # the environment skips it.  A NaN in one of the columns below is
 # *absence*: the exogenous source settles on its own cadence (funding
-# ~8-hourly) or was simply not reading on this bar, so the spread really
-# is unknown here and there is nothing to warm up.  ``spread`` is the
-# case that proves it — ``_add_microstructure_features`` divides by
+# settles hourly) or was simply not reading on this bar, so the spread
+# really is unknown here and there is nothing to warm up.  ``spread`` is
+# the case that proves it — ``_add_microstructure_features`` divides by
 # ``bid``, and the merge seam's absence fill leaves a zero bid behind,
 # which that builder deliberately turns into NaN rather than inventing a
 # spread.  That NaN is correct information, not a not-yet-ready bar.
@@ -491,9 +491,20 @@ def check_feature_width(
     This is the width guard that ships with the 49 -> 55 widening.  (For
     the record: those numbers are the *widened* pair, and the width this
     guard actually sees depends on ``feature_windows`` and
-    ``feature_groups`` as configured — the shipped ``configs/default.yaml``
-    composes 52, so re-derive the number from an artifact rather than
-    quoting it.)  It is deliberately **non-self-referential**:
+    ``feature_groups`` as configured AND on which exogenous channels are
+    configured — so re-derive the number from an artifact rather than
+    quoting it.)  Measured on the live-fetch arm with the shipped
+    ``configs/default.yaml`` (``feature_windows: [1, 4, 24]``, all five
+    ``feature_groups``), 721 bars at 60 minutes:
+
+    * all three ``*_features_file`` keys null — **52**
+    * shipped default, signal channel live — **60**
+
+    and the 60 holds whichever signal file shape is used, including a
+    backfilled history file that carries no ``bid``/``ask`` at all.  The
+    earlier revision of this docstring claimed the shipped default
+    "composes 52"; 52 is in fact the *all-null* width, and the shipped
+    default composes 60.  It is deliberately **non-self-referential**:
     ``expected_feature_names`` comes from the artifact (the
     ``feature_names`` array inside ``normalization.npz``),
     ``actual_columns`` from the columns ``FeaturePipeline.compute`` just

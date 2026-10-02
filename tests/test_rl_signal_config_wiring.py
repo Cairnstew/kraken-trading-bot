@@ -1032,9 +1032,18 @@ def test_both_legs_label_the_key_and_the_producer_not_just_the_seam(
         # names the history recipe first, because the funding channel's file
         # is empty (or one record deep) until history is backfilled --
         # `just funding-pull` alone only ever appends the newest snapshot.
+        # The two legs are joined with `&&`, not `#`: this string is
+        # rendered as "Produce it with: <here>" and copy-pasted into a
+        # shell, where a `#` comments out the live leg and silently leaves
+        # `spread` a constant-zero column at unchanged width.  Pinned
+        # because that failure is invisible to the width guard.
         assert err.producer == (
-            "just funding-backfill # then just funding-pull"
+            "just funding-backfill && just funding-pull"
         ), leg
+        assert "#" not in err.producer, (
+            f"{leg}: a '#' in the hint is a shell comment, so the live leg "
+            f"never runs when the hint is pasted"
+        )
         assert "funding_features_file is set to" in message, leg
         assert "just funding-backfill" in message, leg
         assert "just funding-pull" in message, leg
@@ -1082,8 +1091,14 @@ def test_the_shipped_funding_key_is_tilde_spelled_and_bounded_at_12h() -> None:
     for a path that does not exist, so it is replaced by the properties that
     actually matter: the key is ``~``-spelled — which is why the seam must
     expand it, and why the consumer-side expansion is load-bearing — and the
-    staleness bound is 12h because funding settles ~8-hourly.  Both shipped
-    configs must agree.
+    staleness bound is 12h.  Both shipped configs must agree.
+
+    The bound is 12 because it is a deliberate *upper* bound that bridges
+    more than one missed pull, not because funding settles that far apart:
+    the series is HOURLY (measured inter-record gap histogram
+    {1.0h: 8783, 2.0h: 6, 3.0h: 1}).  That distinction is load-bearing, so
+    it is asserted rather than only commented — see the measured table in
+    the sibling test below.
     """
     repo = Path(__file__).resolve().parents[1]
     for name in ("default.yaml", "deep-history.example.yaml"):
@@ -1096,6 +1111,223 @@ def test_the_shipped_funding_key_is_tilde_spelled_and_bounded_at_12h() -> None:
         )
         assert str(funding).endswith(".jsonl")
         assert cfg["signal_max_age_hours"] == 12, (
-            f"{name}: funding settles ~8-hourly, so a 1h bound marks most "
-            f"bars unobserved"
+            f"{name}: 12 is a deliberate upper bound that bridges more than "
+            f"one missed pull; funding itself settles hourly. The value is "
+            f"load-bearing only while the file is shallow — "
+            f"test_the_freshness_bound_only_matters_while_the_file_is_shallow"
         )
+
+
+def _funding_jsonl(path: Path, stamps: list[str], *, with_quote: bool) -> Path:
+    """A funding JSONL holding one record per stamp in ``stamps``.
+
+    Always emits the FULL key set, because the seam's ``available_cols`` is a
+    per-file intersection against ``_SIGNAL_COLUMNS`` (measured, not assumed:
+    a file that OMITS ``bid`` entirely composes a narrower observation than
+    one that carries it as ``null``).  That is exactly the shape the real
+    backfill writes — ``bid``/``ask``/``basis``/``open_interest``/``vol24h``/
+    ``funding_rate_prediction`` present and JSON ``null``, because Kraken's
+    history endpoint has no such fields.
+
+    ``with_quote`` therefore controls whether those fields carry a real
+    reading (the live-snapshot shape) or ``null`` (the history shape), which
+    are the two shapes the shipped recipes can leave behind.
+    """
+    lines = []
+    for i, stamp in enumerate(stamps):
+        quote: dict[str, Any] = (
+            {
+                "bid": 2706.1 + i,
+                "ask": 2706.2 + i,
+                "basis": 8.8e-05,
+                "open_interest": 25985.0,
+                "vol24h": 29621.0,
+                "funding_rate_prediction": 0.011,
+                "mark_price": 2706.35,
+                "index_price": 2706.12,
+            }
+            if with_quote
+            else {
+                "bid": None,
+                "ask": None,
+                "basis": None,
+                "open_interest": None,
+                "vol24h": None,
+                "funding_rate_prediction": None,
+                "mark_price": None,
+                "index_price": None,
+            }
+        )
+        record: dict[str, Any] = {
+            "ticker": "ETH/USD",
+            "symbol": "PF_ETHUSD",
+            "spot_pair": "ETH/USD",
+            "timestamp": stamp,
+            # Distinct per hour, so "did the bar keep its OWN reading" is
+            # answerable from the value alone and not from a coincidence.
+            "funding_rate": 0.01 + i * 1e-6,
+            "relative_funding_rate": None,
+            **quote,
+        }
+        lines.append(json.dumps(record))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_the_freshness_bound_only_matters_while_the_file_is_shallow(
+    tmp_path: Path,
+) -> None:
+    """Why the shipped 12h bound is not, and is not, about cadence.
+
+    The funding series settles HOURLY — measured over Kraken's own history,
+    the inter-record gap histogram is overwhelmingly ``{1.0h: …}`` with a
+    handful of 2h and 3h stragglers (8,791 records measured 2026-10-02:
+    ``{1.0h: 8783, 2.0h: 6, 3.0h: 1}``; the count grows about a record a day
+    because the window is recomputed on every call).  Several in-tree comments used to
+    assert an eight-hour settlement cadence, which is wrong by 8x, and that
+    false claim is what invites a future reader to widen or narrow this
+    bound "to match the cadence".
+
+    This binds the correction to the seam's actual behaviour, so the claim
+    cannot rot into prose again:
+
+    * a file holding ONE record (what `pull --append` alone produces)
+      needs the wide bound to see anything — 12h reaches 13 bars, 1h only 2;
+    * a file backfilled with the hourly history reaches EVERY bar at both
+      bounds, because every bar carries its own record.
+
+    So the bound is load-bearing only on a shallow file, and on a dense one
+    it provably cannot change the observation.  That is the whole argument
+    for leaving the shipped value at 12 rather than tightening it.
+    """
+    from kraken_trading_bot.rl.data import merge_extra_features
+
+    n = 721
+    index = pd.date_range("2026-09-03T00:00:00Z", periods=n, freq="h")
+    frame = pd.DataFrame(
+        {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+            "vwap": 1.0,
+            "count": 1.0,
+        },
+        index=index,
+    )
+
+    def observed(path: Path, bound: float) -> int:
+        merged = merge_extra_features(
+            frame.copy(),
+            extra_features_file=str(path),
+            ticker="ETH/USD",
+            max_age_hours=bound,
+            require_ticker=True,
+            config_key="funding_features_file",
+        )
+        return int(merged["signal_observed"].sum())
+
+    tmp = tmp_path
+    # Placed 12 bars before the window's right edge, which is the shape that
+    # makes the bound observable: the carry runs FORWARD, so a record on the
+    # very last bar would read 1 bar at any bound and prove nothing.
+    lone_stamp = index[-13].strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    one = _funding_jsonl(tmp / "one.jsonl", [lone_stamp], with_quote=True)
+    # 13 = the record's own bar plus the 12h carry.  2 = the record's own
+    # bar plus a single hour of carry.
+    assert observed(one, 12) == 13, "12h must bridge more than one missed pull"
+    assert observed(one, 1) == 2, "1h is why a one-record file reads as near-dead"
+
+    dense = _funding_jsonl(
+        tmp / "dense.jsonl",
+        [t.strftime("%Y-%m-%dT%H:%M:%S+00:00") for t in index],
+        with_quote=False,
+    )
+    assert observed(dense, 12) == n
+    assert observed(dense, 1) == n, (
+        "on an hourly backfill every bar carries its own record, so the "
+        "bound cannot change the observation — measured, not asserted"
+    )
+
+
+def test_the_history_recipe_must_run_both_legs_or_spread_goes_dead(
+    tmp_path: Path,
+) -> None:
+    """`funding-backfill` alone is width-neutral and still wrong.
+
+    This is the reason the funding channel's producer hint is spelled with
+    ``&&`` rather than a ``#``.  A ``#`` renders as "Produce it with: <here>"
+    and the operator copy-pastes it into a shell, where everything after a
+    ``#`` is a comment — so only the backfill runs and the live snapshot leg
+    never does.
+
+    The damage is silent *by construction*, which is what makes it worth a
+    test.  The backfill endpoint has no ``bid``/``ask``, so ``spread`` is
+    emitted as all-NaN and the absence fill turns it into a literal all-zero
+    column — the "not sparse, constant" failure this pass exists to remove.
+    Crucially the observation WIDTH is unchanged, so ``check_feature_width``
+    passes and no ``FeatureWidthMismatchError`` can fire: a width guard
+    cannot see this regression.
+
+    Measured on a 721-bar 60m frame, both arms at ``signal_max_age_hours: 12``:
+    backfill+live gives ``spread`` 24 nonzero bars (max 3.695e-05) at width
+    60; backfill-only gives 0 nonzero bars at the SAME width 60.
+    """
+    from kraken_trading_bot.rl.data import merge_extra_features
+
+    n = 721
+    index = pd.date_range("2026-09-03T00:00:00Z", periods=n, freq="h")
+    frame = pd.DataFrame(
+        {
+            "open": 1.0,
+            "high": 1.0,
+            "low": 1.0,
+            "close": 1.0,
+            "volume": 1.0,
+            "vwap": 1.0,
+            "count": 1.0,
+        },
+        index=index,
+    )
+    hourly = [t.strftime("%Y-%m-%dT%H:%M:%S+00:00") for t in index]
+
+    def merged(path: Path) -> pd.DataFrame:
+        return merge_extra_features(
+            frame.copy(),
+            extra_features_file=str(path),
+            ticker="ETH/USD",
+            max_age_hours=12,  # the shipped value
+            require_ticker=True,
+            config_key="funding_features_file",
+        )
+
+    tmp = tmp_path
+    # `with_quote` is the ONLY difference between these two arms, so any
+    # divergence is attributable to the live-snapshot leg alone.
+    history_only = merged(
+        _funding_jsonl(tmp / "history.jsonl", hourly, with_quote=False)
+    )
+    history_plus_live = merged(
+        _funding_jsonl(tmp / "both.jsonl", hourly, with_quote=True)
+    )
+
+    # Both arms: every bar observed, funding_rate a real distribution.
+    for name, m in (
+        ("history only", history_only),
+        ("history + live", history_plus_live),
+    ):
+        assert int(m["signal_observed"].sum()) == n, name
+        assert m["funding_rate"].nunique() > n * 0.9, name
+
+    # The regression is invisible to a width check: identical observation
+    # width and identical freshness columns, different `spread` content.
+    assert history_only["signal_observed"].sum() == (
+        history_plus_live["signal_observed"].sum()
+    ), "signal_observed cannot distinguish the two arms"
+    assert (history_only["bid"] != 0).sum() == 0, (
+        "history carries no bid, so every spread reading is an absence"
+    )
+    assert (history_plus_live["bid"] != 0).sum() > 0, (
+        "the live leg is what keeps a real quote behind spread"
+    )

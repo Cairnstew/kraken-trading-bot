@@ -102,8 +102,11 @@ social_features_file: null
 # there): null derives a one-hour carry from the bar interval — with years
 # of seeded bars, 1h still matches the hourly signal cadence, and 0 would
 # demand a record on the exact hour of every bar.  12 (as in default.yaml)
-# is the funding-appropriate value: funding settles ~8-hourly, so 1h would
-# leave most bars unobserved.
+# is a deliberate *upper bound* on an essentially hourly series, sized to
+# bridge more than one missed pull — NOT because records arrive that far
+# apart.  It matters only while the funding file is still shallow: on a
+# file backfilled with Kraken's own hourly history every bar carries its
+# own record, so 1h and 12h give the identical observation.
 signal_max_age_hours: 12
 signal_require_ticker: true
 

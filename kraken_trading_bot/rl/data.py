@@ -112,8 +112,18 @@ _SIGNAL_AGE_COLUMN, _SIGNAL_OBSERVED_COLUMN = _SIGNAL_FRESHNESS_COLUMNS
 # config key is null.  One hour of signal time — i.e. exactly one hourly
 # bar, the seam's own resolution — is enough to bridge a single missed
 # pull without letting a stale reading impersonate a current one for days.
-# Set the key to widen it (funding settles ~8-hourly, so an 8-hourly
-# source wants a bound above 1) or to 0 for a strict per-hour match.
+# Set the key to widen it (a source that settles on a coarser cadence than
+# one hour needs a bound above 1) or to 0 for a strict per-hour match.
+#
+# Note that funding is NOT such a source: it settles HOURLY (measured over
+# Kraken's own ~8,800-record history (measured 2026-10-02: 8,791
+# records, gap histogram {1.0h: 8783, 2.0h: 6, 3.0h: 1}; the count
+# grows by roughly one record a day because the window is recomputed on
+# every call), so `configs/default.yaml` widening the
+# bound to 12 is a deliberate upper bound that bridges more than one missed
+# pull, not a statement about settlement spacing.  On a file backfilled with
+# that history every bar carries its own record, so 1 and 12 give the
+# IDENTICAL observation (measured 721/721 `signal_observed` at both).
 _DEFAULT_SIGNAL_MAX_AGE_HOURS = 1.0
 
 # ``signal_age_hours`` value for a bar with no live reading.  Ages are
@@ -149,7 +159,15 @@ _SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
     ),
     (
         "funding_features_file",
-        "just funding-backfill # then just funding-pull",
+        # `&&`, not `#`: this string is rendered as "Produce it with: <here>"
+        # and an operator copy-pastes it into a shell, where a `#` makes
+        # everything after it a comment — so a `#`-spelled hint runs the
+        # backfill ALONE and silently drops the live leg.  Measured cost of
+        # that half-run: `spread` collapses from 24 nonzero bars (max
+        # 3.695e-05) to a literal all-zero column, at UNCHANGED width, so
+        # `check_feature_width` cannot catch it.  `&&` is one command that
+        # cannot half-succeed.
+        "just funding-backfill && just funding-pull",
     ),
     (
         "social_features_file",

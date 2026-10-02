@@ -934,8 +934,13 @@ def _one_record_funding_file(tmp_path: Path, index: pd.DatetimeIndex) -> Path:
     """A funding JSONL with a SINGLE record, on the window's last bar.
 
     This is the shape `kraken-funding-rates pull --append` produces on its
-    first pull: funding settles ~8-hourly, so the shipped config produces a
-    column that is NaN on all but a handful of bars.
+    first pull.  It is deliberately the *shallow* case: with one record the
+    shipped config produces a column that is NaN on all but a handful of
+    bars.  (Funding itself settles hourly — the shallow file, not a coarse
+    cadence, is what makes the column sparse.  `just funding-backfill`
+    replaces this shape; see
+    `tests/test_rl_signal_config_wiring.py::
+    test_the_freshness_bound_only_matters_while_the_file_is_shallow`.)
     """
     path = tmp_path / "eth_usd_funding.jsonl"
     record = {
