@@ -541,3 +541,28 @@ false claims should not close with one standing next to its own refutation.
 *Method: read-only on source. `git status` empty and HEAD `91c76a9` at finish and
 at start. Scratch: `/tmp/rev-f1/` (width recompute, seam-deleted clone, four
 measurement scripts). Mutation was applied only to the `/tmp` clone.*
+---
+
+> **ADDENDUM (lead, 2026-10-02) — not the reviewer's words.**
+> Line 78 cites `score.py`, the scratch scorer that lived in `/tmp/krb-cost-aware/`. It was never
+> committed, so a reader could not re-run it — which is precisely the gap
+> `just audit-evidence` was built to find, and which it did find here.
+>
+> **Its role is now `tools/cost_aware_gate.py`**, which imports the *same* shipped estimator from
+> `tools/model_matrix.py` (`DISPERSION_RATIO_THRESHOLD`, `summarize`, `pooled_within_spread`,
+> `dispersion_verdict`) and chooses nothing itself. Run it and every figure in §14.0 reproduces:
+>
+> ```
+> just cost-aware-replay \
+>   --records /tmp/krb-cost-aware/cost --control-records /tmp/krb-cost-aware/ctrl \
+>   --cell-live  0396722e7a1a:42,d76622e63d7c:43,dfdd93543409:44 \
+>   --cell-store 0fed61e632ba:42,0498bcf75916:43,4630123dff45:44
+> ```
+>
+> → `excess_return 82.9052`, `total_return 24.2872`, `sharpe 3.0327`, `max_drawdown 53.9052`, all
+> **RESOLVED**; bars-per-re-entry live **1.216** / store **1.429**; trades proxy **91.6×**,
+> equity-drag proxy **34.1×**. Those are the reviewer's independently derived numbers, reached again
+> from committed code.
+>
+> Note the `:seed` annotations are **required** to verify arm pairing: these backtest records all
+> carry the same `seed` field (the trainer default), so they cannot be paired by seed on their own.

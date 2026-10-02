@@ -554,6 +554,17 @@ runs cheaper and less error-prone.
    commit** (`docs: audit-pipeline run log <date>`) in this repo, pushed when
    `gh` is ready. Rollback is `git revert`.
 
+   **WHERE THE RUN LOG GOES — two places, and which is which.** A short
+   append-only entry goes in the `## RUN LOG` section of this file (below), so
+   the accumulated lessons stay greppable in one place. The **detail** for one
+   pass — the full measurement narrative, reviewer evidence, retracted claims —
+   goes in that pass's `.data-audit/RUN-LOG.md`, which is committed with the
+   other `.data-audit/` artifacts. Do not put a pass's whole narrative in this
+   file: it is already past 1000 lines and 10 entries. Do not skip the entry
+   here either. (Verified 2026-10-02: this step said only "append to the RUN
+   LOG" without saying *where*, and the pass created a second RUN LOG file and
+   left this one with no entry for the run.)
+
 ## RUN LOG
 
 Append-only. One entry per run. Format: `- <date> — lesson (what happened →
@@ -890,6 +901,55 @@ because the lessons generalise to any future pass that spawns builders.
     how long an eval window are needed to resolve an effect of a given size from the observed
     within-config spread. That turns "3 seeds, trust me" into a computed requirement, and it is the
     natural next slice for anyone who wants a real verdict from this pipeline.
+
+- 2026-10-02 (evening) — IMPROVE-EXISTING pass (CAND-3a, activate the store + CAND-5 dispersion
+  gate as the acceptance instrument). Gate verdict **`NEEDS_FIX on R1, resolved by docs-only
+  repair, confirmed by the reviewer`** — deliberately not a clean pass. Store read ~76.5k bars,
+  disjoint splits, width-neutral; honest OOS **−34.3% return / Sharpe −0.568** before costs;
+  `NOT SEPARATED`, superseded by the cost-aware re-derivation (all four metrics RESOLVED while
+  **both arms lose money in all six cells**). 455 tests. Detail: `.data-audit/RUN-LOG.md`.
+  Lessons, all of which changed the tooling:
+  - **Evidence has to be re-derivable or it is only trust.** The gate's width-hash assertion
+    depended on a script in `/tmp`, so nobody could reproduce the pass's central invariant. The
+    cost-aware figures came from a scratch scorer. Both are now committed: `tools/width_check.py`
+    and `tools/cost_aware_gate.py`. Phase 6/8 now have `just audit-verify` / `just cost-aware-replay`.
+  - **Keep the estimator file byte-identical, put new drivers beside it.** The replay driver
+    *imports* `DISPERSION_RATIO_THRESHOLD` / `pooled_within_spread` / `dispersion_verdict` from
+    `tools/model_matrix.py` rather than adding a subcommand to it. A subcommand would have
+    permanently downgraded "byte-identical to the pre-registration commit" to "the estimator is
+    unchanged" — strictly weaker evidence for a pre-registration claim. `model_matrix.py` is still
+    byte-identical to `97a2a52`.
+  - **A verification script can be green while the defect it hunts is present.** A clause checker
+    asserted facts about *pandas* and was never bound to the *docstring text*, so restoring both
+    defects still gave 11/11 PASS — proved by mutation, at the reviewer's initiative. Any check
+    written here must name the artifact substring it defends and fail when that substring is absent
+    or altered. `just audit-evidence` checks that a falsification record exists.
+  - **Two reference commits, not one.** `--prereg` (threshold must be byte-identical) and `--since`
+    (executable AST unchanged) are usually different commits. Pointing `--since` at the
+    pre-registration commit reports `CHANGED` for files a later review round legitimately rewrote —
+    a false alarm indistinguishable from a regression. Cost one confused invocation to find.
+  - **Summarising a check's intent instead of its output is how a defect ships.** The lead wrote
+    "the chain breaks at its **second** link" in a message while the file said "**first real**"; the
+    reviewer caught it only by reading the source. The reviewer made the mirror-image error on a
+    `avg_loss` persistence claim, against its own probe output. **Both sides reasoned from a
+    summary rather than the artifact.** This is the single most repeated lesson across ten runs.
+  - **A finding with no decision-level record is invisible in review.** `F5` and `F7` had none for
+    four rounds; `just audit-findings` found them in one call, and `DECISION.md` §15.2 records both.
+    F5's "inconsistent bar count" was not an inconsistency at all: the store's live-upsert leg
+    re-appends the trailing hourly bar each run, so 76,561 / 76,562 / 76,563 are the same store at
+    different wall-clock times, and bars *replayed* is pre-warm-up minus the 24-bar warm-up. **Any
+    re-derived bar count must be timestamped or it will read as an error.**
+  - **`ewm` skips NaN exactly as it skips inf** (pandas 3.0.4), so a `rolling`-style "masks it"
+    intuition is wrong for every `ema`/`macd`/`rsi`/`atr` window: a poisoned bar is carried as a
+    *stale finite value*, which no `isinf`/`isnan` assertion can see. Now pinned by
+    `test_rolling_masks_but_ewm_skips_a_non_finite_price_this_guard_cannot_see`, and recorded as a
+    known gap rather than papered over.
+  - proposal: give the matrix harness a real comparability guard. A live-vs-store pair inside ONE
+    matrix replays different bar counts, so it is structurally uncomparable; the cost-aware pass
+    worked around it with two matrices and the defect is still in `tools/model_matrix.py`.
+  - proposal: these backtest JSONs all report the same `seed` field (the trainer default), so arm
+    pairing cannot be verified from the records. Emit the per-cell seed on write and the `--cells
+    id:seed` annotation becomes unnecessary.
 
 - 2026-10-02 — IMPROVE-EXISTING pass (G1, make the signal seam read the file its own config
   names, and refuse by name). Gate NEEDS_FIX then PASS. 7 commits pushed `444fe1f..53fd684`,

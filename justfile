@@ -287,6 +287,55 @@ check:
 show:
   nix flake show
 
+# ── Audit checks (read-only; each prints a compact receipt) ────────────────
+# Added after the 2026-10-02 pass. These exist because that pass re-derived its
+# four structural checks by hand ~12 times, and because its width-hash assertion
+# depended on a script in /tmp that was not in the repo -- so nobody could
+# reproduce the gate's central invariant. Nothing here commits.
+#
+# Args are passed through verbatim (same convention as `train *CLI_ARGS`), so
+# the Python argparse surface is the single source of truth for flags.
+
+# The four structural gate checks, one receipt.
+#   --prereg <c>  estimator+threshold must be BYTE-IDENTICAL to this commit
+#   --since  <c>  executable AST must be unchanged since this commit
+# These are usually DIFFERENT commits: pointing --since at the pre-registration
+# commit reports CHANGED for files a later review round legitimately rewrote,
+# which is indistinguishable from a real regression.
+# e.g. just audit-verify --prereg 97a2a52 --since 91c76a9 \
+#         --frame /tmp/krb-verify/live721.parquet --expect-obs 93edc733
+audit-verify *args:
+  {{dev}} '.venv/bin/python tools/audit_checks.py verify {{args}}'
+
+# Finding <-> disposition parity between VALIDATION.md and DECISION.md.
+audit-findings *args:
+  {{dev}} '.venv/bin/python tools/audit_checks.py findings {{args}}'
+
+# Flag evidence in .data-audit/ a fresh clone cannot re-derive, and check a
+# falsification record exists. Read-only.
+audit-evidence *args:
+  {{dev}} '.venv/bin/python tools/audit_checks.py evidence {{args}}'
+
+# Pushed-state check plus the ordered close-out steps.
+audit-closeout *args:
+  {{dev}} '.venv/bin/python tools/audit_checks.py closeout {{args}}'
+
+# Observation-matrix fingerprint for a cached frame. Prints the FILE hash and
+# the ARRAY hash separately: they are DIFFERENT values for the same matrix and
+# conflating them looks like a regression.
+# e.g. just width-check --frame /tmp/krb-verify/live721.parquet --expect-obs 93edc733
+width-check *args:
+  {{dev}} '.venv/bin/python tools/width_check.py {{args}}'
+
+# Re-derive the cost-aware CAND-5 figures from per-seed records, using the
+# estimator and threshold IMPORTED from tools/model_matrix.py. Records are run
+# artifacts and stay out of git. Annotate every cell id:seed -- these records
+# all carry the same `seed` field, so pairing cannot be verified without it.
+# e.g. just cost-aware-replay --records /tmp/r/cost --control-records /tmp/r/ctrl \
+#         --cells live=a:42,b:43,c:44 --cells store=d:42,e:43,f:44
+cost-aware-replay *args:
+  {{dev}} '.venv/bin/python tools/cost_aware_gate.py {{args}}'
+
 # Clean generated artifacts (model configs stay tracked; bin+caches removed)
 clean:
   rm -rf models/__pycache__ models/*/__pycache__

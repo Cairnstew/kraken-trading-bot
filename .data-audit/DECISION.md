@@ -996,3 +996,48 @@ wrong in every round of this pass. Building it now would mostly be a way to feel
 **The `/tmp` script is withdrawn and is not part of the evidence for this gate.** It lives in
 scratch state outside the repository, it was proved inert, and nothing in §15 rests on it. The
 verdict above rests on the reviewer's independent 12-clause probe plus the four structural checks.
+
+### 15.2 Findings F5 and F7 — dispositions, recorded late on purpose
+
+`just audit-findings` (added after this pass, see §15.3) reported **F5 and F7 as having no
+decision-level record**. That is the R5 defect class the gate already raised once, still live for two
+findings, and it is recorded here rather than quietly patched over. Both resolutions come from
+`VALIDATION.md`; neither was re-derived, and the mechanism is named so a reader can check it.
+
+**F5 — `DECISION.md` internally inconsistent on the bar count. RESOLVED: a moving store, not a
+contradiction.** Four figures were in circulation — 76,561 (`RESEARCH.md`, Phase 2/3), 76,562
+(`DECISION.md` §9A.3), 76,538 replayed, 76,563 (reviewer's later run). All are the **same store at
+different wall-clock times**, and the mechanism is the store arm's live-upsert leg: `data.py:1349`
+re-fetches the trailing Kraken window on *every* read and upserts it, and the newest hourly bar
+advances with wall-clock time, so each run appends ~1 bar. Partition mtimes prove it — the two
+newest monthly partitions were rewritten on each run while the 103 older ones still carry the seed
+timestamp. So: **pre-warm-up** bar counts grow by ~1 per run, and **bars actually replayed** is
+pre-warm-up minus the 24-bar `first_tradable_index` warm-up. The figure quoted in the run summary is
+a **timestamped snapshot, not a constant**; anyone re-deriving it must record the store's as-of time
+or they will read the difference as an error.
+
+**F7 — 4 guard sites + 1 `evaluate_scope` clause are redundant-and-unpinned. ACCEPTED, not fixed.**
+Removing any one leaves the suite green, so none of the five is individually load-bearing. This is
+**coverage redundancy, not a defect**: defence in depth on a guard that is cheap and silent. It was
+not "fixed" because the only fix is to delete guards, and deleting a redundant guard to make a
+mutation go red trades real protection for a cosmetic metric. Recorded as accepted with its
+reasoning, which is what makes it a disposition rather than an omission.
+
+**Residual.** F1, F2, F3, F4 and F6 were already recorded (§14.6 for F2/F3, §9A.3 for F4, §14 for
+F6). F5 and F7 were not, for four rounds. `just audit-findings` now catches that class mechanically,
+which is the durable fix; this subsection is the evidence that the check found a live instance
+rather than a hypothetical one.
+
+### 15.3 The audit checks added after this pass, and why they are separate
+
+Three read-only commands were added so a later pass does not re-derive this one's evidence by hand.
+They live in `tools/` and are invoked through `just`; the reasoning that made each necessary is in
+its own docstring. The one structural consequence worth stating here:
+
+**`tools/model_matrix.py` is still byte-identical to the pre-registration commit `97a2a52`.** That
+invariant is the strongest available evidence that the gate's threshold was never tuned, and adding a
+`cost-aware` subcommand to it would have permanently downgraded the claim to "the estimator and
+threshold are unchanged" — strictly weaker, and unverifiable by a byte compare. So the cost-aware
+replay **imports** the shipped estimator from `model_matrix` and chooses nothing itself; the driver
+is `tools/cost_aware_gate.py`, beside it. Same pattern the scratch scorer used, except this time it
+is committed.
