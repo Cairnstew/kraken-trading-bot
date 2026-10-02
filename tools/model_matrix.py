@@ -1138,6 +1138,14 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
         # UNRECORDED action_space (pre-provenance) is unproven, not a
         # mismatch, and the RL side treats it as such.
         reasons.append("action_space_mismatch")
+    # PinnedWindowUnavailableError's real CLI text opens "Pinned
+    # data_window [...] does not overlap the N bar(s) that were actually
+    # read" -- it carries no class name (cli.py prints str(e) only) and
+    # no "tradable bar" phrasing, so without this clause a pinned window
+    # that missed the live ceiling is reported as an opaque process_failed
+    # rather than the diagnosable data failure it is.
+    if "does not overlap" in text.lower() or "PinnedWindowUnavailableError" in text:
+        reasons.append("no_tradable_bar")
     if "NotEnoughDataError" in text or (
         "ValueError" in text and "tradable bar" in text
     ) or "no tradable bar" in text.lower():

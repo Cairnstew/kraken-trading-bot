@@ -699,20 +699,7 @@ def test_json_output_carries_the_label_for_a_pinned_run(tmp_path, capsys):
     assert payload["n_eval_bars"] == 72
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "KNOWN GAP in c74e806: the label reaches --json and the LOG stream "
-        "but NOT the CLI's human stdout table. cli.py's cmd_backtest print "
-        "block (lines ~593-614) prints Total return / Buy & hold / Bars "
-        "replayed / Fee / Action space and never reads "
-        "d['evaluation_scope_label'], so a reader of the human table sees "
-        "an unlabelled return -- the exact failure this commit exists to "
-        "close. cli.py is outside this pass's file ownership, so the gap "
-        "is reported rather than fixed. strict=True so closing it turns "
-        "this into a suite FAILURE, which is the intended signal."
-    ),
-)
+# GAP CLOSED by the lead (cli.py now prints the label and its reason first, before any number it qualifies). The strict xfail was left in place by the finishing pass precisely so that closing it would turn into a suite FAILURE rather than pass unnoticed; that is what happened, so the marker is removed here and the test now guards the fix.
 def test_human_output_states_the_label_and_its_reason(tmp_path, capsys):
     """The label must be *printed* to stdout, with the reason."""
     frame = _walk_ohlcv(240, seed=82)
@@ -753,15 +740,7 @@ def test_human_output_states_the_label_and_its_reason(tmp_path, capsys):
     assert "SAME" in captured.out
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Same KNOWN GAP as "
-        "test_human_output_states_the_label_and_its_reason: cmd_backtest "
-        "never prints evaluation_scope_label, so even a genuine split is "
-        "unlabelled in the human table."
-    ),
-)
+# GAP CLOSED by the lead (cli.py now prints the label and its reason first, before any number it qualifies). The strict xfail was left in place by the finishing pass precisely so that closing it would turn into a suite FAILURE rather than pass unnoticed; that is what happened, so the marker is removed here and the test now guards the fix.
 def test_human_output_labels_a_pinned_run_out_of_sample(tmp_path, capsys):
     frame = _walk_ohlcv(240, seed=83)
     _register(tmp_path)

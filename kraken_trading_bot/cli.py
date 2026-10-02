@@ -591,6 +591,14 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         return 0
 
     print(f"Backtest {d['ticker_id']}/{d['model_name']}")
+    # The scope label comes FIRST, before any number it qualifies. With
+    # ``since``/``until`` null -- the shipped default -- training_frame and
+    # evaluation_frame return the SAME object, so every return printed
+    # below describes the bars the model was fitted on. Unlabelled, that
+    # reads as a prediction; it is not one.
+    print(f"  Evaluation:     {d['evaluation_scope_label']}")
+    if d.get("evaluation_scope_reason"):
+        print(f"                  ({d['evaluation_scope_reason']})")
     print(f"  Total return:   {d['total_return'] * 100.0:.2f}%")
     # The reference point. A strategy return on its own cannot distinguish
     # a working model from a lucky one on a rising asset.
