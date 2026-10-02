@@ -656,6 +656,48 @@ implementation with verification. This pass therefore separates them: `builder-i
 `data.py`/`backtest.py`/`export.py`), and the reviewer verifies. **No teammate both implements and
 verifies its own claim.**
 
+### 14.0 COST-AWARE GATE RESULT (measurement track, merged after this section)
+
+Parameters applied **exactly** as §13.1 pre-registered: threshold read from the shipped module
+and `assert`ed `== 1.0` (not passed as a literal), cost basis `fee_rate: 0.0026` /
+`slippage: 0.0005`, shipped estimator, ticker `ETH_USD`, seeds 42/43/44, **no retraining**.
+
+| metric (live↔store) | live median | store median | pooled IQR | gap | **ratio** | **verdict** |
+|---|---|---|---|---|---|---|
+| `excess_return` (headline) | −12.44% | −341.22% | 3.97% | 328.79pp | **82.91** | **RESOLVED** |
+| `total_return` | −5.26% | −99.76% | 3.89% | 94.51pp | **24.29** | **RESOLVED** |
+| `sharpe` | −0.719 | −4.976 | 1.404 | 4.257 | **3.03** | **RESOLVED** |
+| `max_drawdown` | 8.51% | 99.85% | 1.69% | 91.34pp | **53.91** | **RESOLVED** |
+
+**Stated plainly, as §13.3 required: the strategy loses money after costs in BOTH arms, in all six
+cells.** Live median −5.26% (equity $9,474 / $9,062 / $9,813). Store median **−99.76%** (equity
+**$23.68 / $12.03 / $818.02**), 99.85% max drawdown — a wipeout, not a drawdown statistic. The
+policy re-enters every ~1.2 bars in **both** arms; the store arm pays ~145× more absolute cost
+while replaying 110× more bars. **No "store arm improved" claim is made in either direction.**
+What CAND-3a delivered is unchanged and orthogonal: *an out-of-sample measurement became possible
+at all.*
+
+**Both previously-RESOLVED rows re-derived: the verdicts survive, the evidence does not.** `sharpe`'s
+gap **sign flips** (+1.005 higher frictionless → 4.257 lower under costs; every cell negative) —
+exactly the churn artifact §13.2 predicted, now measured rather than argued. `max_drawdown`'s
+magnitude inflates 5× on a larger numerator, not more signal.
+
+**CORRECTION — §13.1's pre-registered magnitude prediction was wrong, and the error was mine.**
+§13.1 predicted ratio ≈1.4 (pooled IQR ~11.7pp against a 16.24pp gap). Measured: pooled IQR
+**3.97pp**, gap **328.79pp** → ratio **82.91**, ~59× off. The pre-registration held the **gap**
+fixed while swapping a cost-aware **pooled IQR**, but the gap is the variable that moved most
+(16.24pp → 328.79pp, the store arm's return travelling −322pp). Holding one side of a ratio
+constant across a change that moves it 20× is not a valid projection. **The verdict is
+unaffected** — both figures sit on the same side of a threshold fixed and committed in advance —
+and **the threshold was not touched to reconcile it.** What the pre-registration bought — the
+direction call, and the rule that `RESOLVED` is not a claim the store helps — both held.
+
+**Control fidelity.** The store arm reproduces frictionless to ~0.1% (+224.86 / +52.98 / +1800.10
+vs recorded +225.13 / +53.17 / +1800.10; ratio 0.031 vs 0.037). **The live arm drifts** (+4.27 /
+−1.14 / +8.65 vs +4.07 / −0.44 / +8.87) because it re-fetches a **rolling** REST window. **A
+live-arm backtest cannot be replayed bit-identically across days; a store-backed one can** — an
+unplanned argument for what this pass built.
+
 ---
 
 ## 13. PRE-REGISTERED DISPERSION RULE — committed BEFORE the cost-aware re-run
