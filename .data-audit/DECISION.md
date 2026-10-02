@@ -895,3 +895,49 @@ overriding it would break every other config layer that relies on it.
 
 *Residual, accepted and recorded:* with option (b) the trap is still reachable by editing the wrong
 file, but the message no longer *instructs* it. A working override remains the correct future fix.
+
+---
+
+## 15. GATE CLOSING RECORD
+
+**Final verdict: `NEEDS_FIX on R1, resolved by docs-only repair, confirmed by the reviewer`.**
+
+This is deliberately **not** recorded as a clean pass. The Phase 6 gate returned `NEEDS_FIX` with
+seven findings; F1 was the only MAJOR *result* finding and it was resolved by re-running the gate
+under costs (§14.0, §13), but F2 carried a MAJOR *truthfulness* finding whose repair was incomplete.
+
+**What the narrow re-review established.** A reviewer independent of the implementing agent
+re-examined F1 and F2 only, per the user's exit condition. It returned:
+
+- **F1 — CLEAN on all five checks.** The threshold was not tuned (`tools/` provably zero-diff
+  against `97a2a52`); all 20 figures in §14.0 reproduce from the per-seed records through two
+  independent implementations agreeing to 1e-12; all six cells lose money and the report says so
+  without directional framing; §14.4's self-correction is honest (see §14.5); pre-registration
+  precedes the result commit by direct ancestry.
+- **Width-neutrality held, byte-identical** — obs `93edc733…`, arr `6a88a379…`, 60 features,
+  `start_index` 24, 0 non-finite obs cells. **No `models/` artifact is invalidated.**
+- **F2's structural repair is real.** The vacuous test is dead: deleting the seam now takes down
+  exactly one test, with `sma_4` at 91.41 against a ~122 price — the original symptom. The old
+  infinity assertion was **kept and labelled**, not deleted, and that label is true under mutation.
+  The `ewm` hazard is recorded as a known gap and its pin provably bites in both directions.
+- **R1 — one material defect, in prose only.** `_rsi`'s docstring asserted a pandas mechanism that
+  is the *opposite* of what pandas does, contradicting the `KNOWN GAP` note added in the same
+  commit. Repaired; no executable line changed.
+
+**Why the verdict is not "clean".** R1's blast radius was deliberately bounded — no functional
+regression, no coverage gap — and it was repaired docs-only. But the repair went through **three
+review rounds**, and two of the rounds found further defects: one pre-existing (a swapped
+cosmetic/load-bearing claim that contradicted itself within three lines, in the very paragraph the
+repair cites as governing) and **one introduced by the repair itself** — a clause asserting the chain
+"breaks at its first real link" while the next clause asserted the opposite. That last one is the
+reason this record exists: the lead described the wording in a message as "second" while the file
+said "first real", and only a reviewer reading the source rather than the description caught it.
+**The lesson recorded for this pass: a repair that cites its own prose is not finished when the
+prose is corrected — it is finished when every falsifiable clause in the cited text has been
+measured.**
+
+**Mechanical evidence, not self-certification.** Each round was verified by: an AST comparison with
+docstrings stripped (itself self-tested against six mutants after two real bugs in the proof were
+found); a width-hash re-run; the full suite; and a `tools/` zero-diff check against `97a2a52`. The
+final state is also covered by a script asserting all 19 falsifiable clauses in the repaired
+docstring true by measurement.
