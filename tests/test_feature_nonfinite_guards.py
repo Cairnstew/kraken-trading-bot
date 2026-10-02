@@ -600,3 +600,139 @@ def test_a_clean_frame_is_unaffected_by_every_guard():
     # has real spread rather than sitting flat at zero.
     sma_idx = list(raw.columns).index("sma_4")
     assert obs[:, sma_idx].std() > 0.0
+
+
+def test_order_book_imbalance_denominator_is_guarded_against_cancellation():
+    """The one case where the imbalance denominator guard is load-bearing.
+
+    ``bid_vol - ask_vol`` over ``bid_vol + ask_vol`` looks safe against an
+    infinity on its own -- an infinite numerator meets an infinite
+    denominator and yields ``NaN``, which the fill repairs.  But the
+    denominator is a SUM, so two large volumes of OPPOSITE SIGN cancel it
+    to exactly ``0`` while the numerator stays huge, and ``inf / 0`` is
+    ``inf``: a value that survives the observation policy.  Negative
+    volumes are representable (a signed net-flow feed), so this is
+    reachable, not hypothetical.
+    """
+    df = _frame(n=200)
+    df["bid_vol"] = 1e308
+    df["ask_vol"] = -1e308  # denominator cancels to 0.0, numerator to inf
+    df["bid"] = 100.0
+    df["ask"] = 100.5
+
+    raw = _pipeline().compute(df)
+    values = pd.to_numeric(raw["order_book_imbalance"], errors="coerce").to_numpy(
+        dtype=np.float64
+    )
+    assert not np.isinf(values).any(), (
+        "order_book_imbalance emitted inf: the denominator cancelled to 0 "
+        "while the numerator overflowed, and inf/0 is inf"
+    )
+    assert np.isfinite(_observation(df)).all()
+
+
+def test_rsi_reports_the_neutral_50_when_a_window_has_no_losses():
+    """Pins the value the ``avg_loss`` zero floor actually produces.
+
+    Two different readings are possible for a window with no losses, and
+    they are numerically distinguishable, so this pins the chosen one:
+    ``avg_gain / avg_loss.replace(0, nan)`` is ``NaN`` and the trailing
+    ``fillna(50.0)`` supplies the neutral 50, whereas the unfloored ``inf``
+    would make ``100 - 100/(1 + inf)`` collapse to ``100.0``.  The module
+    deliberately takes the neutral reading; this test is what makes that
+    a decision rather than an accident.
+    """
+    rising = pd.Series(100.0 * (1.001 ** np.arange(40)))  # no down-bars at all
+    values = _rsi(rising, 14).to_numpy(dtype=np.float64)
+
+    assert np.isfinite(values).all()
+    assert (values[14:] == 50.0).all(), (
+        "a window with no losses resolved to the unfloored value rather "
+        "than to the neutral 50"
+    )
+
+
+def test_log_return_loop_numerator_is_guarded_on_an_inf_close():
+    """The LIVE log-return expression, which is the one in the window loop.
+
+    ``return_1``/``log_return_1`` are assigned twice: once as standalone
+    statements and once by ``for w in self.windows``.  With ``w=1`` in the
+    window set -- the default -- the loop wins, so the loop's expression is
+    the one that actually reaches the column, and it is the one whose
+    numerator guard is load-bearing.  An infinite close makes the numerator
+    ``inf`` and ``log(inf)`` is ``+inf``.
+    """
+    df = _frame()
+    df.loc[df.index[200], "close"] = np.inf
+
+    raw = _pipeline().compute(df)
+    for col in ("log_return_1", "log_return_4", "log_return_24"):
+        values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
+        assert not np.isinf(values).any(), (
+            f"{col} emitted inf: the window-loop numerator is unguarded"
+        )
+    assert np.isfinite(_observation(df)).all()
+
+
+def test_range_1_and_price_ratio_numerators_are_guarded_on_an_inf_close():
+    """The numerator guards on the two ratio features, exercised by inf.
+
+    ``range_1`` divides a DIFFERENCE of two series by ``close``, so both
+    the numerator and the denominator need a guard; ``price_ratio_sma_{w}``
+    divides ``close`` by a rolling mean, and its numerator is the ``close``
+    that a zero/infinite bar sets.  An infinite close is the discriminating
+    case: it leaves the denominator healthy, so only the numerator guard can
+    save the column.
+    """
+    df = _frame()
+    df.loc[df.index[200], "close"] = np.inf
+    df.loc[df.index[200], "high"] = np.inf
+
+    raw = _pipeline().compute(df)
+    for col in ("range_1", "price_ratio_sma_4", "price_ratio_sma_24"):
+        values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
+        assert not np.isinf(values).any(), (
+            f"{col} emitted inf: its numerator is unguarded, and an "
+            f"infinite close leaves the denominator healthy"
+        )
+    assert np.isfinite(_observation(df)).all()
+
+
+def test_compute_seam_is_the_only_guard_for_the_rolling_technical_group():
+    """Pins the seam itself, which the price-group tests cannot.
+
+    ``sma``/``ema``/``rsi``/``macd``/``bollinger``/``atr`` carry **no**
+    per-expression guard by design: the module places one sanitization in
+    ``compute`` precisely so it covers the rolling builders too.  An
+    infinite close therefore reaches ``close.rolling(4).mean()`` as ``inf``
+    and comes straight back out as ``inf`` -- nothing downstream re-guards
+    it, and ``ffill``/``fillna`` cannot repair it.
+
+    In the price group the individual guards turn out to be mutually
+    redundant (an inf numerator meets a guarded denominator and yields
+    NaN), so those tests pass with the seam removed.  This one cannot.
+    """
+    df = _frame()
+    for col in ("close", "high", "low", "open"):
+        df.loc[df.index[200], col] = np.inf
+
+    raw = _pipeline().compute(df)
+    for col in (
+        "sma_4",
+        "ema_4",
+        "rsi_4",
+        "macd_line_4",
+        "macd_signal_4",
+        "macd_hist_4",
+        "bb_upper_4",
+        "bb_lower_4",
+        "bb_width_4",
+        "bb_pctb_4",
+        "atr_4",
+    ):
+        values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
+        assert not np.isinf(values).any(), (
+            f"{col} emitted inf: the compute() seam is the only guard for "
+            f"the rolling builders"
+        )
+    assert np.isfinite(_observation(df)).all()

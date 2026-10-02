@@ -683,17 +683,32 @@ class FeaturePipeline:
         check is a single vectorized pass over a C-contiguous numpy array
         -- no Python-level loop over rows or columns -- so it is bounded by
         the array's memory bandwidth, not by its element count in Python.
-        On the store arm's own shape (36 804 rows x 60 features,
-        float64) it measures ~2.0 ms per call against a ~9 ms ``compute()``,
-        i.e. ~18% of ``transform``; on the same shape in float32 it is
-        ~1.0 ms.  That is affordable at this call rate (once per
-        observation build, not once per environment step -- the
-        environment normalizes once in ``_raw_feature_array`` and slices
-        per step), and it is the only place a whole-episode poisoning can
-        be caught before the policy sees step 1.  Deferring it to
-        construction was rejected: the stats can be replaced by
-        :meth:`set_stats` / :meth:`load_normalization` at any time, and it
-        is exactly that later swap which reintroduces a poisoned artifact.
+
+        Measured on the store arm's own row count (36 804 bars, the default
+        feature groups, 49 columns, float64) on this host: **0.45 ms** per
+        call on a contiguous float64 array (0.52 ms median), 0.94 ms when
+        handed the ``DataFrame`` rather than the array, and 0.15 ms on the
+        float32 array actually returned.  ``compute()`` on the same frame
+        is ~67 ms and a whole ``transform`` ~93 ms, so **both** gates
+        together are ~0.5% of a ``transform`` (~1.3% of the ``compute``
+        they guard).  It is affordable at this call rate, and it is the
+        only place a whole-episode poisoning can be caught before the
+        policy sees step 1.
+
+        (An earlier revision of this docstring claimed ~2.0 ms per call
+        against a ~9 ms ``compute`` -- i.e. ~18%.  Re-measured, the scan
+        is roughly 4x *cheaper* than stated and ``compute`` roughly 7x
+        more expensive, so the conclusion is unchanged and the margin is
+        wider than claimed.  The numbers above are the ones to trust.)
+
+        The scan runs on **every** ``transform``, not once at
+        construction.  Deferring it was rejected: the stats can be replaced
+        by :meth:`set_stats` / :meth:`load_normalization` at any time, and
+        it is exactly that later swap which reintroduces a poisoned
+        artifact.  It is not on the per-step path either -- the environment
+        builds its matrix once in ``_raw_feature_array`` and slices per
+        step (``environment.py`` calls ``stats.normalize`` at
+        construction; ``step`` reads ``self._feature_matrix[idx]``).
 
         Args:
             df: Raw OHLCV frame.
