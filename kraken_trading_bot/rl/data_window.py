@@ -43,6 +43,25 @@ works for a fetched frame, a store-backed frame and a test fixture alike.
 A pinned window therefore still needs ``--pages``/``eval_split`` to be
 large enough to cover it; the callers raise a named error rather than
 silently replaying a handful of bars.
+
+**A pin with nothing behind it is a named error, and a result says which
+kind of measurement it is.**  Two additions close the loop this module
+opened:
+
+:func:`evaluate_scope`
+    Derives the in-sample/out-of-sample verdict from the **actual**
+    halves, not from a flag a caller set -- so every artifact that
+    reports a return has to carry the verdict it earned.  With the
+    shipped default (``since``/``until`` null) the two halves are the
+    same object and the verdict is ``IN-SAMPLE``, which is the honest
+    reading of a backtest over the bars the model was fitted on.
+
+:func:`training_frame` / :func:`evaluation_frame`
+    Refuse a pin whose range misses every bar that exists, raising
+    :class:`~kraken_trading_bot.rl.data.PinnedWindowUnavailableError`
+    (a ``NotEnoughDataError``) that names the cause, the overlap that
+    failed and the fix, instead of letting an empty slice reach
+    ``prepare_episode`` and surface as a bare bar count.
 """
 
 from __future__ import annotations
@@ -59,6 +78,26 @@ _LOGGER = logging.getLogger(__name__)
 # Matches the value shipped in ``configs/default.yaml``; it is inert while
 # the window is unpinned (see the module docstring).
 DEFAULT_EVAL_SPLIT = 0.7
+
+# The two words every artifact carries.  Matched verbatim on
+# ``IN-SAMPLE`` by the matrix harness (``tools/model_matrix.py``), so a
+# cell summarised here and a cell summarised there read the same.
+IN_SAMPLE_LABEL = "IN-SAMPLE"
+OUT_OF_SAMPLE_LABEL = "OUT-OF-SAMPLE"
+
+
+def _pinned_window_error() -> type[Exception]:
+    """The pin-coverage error class, imported lazily.
+
+    Deferred because ``data_window`` is deliberately dependency-free --
+    pure pandas slicing, nothing fetched, nothing required -- and
+    ``kraken_trading_bot.rl.data`` pulls in the whole feature package.
+    ``data`` does not import this module, so there is no cycle to avoid;
+    only the import cost, and only on the one error path.
+    """
+    from .data import PinnedWindowUnavailableError
+
+    return PinnedWindowUnavailableError
 
 
 @dataclass(frozen=True)
@@ -102,6 +141,64 @@ class DataWindow:
         lower = "unbounded" if self.since is None else self.since.isoformat()
         upper = "unbounded" if self.until is None else self.until.isoformat()
         return f"[{lower}, {upper}) eval_split={self.eval_split:g}"
+
+
+@dataclass(frozen=True)
+class EvaluationScope:
+    """What kind of measurement a run's evaluation bars actually are.
+
+    Every artifact that reports a return carries one of these, because
+    "a backtest" says nothing about whether the bars it replayed were
+    bars the model was fitted on.  With the shipped default
+    (``since``/``until`` null) :func:`training_frame` and
+    :func:`evaluation_frame` return the *same object*, so the return
+    describes the fit and not a prediction -- and the only honest label
+    for it is ``IN-SAMPLE``.
+
+    A plain bool plus strings rather than an enum: it has to survive
+    ``json.dumps`` in ``--json`` output and land as a CSV column in
+    ``export-data``, and both want a scalar.
+
+    Attributes:
+        is_out_of_sample: True only when the window is pinned, the split
+            applies, and the two halves came back **non-empty and
+            genuinely disjoint**.  Every clause is load-bearing: a
+            nominally pinned window that yields 0/0 bars has not earned
+            an out-of-sample label, it has failed.
+        label: ``"OUT-OF-SAMPLE"`` or ``"IN-SAMPLE"`` -- the word to
+            print.
+        reason: One sentence naming which clause decided it, so a reader
+            can tell "you never pinned a window" from "you pinned one and
+            it covered nothing".
+        window_is_pinned: The window's own :attr:`DataWindow.is_pinned`.
+        window_has_split: The window's own :attr:`DataWindow.has_split`.
+        n_train_bars: Bars the training half holds.
+        n_eval_bars: Bars the evaluation half holds.
+        n_overlapping_bars: Bars the two halves share; must be ``0`` for
+            an out-of-sample verdict.
+    """
+
+    is_out_of_sample: bool
+    label: str
+    reason: str
+    window_is_pinned: bool
+    window_has_split: bool
+    n_train_bars: int
+    n_eval_bars: int
+    n_overlapping_bars: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """A JSON-serializable view, for ``--json`` output."""
+        return {
+            "evaluation_is_out_of_sample": self.is_out_of_sample,
+            "evaluation_scope_label": self.label,
+            "evaluation_scope_reason": self.reason,
+            "data_window_is_pinned": self.window_is_pinned,
+            "data_window_has_split": self.window_has_split,
+            "n_train_bars": self.n_train_bars,
+            "n_eval_bars": self.n_eval_bars,
+            "n_overlapping_bars": self.n_overlapping_bars,
+        }
 
 
 def _parse_bound(value: Any, key: str) -> pd.Timestamp | None:
@@ -305,11 +402,19 @@ def training_frame(df: pd.DataFrame, window: DataWindow) -> pd.DataFrame:
     Returns:
         The training slice; the whole (clipped) frame when no split
         applies.
+
+    Raises:
+        PinnedWindowUnavailableError: If the pin leaves no bar at all --
+            a subclass of ``NotEnoughDataError``, so existing handlers
+            still catch it.
     """
     clipped = clip_to_window(df, window)
     if not window.has_split or len(clipped) < 2:
+        _guard_pinned_coverage(df, clipped, window, "training")
         return clipped
-    return clipped.iloc[: split_index(len(clipped), window)]
+    out = clipped.iloc[: split_index(len(clipped), window)]
+    _guard_pinned_coverage(df, out, window, "training")
+    return out
 
 
 def evaluation_frame(df: pd.DataFrame, window: DataWindow) -> pd.DataFrame:
@@ -323,17 +428,225 @@ def evaluation_frame(df: pd.DataFrame, window: DataWindow) -> pd.DataFrame:
         The out-of-sample slice; the whole (clipped) frame when no split
         applies, so an unpinned backtest replays exactly what it always
         did.
+
+    Raises:
+        PinnedWindowUnavailableError: If the pin leaves no bar at all --
+            a subclass of ``NotEnoughDataError``, so existing handlers
+            still catch it.
     """
     clipped = clip_to_window(df, window)
     if not window.has_split or len(clipped) < 2:
+        _guard_pinned_coverage(df, clipped, window, "evaluation")
         return clipped
-    return clipped.iloc[split_index(len(clipped), window) :]
+    out = clipped.iloc[split_index(len(clipped), window) :]
+    _guard_pinned_coverage(df, out, window, "evaluation")
+    return out
+
+
+def _bar_span(df: pd.DataFrame) -> str | None:
+    """Human ``first .. last (n bars)`` for a frame, or ``None`` if empty.
+
+    The available span an error needs to quote: a reader cannot tell why
+    a pin missed without seeing what was there instead.
+    """
+    if df is None or len(df) == 0:
+        return None
+    index = df.index
+    if not isinstance(index, pd.DatetimeIndex):
+        try:
+            index = pd.to_datetime(index, utc=True)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return f"<{len(df)} bars on a {type(df.index).__name__} index>"
+        if index.tz is None:  # pragma: no cover - to_datetime(utc) sets tz
+            index = index.tz_localize("UTC")
+    return (
+        f"{index[0].isoformat()} .. {index[-1].isoformat()} ({len(df)} bars)"
+    )
+
+
+def _guard_pinned_coverage(
+    source: pd.DataFrame,
+    sliced: pd.DataFrame,
+    window: DataWindow,
+    half: str,
+) -> None:
+    """Refuse a pin that overlaps nothing, naming the cause and the fix.
+
+    Fires on exactly one condition -- **the window is pinned** *and* the
+    resulting ``{half}`` slice is empty -- because that is the one
+    "not enough data" state whose remedy is not "raise ``--pages``": the
+    bars are not behind the requested window at all, so paging further
+    into the trailing 721 can never reach them.
+
+    It deliberately does **not** fire for an ordinary short frame.  A
+    frame that overlaps the window but holds fewer bars than the warm-up
+    needs keeps returning its (short) slice and keeps raising plain
+    ``NotEnoughDataError`` further down, where "widen --pages" is the
+    right advice; ``tests/test_market_data_store_seeding.py`` pins both
+    behaviours.
+
+    An **unpinned** window never fires here either, even on an empty
+    frame: that is the pre-existing path and it already has its own named
+    error one layer down.
+    """
+    if not window.is_pinned:
+        return
+    if sliced is not None and len(sliced) > 0:
+        return
+
+    n_available = 0 if source is None else len(source)
+    if n_available == 0:
+        reason = (
+            "the pinned window is satisfiable in principle, but the read "
+            "returned no bars at all"
+        )
+    else:
+        reason = (
+            "the pinned window is entirely outside the available bars -- "
+            f"no {half} bar survives the clip"
+        )
+    raise _pinned_window_error()(
+        reason,
+        window=window.describe(),
+        requested_range=_requested_range(window),
+        available_span=_bar_span(source),
+        n_available=n_available,
+    )
+
+
+def _requested_range(window: DataWindow) -> str:
+    """The ``since``/``until`` a pin asked for, as one quotable phrase."""
+    lower = "unbounded" if window.since is None else window.since.isoformat()
+    upper = "unbounded" if window.until is None else window.until.isoformat()
+    return f"[{lower}, {upper})"
+
+
+def evaluate_scope(df: pd.DataFrame, window: DataWindow) -> EvaluationScope:
+    """Is the evaluation slice genuinely out-of-sample?  Derive, don't ask.
+
+    The verdict is computed from the two halves :func:`training_frame`
+    and :func:`evaluation_frame` actually produce, so a caller cannot get
+    an out-of-sample label by setting a flag -- and cannot get one by
+    pinning a window that covers nothing.  Three clauses, all required:
+
+    1. the window is **pinned** (``since``/``until`` set) -- otherwise
+       the split is inert and both halves are the same object;
+    2. the split **applies** (``eval_split`` below 1.0);
+    3. both halves come back **non-empty and disjoint**.
+
+    Clause 3 is the one that matters for honesty rather than mechanics: a
+    pinned window over data that does not reach back that far yields
+    0/0 bars, and that is a *failed* measurement, not an out-of-sample
+    one.  :func:`training_frame` refuses that case outright, so this
+    function sees it only if a caller handed it a short frame directly --
+    and it still refuses to call it out-of-sample.
+
+    Args:
+        df: The full (pre-clip) frame the run read.
+        window: Resolved window.
+
+    Returns:
+        The verdict, with the reason a reader needs to trust it.
+    """
+    train = training_frame(df, window)
+    evaluation = evaluation_frame(df, window)
+
+    n_train = 0 if train is None else len(train)
+    n_eval = 0 if evaluation is None else len(evaluation)
+
+    # `is` first: the unpinned default hands back one object, and
+    # building two sets for 76k bars to rediscover that is not free.
+    if train is not None and evaluation is not None and train is evaluation:
+        n_overlap = n_eval
+    else:
+        try:
+            n_overlap = len(set(train.index) & set(evaluation.index))
+        except TypeError:  # pragma: no cover - unhashable index values
+            n_overlap = 0
+
+    scope = dict(
+        window_is_pinned=window.is_pinned,
+        window_has_split=window.has_split,
+        n_train_bars=n_train,
+        n_eval_bars=n_eval,
+        n_overlapping_bars=n_overlap,
+    )
+
+    if not window.is_pinned:
+        return EvaluationScope(
+            is_out_of_sample=False,
+            label=IN_SAMPLE_LABEL,
+            reason=(
+                "data_window.since and until are both null (the shipped "
+                f"default), so the training and evaluation slices are the "
+                f"SAME {n_eval} bar(s) -- this return describes the fit, "
+                "not a prediction. Pin data_window.since/until to hold bars "
+                "out."
+            ),
+            **scope,
+        )
+
+    if not window.has_split:
+        return EvaluationScope(
+            is_out_of_sample=False,
+            label=IN_SAMPLE_LABEL,
+            reason=(
+                f"data_window is pinned to {window.describe()} but "
+                f"eval_split={window.eval_split:g} disables the train/eval "
+                f"split, so evaluation replayed the same {n_eval} bar(s) "
+                "the model was fitted on. Set data_window.eval_split below "
+                "1.0 to hold bars out."
+            ),
+            **scope,
+        )
+
+    if n_train == 0 or n_eval == 0:
+        return EvaluationScope(
+            is_out_of_sample=False,
+            label=IN_SAMPLE_LABEL,
+            reason=(
+                f"data_window is pinned to {window.describe()} but clipped "
+                f"to {n_train} training / {n_eval} evaluation bar(s) -- "
+                "there is nothing held out, so this supports no "
+                "out-of-sample claim."
+            ),
+            **scope,
+        )
+
+    if n_overlap > 0:
+        return EvaluationScope(
+            is_out_of_sample=False,
+            label=IN_SAMPLE_LABEL,
+            reason=(
+                f"data_window is pinned to {window.describe()} but the "
+                f"training and evaluation slices share {n_overlap} bar(s), "
+                "so the return is measured partly over bars the model was "
+                "fitted on."
+            ),
+            **scope,
+        )
+
+    return EvaluationScope(
+        is_out_of_sample=True,
+        label=OUT_OF_SAMPLE_LABEL,
+        reason=(
+            f"data_window pinned to {window.describe()} with "
+            f"eval_split={window.eval_split:g}: evaluation replayed "
+            f"{n_eval} bar(s) disjoint from the {n_train} training bar(s) "
+            "the model was fitted on."
+        ),
+        **scope,
+    )
 
 
 __all__ = [
     "DataWindow",
     "DEFAULT_EVAL_SPLIT",
+    "IN_SAMPLE_LABEL",
+    "OUT_OF_SAMPLE_LABEL",
+    "EvaluationScope",
     "clip_to_window",
+    "evaluate_scope",
     "evaluation_frame",
     "resolve_data_window",
     "split_index",
