@@ -12,7 +12,8 @@ bars**, at the **seed/live-append seam**: ``2026-08-31 23:00`` to
 and this repo's live append leg takes over.
 
 These tests DETECT AND LABEL. They deliberately assert nothing about a
-repair, because the repair is CAND-3b and out of scope.
+repair, because the repair (time-aware windows over a reindexed bar grid)
+is a separate, unregistered item and out of scope. See DECISION.md 14.
 """
 
 from __future__ import annotations
@@ -247,7 +248,7 @@ def test_the_caveat_names_the_missing_bars_gaps_and_the_seam_hole(tmp_path):
     assert "1 gap(s)" in caveat
     assert SEAM_GAP_NAME in caveat
     # And it must point at the real fix rather than implying this is fine.
-    assert "CAND-3b" in caveat
+    assert "time-aware" in caveat
     assert "BAR COUNTS" in caveat
 
 
@@ -260,7 +261,7 @@ def test_format_report_prints_the_seam_warning_on_its_own_line(tmp_path):
     assert "MISSING" in text
     assert SEAM_GAP_NAME in text
     assert "**" in text  # the flagged line
-    assert "CAND-3b" in text
+    assert "time-aware" in text
 
 
 # ── the CLI ────────────────────────────────────────────────────────────────

@@ -18,9 +18,11 @@ can catch that: a z-scored 1-bar step looks exactly like a z-scored
 39-bar step.
 
 This tool **detects and labels only**. It does not repair, interpolate or
-reindex anything, and it does not fail the run -- it reports. The real
-fix is CAND-3b (time-aware feature windows over a reindexed grid); see
-``DECISION.md``.
+reindex anything, and it does not fail the run -- it reports. The real fix
+is to make the feature windows **time-aware** -- compute them over a
+reindexed, gap-filled bar grid so a window means N *hours* rather than N
+*rows*. That item is not yet registered; see DECISION.md section 14 for
+why it is deliberately NOT called CAND-3b (that label is already taken).
 
 Usage::
 
@@ -200,7 +202,8 @@ class GapReport:
             + "; ".join(parts)
             + ". Features here are computed on BAR COUNTS, not wall-clock, so "
             "a gap of N bars is z-scored as a 1-bar step and the 24-bar "
-            "warm-up may span more than a day. The real fix is CAND-3b."
+            "warm-up may span more than a day. The real fix is time-aware "
+            "feature windows over a reindexed bar grid (DECISION.md 14)."
         )
 
 

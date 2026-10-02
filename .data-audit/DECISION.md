@@ -705,3 +705,64 @@ If the cost-aware numbers show the strategy losing money in **both** arms — wh
 frictionless→taker swing suggests — the report **says so plainly**. No "store arm improved"
 language in either direction. What CAND-3a delivered remains: *an out-of-sample measurement
 became possible at all.*
+
+---
+
+## 14. KNOWN LIMITATION — features are computed on bar counts, not wall-clock
+
+**Status: DETECTED AND LABELLED, NOT FIXED.** Recorded 2026-10-02 from Phase 6 finding F6.
+**This section is a standing caveat on every number computed from the store arm.**
+
+### 14.1 What was measured
+
+`just store-verify` now runs `tools/store_gap_scan.py` alongside the sibling seeder's own
+contiguity check. On the shipped ETH/USD 60-minute store (106 month files):
+
+| | |
+|---|---|
+| bars present | **76,564** (was 76,563 at Phase 6 review; the live append leg adds ~1 bar per run) |
+| span | `2018-01-01T00:00Z` → `2026-10-02T17:00Z`, **76,721 hours** |
+| **missing bars** | **158** across **28 gaps** (157 at review time; the +1 is the live leg) |
+| largest gap | `2026-08-31 23:00` → `2026-09-02 14:00` — **38 missing bars**, spanning **39 elapsed hours** |
+| other gaps | 32 (2018-02, off-grid boundary), 10 (2018-06-26), 10 (2019-05-15), 8 (2019-08-15), 7 ×2, 6, … |
+
+**Units, because this gap has already been reported both ways and read as a contradiction:**
+*38 missing bars* and *39 hours* are both correct. `N` missing bars means the two surviving bars
+are `N+1` steps apart.
+
+### 14.2 Why it matters
+
+Every feature in `features.py` is computed over a **window of rows**, and the environment's
+`start_index = 24` skips 24 **rows**:
+
+- `return_1` reports the return between whichever two rows happen to be adjacent. Across the
+  39-hour seam that is a **39-hour return presented as a 1-hour return**.
+- `sma_24`, `rsi_24`, `obv_slope_24` and `bollinger_24` span 24 rows that may cover **more than
+  a day**.
+- After z-scoring, a 39-bar jump is indistinguishable from a 1-bar jump. **No guard in this repo
+  can detect it**, because every value involved is finite and correctly computed from the rows it
+  was given. Only the timestamps know.
+
+**The 38-bar hole is at the seed/live-append seam**, in the most recent month: the month-file
+boundary where the Binance-archive seed ends and this repo's live append leg takes over. That is
+precisely the region a live deployment trades, so the hole is not confined to the training slice.
+The tool labels that gap **by name** (`seed/live-append seam`) and flags it on its own line.
+
+### 14.3 What was deliberately NOT done
+
+**No reindexing, no interpolation, no gate.** `store_gap_scan.py` detects and labels; it does not
+repair and does not fail the run. Adding a hard failure would have broken the store arm on data
+that is otherwise usable, which is a bigger decision than a bug-fix pass should make.
+
+### 14.4 The real fix, and why it is not called CAND-3b
+
+The fix is to compute features over a **reindexed, gap-filled bar grid**, so a window means N
+*hours* rather than N *rows* — i.e. make the windows time-aware and decide explicitly what a
+window spanning a gap means (hold last value, or mask the row).
+
+**It is not called CAND-3b here on purpose.** `CAND-3b` is **already taken** in this document:
+§10.4 defines it as `since`/`until` push-down plus a venue label in `_meta.json` — a ~21-line,
+store-only **efficiency** item, explicitly DEFERRED as not load-bearing (whole-store read 0.142 s
+vs windowed 0.010 s). Reusing that id for a correctness fix would be the same false-claim failure
+this pass exists to remove, so this item needs its own registration before it is referred to by
+id. *Raised with the lead rather than invented here.*
