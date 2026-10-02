@@ -502,6 +502,22 @@ third-party archives.
 Any `F<n>` raised in Phase 6 that is not in this table **must be appended here** before
 `just audit-findings` is allowed to pass.
 
+### 7.8 Phase 4/5 finding dispositions (lead-appended after `aba7b9b`)
+
+Raised during Phase 4B (`8cada4e`) and Phase 5 (`aba7b9b`). Recorded here so their
+disposition is decision-level and not living only in a commit message — the gap
+`just audit-findings` exists to catch.
+
+| id | finding | disposition |
+|---|---|---|
+| **F-7** | **§6.1's dedup direction was inverted.** It claimed the appended *live* record wins the overlap hour. `data.py:758-763` runs `signal_df[~signal_df.index.duplicated(keep="last")]` **before** the hour-`floor()` and the `groupby(level=0).last()`, so the loser's whole row is discarded by **file order** and `last()` never sees it. Whichever record is **last in the file** wins the hour wholesale. | **Corrected and acted on.** Builder `--append` now **skips hours the file already holds**, which also enforces §6's own "one object per `(ticker, floored hour)`" contract. Measured without the skip: 13 real `spread` readings → `NaN`, spread max → `nan`, +13 non-finite cells. The consumer-side alternative (drop the row-level dedup so `groupby` merges per column) is a seam change that flips D1 to CHANGED — **declined, out of scope.** |
+| **F-8** | **§7.3's exact width constants are wrong by 3, so a gate asserting them WILL fail.** C1 says `n_features == 57`; C2 says `== 49`. Measured on the shipped live-fetch leg: **60** and **52**. Every §7 width figure is 3 low because the frame it was measured on lacked `vwap`/`count`, so the three presence-gated derived features (`vwap_dev`, `volume_per_trade`, `trade_count_zscore_20`) were absent. **Sane range is 52–60, not 49–57.** | **Superseded — Phase 6 must use 52–60.** The *deltas* in §7 are still right (the `funding_rate`-only hazard is −5: 60 → 55). Do **not** assert C1/C2's literals. This is the same class as the 2026-10-01 "width per configuration" lesson: **ask which axis the earlier figure's fixture included.** |
+| **F-9** | **C8 ("0 non-finite") is unsatisfiable as written on one arm and satisfied on the other.** Builder measured **684** non-finite cells (identical in baseline *and* target, all `spread` where there is no bid/ask); integrator measured **0**. | **Open — reviewer must re-derive and name the frame.** The likely reconciliation is *which frame is counted*: 684 pre-zero-fill NaN cells in the merged frame vs 0 post-zero-fill in the observation (`data.py:816` `fillna(0.0)`). **Do not** restate either number until that is shown. |
+| **F-10** | **C12 (`signal_age_hours` max ≤ 2.0) is unachievable as written; measured max 12.0.** `signal_age_hours` is `ages.max(axis=1)` — the **stalest** column wins — and the backfill carries no `bid`/`ask`/`basis`/`open_interest`/`vol24h`, so those read the appended live row and ramp 1…12 before the 12 h bound retires them. | **Restate per shape.** C12 holds on the *shipped* shape (live snapshot on the **newest** bar, carry runs backwards) and not on a file seeded with a **stale** snapshot. This also **confirms F-6**: DEV-2 was right to leave the bound at 12. Phase 6 states which shape it measured. |
+| **F-11** | **`spread` nonzero count is measured two ways and they disagree.** Builder: **13** (arguing §3.1/§3.2's "24" must equal the 13 observed bars, since both come from one live record plus one 12 h carry). Integrator: **24/721**, byte-identical both arms. | **Open — reviewer re-derives and states the frame and the right edge.** Not resolved here; two agents measured different arms. This repo's record is that a bar count must be **timestamped** or it reads as an error. |
+| **F-12** | **§6 says the record carries 13 keys; the backfilled file carries 14** (the extra is `relative_funding_rate`, which §4/DEV-4 says to record), so B2's "exactly the same 13 keys" is unsatisfiable. | **Restated as a superset.** What the consumer needs is *backfilled ⊇ live*; that holds and is what the builder's test asserts. `relative_funding_rate` costs **0** observation columns because `data.py:765-769` intersects on keys. |
+| **F-13** | **F-1 is now resolved, and its number was wrong.** F-1 read the shipped default as **52**; the integrator corrected the docstring: **52 is the all-null width**, the shipped default composes **60**. | **Closed** by a docstring-only edit in `aba7b9b` (invisible to D1's `executable-ast`, which is what F-1's own disposition required). |
+
 ---
 
 ## 8. Runner-ups, and why they lost
