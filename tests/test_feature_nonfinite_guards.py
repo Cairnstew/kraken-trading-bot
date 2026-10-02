@@ -1,14 +1,14 @@
 """Non-finite feature guards: one bad bar must not poison the episode.
 
 The measured failure this pins, from the deep-history store arm of the
-2026-10-02 data-pipeline pass. The seeded Binance archive carries a
-zero-volume bar at each partial-month boundary (4 across 2018-2026: the
-2019-06, 2020-12, 2021-02 and 2023-03 files). ``volume_change_1`` was
-``volume.pct_change()``, which divides by the PRIOR bar's volume, so a
-zero prior bar yields ``inf`` -- and ``inf`` is the one value the
-``compute -> ffill -> fillna(0)`` observation policy cannot repair.
-``FeaturePipeline.fit`` then recorded that column's stats as
-``(mean=inf, std=nan)``; ``NormalizationStats.normalize`` subtracts the
+2026-10-02 data-pipeline pass. The seeded Binance archive carries
+**4 zero-volume bars** in 2018-2026 (``2019-06-07 21:00``,
+``2020-12-21 14:00``, ``2021-02-11 03:00``, ``2023-03-24 12:00``).
+``volume_change_1`` was ``volume.pct_change()``, which divides by the
+PRIOR bar's volume, so a zero prior bar yields ``inf`` -- and ``inf`` is
+the one value the ``compute -> ffill -> fillna(0)`` observation policy
+cannot repair.  ``FeaturePipeline.fit`` then recorded that column's stats
+as ``(mean=inf, std=nan)``; ``NormalizationStats.normalize`` subtracts the
 mean from every row, so EVERY observation row became ``-inf``/NaN and PPO
 died on its own distribution constraint:
 
@@ -19,6 +19,18 @@ died on its own distribution constraint:
 The live arm (721 Kraken bars) had no zero-volume bar and trained fine,
 so the defect was invisible until the store arm was switched on.
 
+**Correction (2026-10-02, Phase 6 finding F4).** These bars were
+originally described here, and in ``DECISION.md`` §9A.3, as sitting "at
+each partial-month boundary".  That was **factually wrong** and this
+description of the cause has been replaced.  All 4 are **mid-month**;
+**0 of the 106 month-first bars** in the archive are zero-volume; and 2 of
+the 4 (2020-12-21 14:00, 2021-02-11 03:00) sit *immediately before* a
+missing-bar gap.  They are **exchange-outage no-trade bars**, not
+archive-boundary artifacts -- a materially different diagnosis, pointing
+at exchange data integrity rather than at the Binance monthly file format.
+(The zero-volume *symptom* and the fix below are unaffected; only the
+attributed cause was wrong.)
+
 Two things are pinned here, and they are deliberately separate:
 
 1. the builders never EMIT a non-finite value for a zero bar -- they emit
@@ -28,6 +40,11 @@ Two things are pinned here, and they are deliberately separate:
    exogenous column still manages to produce one, so the
    "transform output is an affine image of the observation" invariant is
    enforced rather than assumed.
+
+Read the module-level seam note in ``kraken_trading_bot/rl/features.py``
+before adding a guard: ``rolling`` **masks** a non-finite input to NaN
+while ``ewm`` **skips** it and returns a finite-but-wrong value, and that
+difference is what the last three tests in this file exist to pin.
 
 These tests need no network, no store and no sibling package.
 """
@@ -44,8 +61,8 @@ from kraken_trading_bot.rl.features import FeaturePipeline
 def _frame(n: int = 400, zero_volume_at: tuple[int, ...] = (137,)) -> pd.DataFrame:
     """A healthy OHLCV frame with a zero-volume bar at each index given.
 
-    Zero volume is what the seeded archive's partial-month rows carry;
-    everything else is a clean geometric ramp so no indicator is
+    Zero volume is what the seeded archive's exchange-outage no-trade bars
+    carry; everything else is a clean geometric ramp so no indicator is
     degenerate for an unrelated reason.
     """
     idx = pd.date_range("2021-01-01", periods=n, freq="1h", tz="UTC")
@@ -698,24 +715,90 @@ def test_range_1_and_price_ratio_numerators_are_guarded_on_an_inf_close():
     assert np.isfinite(_observation(df)).all()
 
 
-def test_compute_seam_is_the_only_guard_for_the_rolling_technical_group():
-    """Pins the seam itself, which the price-group tests cannot.
+#: The rolling/technical columns that ``compute``'s seam is load-bearing
+#: for, split by the mechanism that repairs them once the seam has mapped
+#: the bad price to NaN.  See the two tests below for the measurements.
+_ROLLING_NAN_COLUMNS = ("sma_4", "bb_upper_4", "bb_lower_4", "bb_width_4")
+_ROLLING_NEUTRAL_COLUMNS = {"rsi_4": 50.0, "bb_pctb_4": 0.5}
 
-    ``sma``/``ema``/``rsi``/``macd``/``bollinger``/``atr`` carry **no**
-    per-expression guard by design: the module places one sanitization in
-    ``compute`` precisely so it covers the rolling builders too.  An
-    infinite close therefore reaches ``close.rolling(4).mean()`` as ``inf``
-    and comes straight back out as ``inf`` -- nothing downstream re-guards
-    it, and ``ffill``/``fillna`` cannot repair it.
 
-    In the price group the individual guards turn out to be mutually
-    redundant (an inf numerator meets a guarded denominator and yields
-    NaN), so those tests pass with the seam removed.  This one cannot.
-    """
+def _poisoned_frame(bad: float, at: int = 200) -> pd.DataFrame:
+    """A healthy frame with ``bad`` written into one bar's whole price row."""
     df = _frame()
     for col in ("close", "high", "low", "open"):
-        df.loc[df.index[200], col] = np.inf
+        df.loc[df.index[at], col] = bad
+    return df
 
+
+def test_compute_seam_makes_a_zero_price_bar_unknown_to_the_rolling_group():
+    """Pins the seam by its *real* effect, which is not infinity suppression.
+
+    This test previously claimed that an infinite close "comes straight back
+    out as ``inf``" through ``rolling`` and that the seam was therefore the
+    only thing stopping an infinity.  That claim was false and the test was
+    vacuous: pandas masks ``inf`` to NaN inside ``rolling`` on its own, so
+    deleting the seam left it green.  Measured on pandas 3.0.4:
+
+    * ``rolling(w)`` **masks** a non-finite input -> NaN (0 infinities out).
+    * ``ewm()`` **skips** the bar entirely -> finite, and *wrong*.
+
+    Neither emits an infinity, so no ``isinf`` assertion can ever see the
+    seam.  What the seam actually does is refuse the bad price *before* the
+    rolling windows consume it, and because ``_NON_FINITE_INPUTS`` contains
+    ``0.0`` as well as the infinities, the reachable trigger is a **zero**
+    price -- far likelier in real OHLCV than an infinity.
+
+    Without the seam a zero price enters the window as a real number and the
+    rolling group reports a finite, plausible, completely wrong answer
+    (measured at bar 200 of this exact frame): ``sma_4`` 91.41 instead of
+    NaN, ``bb_upper_4`` 196.97, ``bb_lower_4`` **-14.14**, ``bb_width_4``
+    **2.3094**, ``rsi_4`` **0.2979**, ``bb_pctb_4`` **0.0670**, ``atr_4``
+    **30.87** against a healthy 0.487.  Every one of those is finite, so
+    every one of them walks straight through ``_require_finite`` -- a
+    -83% price print and a 63x range spike, silently, as model input.
+
+    The contract pinned here is therefore: **the poisoned window reads as
+    unknown (NaN), or as the module's documented neutral constant where a
+    downstream guard owns one** -- never as a finite wrong number.
+    """
+    df = _poisoned_frame(0.0)
+    raw = _pipeline().compute(df)
+
+    # window=4 over a NaN at bar 200 -> bars 200..203 are all un-known.
+    poisoned = slice(200, 204)
+    for col in _ROLLING_NAN_COLUMNS:
+        values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
+        assert np.isnan(values[poisoned]).all(), (
+            f"{col} reported a finite value across the poisoned window "
+            f"({values[poisoned].tolist()}) instead of NaN: the compute() "
+            f"seam is what stops a zero price entering the rolling window"
+        )
+        # and the window must recover once the bad bar has rolled out
+        assert np.isfinite(values[204]), f"{col} never recovered after the gap"
+
+    # These two have a *documented* neutral reading for an unknown window,
+    # so NaN is not what they may report -- the neutral constant is.
+    for col, neutral in _ROLLING_NEUTRAL_COLUMNS.items():
+        values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
+        assert np.allclose(values[poisoned], neutral), (
+            f"{col} should fall back to its documented neutral {neutral} "
+            f"across the poisoned window, got {values[poisoned].tolist()}"
+        )
+
+    # The neutral readings must not leak into the normalized observation
+    # either -- this is the surface the environment actually sees.
+    assert np.isfinite(_observation(df)).all()
+
+
+def test_a_zero_price_bar_never_yields_an_infinity_in_the_rolling_group():
+    """The narrow claim the old test made, kept because it is still true.
+
+    Note what this does **not** establish: it is a property of pandas'
+    own masking, not of this module.  It passes identically with the seam
+    removed -- which is precisely why it could never prove the seam was
+    load-bearing.  The test above is the one that does.
+    """
+    df = _poisoned_frame(0.0)
     raw = _pipeline().compute(df)
     for col in (
         "sma_4",
@@ -731,8 +814,44 @@ def test_compute_seam_is_the_only_guard_for_the_rolling_technical_group():
         "atr_4",
     ):
         values = pd.to_numeric(raw[col], errors="coerce").to_numpy(dtype=np.float64)
-        assert not np.isinf(values).any(), (
-            f"{col} emitted inf: the compute() seam is the only guard for "
-            f"the rolling builders"
-        )
+        assert not np.isinf(values).any(), f"{col} emitted inf for a zero price"
     assert np.isfinite(_observation(df)).all()
+
+
+def test_rolling_masks_but_ewm_skips_a_non_finite_price_this_guard_cannot_see():
+    """Documents the known gap: pandas' ``ewm`` returns finite-but-wrong.
+
+    The seam plus ``_require_finite`` close the *infinity* hole.  They
+    cannot close this one, and this test exists to pin the hazard in place
+    rather than let it be rediscovered as a bug:
+
+    * ``rolling(w).mean()`` **masks** a non-finite input to NaN -- the bad
+      bar contaminates nothing, and the NaN is visible to the guard.
+    * ``ewm(...).mean()`` **skips** the bar and carries on, returning a
+      value that is finite *and wrong* -- 0 infinities and 0 NaNs, so
+      ``_require_finite`` passes it cleanly.  Nothing downstream can tell a
+      skipped-bar EMA from a genuine one.
+
+    Fixing the ``ewm`` families (``ema``/``macd``/``rsi``/``atr``) is out of
+    scope for this pass; what is in scope is that the limitation is written
+    down and pinned.  If this test ever starts failing because pandas
+    changed the behaviour, that is *good* news -- re-check whether the
+    finite-but-wrong hazard still exists.
+    """
+    close = pd.Series([1.0, 2.0, 3.0, np.inf, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    rolled = close.rolling(5).mean().to_numpy(dtype=np.float64)
+    ewmmed = close.ewm(span=5, adjust=False).mean().to_numpy(dtype=np.float64)
+
+    # rolling: masks.  No infinity, and the bar plus its window read NaN.
+    assert not np.isinf(rolled).any()
+    assert np.isnan(rolled[3:8]).all(), "rolling no longer masks a non-finite input"
+
+    # ewm: skips.  No infinity, no NaN -- a clean-looking, wrong number.
+    assert not np.isinf(ewmmed).any()
+    assert not np.isnan(ewmmed).any(), "ewm no longer skips a non-finite input"
+    # It literally repeats the previous bar's value: the inf never entered
+    # the average at all, it was skipped.
+    assert ewmmed[3] == pytest.approx(ewmmed[2]), (
+        "ewm no longer skips the bad bar; the finite-but-wrong hazard it "
+        "created may be gone -- re-check the seam and the ewm guards"
+    )

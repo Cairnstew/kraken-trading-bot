@@ -543,11 +543,21 @@ Two further facts that fall out of the measurement:
   live arm it yields **0 train / 0 eval**. The store is a *precondition* for pinning, not an
   optional extra.
 - **The store flip is not deliverable without the non-finite guard** (`bfe32aa`). The seeded
-  archive carries a zero-volume bar at each partial-month boundary (4 across the store); `pct_change`
+  archive carries 4 zero-volume bars; `pct_change`
   turns it into `inf`, which the documented `compute → ffill → fillna(0)` policy cannot repair, and
   one such bar inside the training slice poisoned all 36,804 rows and killed PPO. **The live arm was
   unaffected** (721 Kraken bars contain no zero-volume bar), so this was invisible until the store
   was switched on.
+  > **CORRECTION (2026-10-02, Phase 6 finding F4) — the diagnosis above was wrong, the
+  > finding was not.** The original wording here read "a zero-volume bar at each partial-month
+  > boundary", implying a Binance monthly-file artifact. That is **factually false**: all 4 bars are
+  > **mid-month**, **0 of the 106 month-first bars** in the archive are zero-volume, and 2 of the 4
+  > (`2020-12-21 14:00`, `2021-02-11 03:00`) sit *immediately before* a missing-bar gap. They are
+  > **exchange-outage no-trade bars** (`2019-06-07 21:00`, `2020-12-21 14:00`, `2021-02-11 03:00`,
+  > `2023-03-24 12:00`) — a data-integrity problem in the upstream exchange feed, not a
+  > month-partitioning artifact. The **symptom, the non-finite guard and the requirement are
+  > unchanged**; only the attributed cause was wrong. Git history is left intact deliberately —
+  > `bfe32aa`'s commit message still carries the old wording.
 
 ---
 
