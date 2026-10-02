@@ -147,7 +147,10 @@ _SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
         "python ~/Projects/ticker-news-signals/cli.py pull --ticker <PAIR> "
         "--output <path>",
     ),
-    ("funding_features_file", "just funding-pull"),
+    (
+        "funding_features_file",
+        "just funding-backfill # then just funding-pull",
+    ),
     (
         "social_features_file",
         "python ~/Projects/kraken-social-signals/cli.py pull --ticker <PAIR> "

@@ -9,6 +9,8 @@
 #   just matrix-plan                       expand a model-evaluation matrix
 #   just test               run the pytest suite
 #   just funding-pull       pull one Kraken funding snapshot (keyless)
+#   just funding-backfill   fill the funding channel's file with Kraken's
+#                           own ~366-day hourly history (keyless, idempotent)
 #   just funding-timer      enable the hourly systemd.user funding timer
 #
 # Every recipe that needs the project environment runs **inside the Nix
@@ -156,6 +158,46 @@ funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   mkdir -p "$root/$(dirname {{output}})"
   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
     pull --pair {{pair}} --output "$root/{{output}}" --append
+
+# Fill funding HISTORY from Kraken's own /historical-funding-rates, into the
+# SAME file `funding-pull` writes (--append).  This is the difference between
+# a funding channel with one record and one with ~8,791: the endpoint is
+# keyless, one request, and serves a rolling ~366-day HOURLY window.
+#
+# Why the same file and not a second one: the merge seam intersects each
+# file's keys against a fixed allow-list, so a history-only file carrying
+# just the recoverable fields would drop `bid`/`ask` and, with them,
+# `spread` — measured 57 -> 52 observation columns.  One file, one key set.
+#
+# Recovery is "1 of 6": `funding_rate` only.  `basis`, `open_interest`,
+# `funding_rate_prediction`, `vol24h` and `spread` are not in that endpoint
+# and are written as JSON null, never 0.0.
+#
+# The ~366-day window AGES OUT (it is recomputed on every call), so run this
+# periodically as a top-up.  Re-running is idempotent: an hour the file
+# already holds is left alone, so it will not duplicate rows.
+#
+# `--since` is optional and is filtered client-side — the endpoint ignores
+# range parameters.  A `--since` older than the rolling window warns and
+# names both dates.
+# The date range comes from the environment, NOT from a just parameter and
+# NOT from an extra arg: `just` binds bare positionals to `pair` then
+# `output` in declaration order, so `just funding-backfill --since X`
+# silently overwrote `output` with "--since" and moved X into the passthrough.
+# An env var cannot be stolen by that binding, and it is also the spelling
+# `funding-pull`'s callers already have in their shell.
+#   just funding-backfill
+#   SINCE=2026-01-01 just funding-backfill
+#   SINCE=2026-01-01 UNTIL=2026-06-01 just funding-backfill XBT/USD
+funding-backfill pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  mkdir -p "$root/$(dirname {{output}})"
+  args=(backfill --pair {{pair}} --output "$root/{{output}}" --append)
+  if [ -n "${SINCE:-}" ]; then args+=(--since "$SINCE"); fi
+  if [ -n "${UNTIL:-}" ]; then args+=(--until "$UNTIL"); fi
+  nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- "${args[@]}"
 
 # ── Model evaluation matrix ─────────────────────────────────────────────
 # Three stages over a YAML matrix spec: expand+warn, execute (resumable

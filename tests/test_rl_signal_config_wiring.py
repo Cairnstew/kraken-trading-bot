@@ -1028,9 +1028,15 @@ def test_both_legs_label_the_key_and_the_producer_not_just_the_seam(
         message = str(err)
         assert err.config_key == "funding_features_file", leg
         # The producer command is the half that makes it a fix rather than a
-        # complaint: without config_key there is no key to look up.
-        assert err.producer == "just funding-pull", leg
+        # complaint: without config_key there is no key to look up.  It now
+        # names the history recipe first, because the funding channel's file
+        # is empty (or one record deep) until history is backfilled --
+        # `just funding-pull` alone only ever appends the newest snapshot.
+        assert err.producer == (
+            "just funding-backfill # then just funding-pull"
+        ), leg
         assert "funding_features_file is set to" in message, leg
+        assert "just funding-backfill" in message, leg
         assert "just funding-pull" in message, leg
         assert "the signal-file config key" not in message, leg
 

@@ -115,14 +115,41 @@ social_features_file: null
 # int to widen it, or 0 for a strict per-hour match.
 #
 # 12 is set here because `funding_features_file` is a real, configured
-# file: kraken-funding-rates settles ~8-hourly, so at the null->1h
-# default most bars fall outside the freshness window and every one of
-# them reads as unobserved.  How many bars a bound covers is NOT a
-# constant — it moves with the read window (`--pages`) and the bar
-# interval — so it is deliberately not quoted as a ratio here.  (An
-# earlier revision of this comment claimed "76 of 721 bars at 1h, 301 of
-# 721 at 12"; that was measured against one particular window and reads
-# as a general figure it never was.)
+# file.  Note the cadence: kraken-funding-rates settles **HOURLY** — an
+# earlier revision of this comment asserted an eight-hour settlement
+# cadence, which is wrong by 8x.  Measured over Kraken's own 8,791-record
+# funding history, the inter-record gap histogram is
+# {1.0h: 8783, 2.0h: 6, 3.0h: 1}, i.e. hourly with three stragglers.  So 12
+# is a deliberate *upper bound* on an essentially hourly series, sized to
+# bridge more than one missed pull — not a statement that records arrive
+# every 12 hours.
+# How many bars a bound covers is NOT a constant — it moves with the read
+# window (`--pages`) and the bar interval — so it is deliberately not
+# quoted as a ratio here.  (An earlier revision of this comment claimed
+# "76 of 721 bars at 1h, 301 of 721 at 12"; that was measured against one
+# particular window and reads as a general figure it never was.)
+#
+# TWO THINGS TO KNOW BEFORE TRUSTING `signal_observed` ON THIS CHANNEL.
+#
+# 1. Funding history is now recoverable, so the file is backfilled rather
+#    than one record deep: `just funding-backfill` appends Kraken's own
+#    ~366-day hourly history (`/historical-funding-rates`, keyless) into
+#    THIS file.  That recovers **1 of 6** columns — `funding_rate` — and
+#    only that one.  `basis`, `open_interest`, `funding_rate_prediction`,
+#    `vol24h` and `spread` are NOT in that endpoint and stay 0.0 fill.
+# 2. `signal_observed` is a per-CHANNEL OR (`observed = filled.notna()
+#    .any(axis=1)`), not per column.  Once history covers the window it is
+#    1.0 on every bar *while four of the six funding columns are still
+#    100% zero-fill with no reading behind them*.  So on this channel
+#    `signal_observed` no longer distinguishes them: it says "a funding
+#    record landed here", not "every funding field has a reading here".
+#    Do NOT gate any feature on `signal_observed`; use `signal_age_hours`
+#    plus the column's own 0.0 fill to reason about absence.
+# 3. Coverage starts at the earliest record Kraken returns — a rolling
+#    ~366-day cap RECOMPUTED on every call, measured from
+#    2025-10-01T08:00Z.  It ages out: run `just funding-backfill`
+#    periodically as a top-up.  Bars older than the file's earliest record
+#    are honestly unobserved (`signal_observed == 0`), not interpolated.
 signal_max_age_hours: 12
 
 # Require every merged signal file to actually be this ticker's file.
