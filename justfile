@@ -221,7 +221,17 @@ store-seed ticker="ETH/USD" since="2018-01-01" interval="60" store=store_root:
   root="{{justfile_directory()}}"
   report="$(mktemp -t ktb-seed-report.XXXXXX.json)"
   trap 'rm -f "$report"' EXIT
-  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli seed --ticker {{ticker}} --interval {{interval}} --from {{since}} --store {{store}}' > "$report"
+  # The redirect MUST live inside the `bash -c` string.  `{{dev}}` is
+  # `nix develop --command bash -c ...`, and this dev shell prints a
+  # six-line banner ("kraken-trading-bot dev shell", the store path, the
+  # version and the two dep lines) to STDOUT on every entry (flake.nix:70,
+  # :74).  A `> "$report"` outside the quotes would therefore capture the
+  # banner *plus* the seeder's JSON, and store_guard would die with
+  # "cannot read the seed report: Expecting value: line 1 column 1" — the
+  # seed had in fact succeeded.  Redirecting inside the inner shell keeps
+  # only the seeder's own stdout, which is the report (cli.py:151); the
+  # seeder's progress and warnings go to stderr (logging_config.py:153).
+  {{dev}} 'PYTHONPATH={{deep_history_dir}}:$PYTHONPATH python -m kraken_deep_history.cli seed --ticker {{ticker}} --interval {{interval}} --from {{since}} --store {{store}} > '"$report"
   {{dev}} 'python '"$root"'/tools/store_guard.py '"$report"
   echo "seeded {{store}}. Check it with: just store-stats && just store-verify"
 

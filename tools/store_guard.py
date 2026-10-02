@@ -88,6 +88,17 @@ def main(argv: list[str] | None = None) -> int:
         report = _load(args[0])
     except (OSError, json.JSONDecodeError) as exc:
         print(f"store_guard: cannot read the seed report: {exc}", file=sys.stderr)
+        print(
+            "store_guard: the report must be the seeder's stdout and nothing "
+            "else.  The likeliest cause is a redirect applied to `nix develop` "
+            "itself rather than to the seeder inside the dev shell: this dev "
+            "shell prints a banner to STDOUT (flake.nix:70), so the file "
+            "holds the banner followed by the JSON and json.load trips on "
+            "character 0.  Fix: put the `>` inside the `bash -c` string, as "
+            "`just store-seed` does.  This is NOT a store_mode verdict — "
+            "nothing here says whether the seed wrote parquet or csv.",
+            file=sys.stderr,
+        )
         return 2
     try:
         mode = require_market_data_store(report)
