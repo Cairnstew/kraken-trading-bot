@@ -1,345 +1,791 @@
-# RESEARCH-3 — gaps G3 + G4: can anything actually be CONCLUDED from this pipeline?
+# RESEARCH-3 — CAND-3 (the ~721-bar ceiling), CAND-4 (no retry), CAND-5 (no dispersion gate)
 
-**Pass:** 2026-10-02 · **Role:** researcher (read-only) · **Gaps:** G3 (thin history) + G4 (measurement power is a literal)
-**Headline:** G3's stated caveat ("deep history is Binance-under-a-Kraken-label") is **true but entirely avoidable at zero cost**, because **Kraken publishes its own keyless OHLCVT CSV archive**. And G4's arithmetic inverts the intuition in the audit: **a longer eval window REDUCES power**, so the pinned 456-bar/3-seed design is close to the worst available choice.
+**Pass:** PHASE 2 research, `audit-pipeline-1002`, agent `researcher3`
+**HEAD researched:** `ca107fa` ("docs: data-pipeline pass 2026-10-02 — Phase 1 audit artifact")
+**Reads:** `AUDIT.md` §2 rows G3/G8, §3 CAND-3/CAND-4/CAND-5
+**Mode:** read-only except this file. No code written, nothing committed, nothing deleted. All
+measurement done in `/tmp/krb-cand3/`.
 
----
-
-## 0. What I verified in code myself (not taken from AUDIT.md)
-
-| Claim | Where | Verdict |
-|---|---|---|
-| `market_data_store: null` makes the deep-history branch dead | `configs/default.yaml:142`; `rl/data.py:949-961` (null → `return fetch_ohlc_dataframe(...)`, byte-identical pass-through); deep branch at `data.py:975-1017` | **CONFIRMED** |
-| `~/Projects/kraken-market-data/store` does not exist | `ls` → *No such file or directory*. The sibling repo `~/Projects/kraken-market-data/` exists (`market_data/`, `INTEGRATION.md`, `tests/`), store never seeded. | **CONFIRMED** |
-| Window bounds are a CLIP, not a push-down | `rl/data_window.py:212-237` (`_window_mask` masks the *already-read* frame), `:240-272` (`clip_to_window`), `:293-330` (`training_frame`/`evaluation_frame` all call `clip_to_window` first) | **CONFIRMED** |
-| `KRAKEN_REST_BAR_CEILING = 720` and `--pages` does not scale it | `tools/model_matrix.py:220-226`; and now **upstream-confirmed**: Kraken's own REST spec says *"Returns up to 720 of the most recent entries (older data cannot be retrieved, regardless of the value of `since`)"* — <https://docs.kraken.com/api/docs/rest-api/get-ohlc-data> | **CONFIRMED (ceiling is absolute, not a paging artefact)** |
-| `MIN_REPLICATES_FOR_A_CLAIM = 3` is a static literal | `tools/model_matrix.py:230`; used only as a threshold at `:1239-1246` and `:1302-1310` and in prose at `:2210-2227`. Never compared to any observed spread. | **CONFIRMED** |
-| No code compares two groups for overlap | `summarize` (`:315-325`) emits `median/q1/q3/min/max`; `_print_group_table` (`:1874-1898`) prints `median [q1,q3]`. `grep` for any interval-overlap/CI logic → none. | **CONFIRMED** |
-| The recorded 672→202→178 run | `tools/model_matrix.py:560-567` quotes verbatim: *"a 672-bar window logged '202 replayable bars', of which 178 were replayed after feature warm-up"* | **CONFIRMED** |
-| The `pages_may_undershoot` warning | `tools/model_matrix.py:1374-1397`, using `pages * 300 < span_bars_for(...)` — note the `300`, not `720`; a third divisor the file never explains. | **CONFIRMED (and see §3.4 — this constant is wrong)** |
-| Deep history is Binance-under-Kraken-label; DOGE unmapped | `configs/deep-history.example.yaml:9-19`; `kraken-deep-history/kraken_deep_history/utils.py:24-27` maps only `ETH/USD→ETHUSDT`, `BTC/USD→BTCUSDT`, `SOL/USD→SOLUSDT`, `XRP/USD→XRPUSDT`; unknown tickers refused | **CONFIRMED** |
-| **NEW — the backtest replay is already deterministic** | `rl/backtest.py:328` `deterministic: bool = True`; `:534` `action = agent.predict(obs, deterministic=deterministic)`. Given a trained model and a pinned window, `backtest_model` has **zero** replay variance. | **CONFIRMED — this changes the whole power analysis** |
-| **NEW — the seed is already in every record** | `tools/model_matrix.py:1119-1121` passes `--seed` to `train` (and deliberately not to `backtest`, `:1132-1136`); `BacktestResult.seed` (`:165,190`) is in `REQUIRED_BACKTEST_FIELDS` (`:136`). | **CONFIRMED — paired-by-seed needs ZERO new collection** |
+Every number below is measured on this host unless it is quoted from a first-party document, in
+which case the source is named. Nothing is estimated.
 
 ---
 
-## 1. Part A — Seeding deep history: candidate records
+## 0. Executive answer
 
-### A1. ⭐ Kraken's own OHLCVT CSV archive — **keyless, same-venue, already first-party**
-
-| Field | Value | Evidence |
-|---|---|---|
-| What | Per-currency-pair OHLCVT CSV, `timestamp,open,high,low,close,volume,trades`, **no header row**, plus a `MANIFEST.json` | support article, <https://support.kraken.com/hc/en-us/articles/360047124832-Downloadable-historical-OHLCVT-Open-High-Low-Close-Volume-Trades-data> |
-| Maintenance | Page **last updated 2026-09-16**; archive artifacts `Last-Modified: Mon, 14 Sep 2026 19:12:12 GMT`; quarterly incremental releases | live `curl -sI` + page |
-| Coverage | **Each pair from its first trade on Kraken through 30 June 2026** (full dump); incremental quarterly ZIPs (`Kraken_OHLCVT_2026Q1.zip`, `Kraken_OHLCVT_2026Q2.zip`) | page + live `MANIFEST.json` read from the Q2 ZIP |
-| Size | Full = 5 × 2,097,152,000 B parts ≈ **10.5 GB**, reassembled, `sha256 fc81b54cba6e12af3e9422dde9416179e6ef76af4831d48d839fbdb43018eaa4`; checksums at `https://assets.kraken.com/marketing/institutions/OHLCVT_Full_PARTS_SHA256SUMS.txt`. **One quarter = 537,866,903 B (538 MB)** | live `curl -sI`: `content-length: 537866903` |
-| Intervals | **1, 5, 15, 30, 60, 240, 720, 1440 minutes** — 60 is present | live: `ETHUSD_60.csv` in the ZIP central directory (9,795 entries) |
-| Auth | **none** — plain `curl -O` on `assets.kraken.com` | page's own macOS/Windows copy-paste `curl` loop |
-| Rate limits | none published; ~2 GB parts on a CDN. I made **2** requests (a HEAD each, then one 538 MB GET) — no throttle encountered. | live |
-| Output shape | `timestamp` is **epoch seconds**; `trades` maps 1:1 to the store's `count`; **no `vwap` column** | live read of `ETHUSD_60.csv` |
-| Gap behaviour | *"the OHLCVT data only includes entries for intervals when trades happened… gaps are not zero-filled"* | page |
-| **Live verification I performed** | Downloaded `Kraken_OHLCVT_2026Q2.zip` (538 MB, keyless) into `/tmp` and parsed it: `MANIFEST.json` = `{"product":"ohlcvt","schema_version":1,"release":"r1","columns":["timestamp","open","high","low","close","volume","trades"],"has_header":false,"coverage":{"start":"2026-04-01","end":"2026-06-30"},"pairs":1399,"files":9793,"rows":35247327,"generated":"2026-08-17"}`. `ETHUSD_60.csv` = **2,184 rows, 2026-04-01→2026-06-30, ZERO gaps**. **`DOGUSD_60.csv` and `XBTUSD_60.csv` both exist.** Row 0: `1775001600,2103.25,2115.26,2095.55,2112.38,1259.76951889,761` | live |
-
-**This single candidate removes the audit's G3 caveat, and removes the DOGE hole.**
-- Venue continuity: **perfect** — it is the same venue, and (per the page) "the API equivalent" of Kraken's own OHLC.
-- DOGE/USD: `DOGUSD_60.csv` is in the archive. The audit's "DOGE/USD has no mapping and is refused" is a property of the **Binance seeder's ticker map**, not of deep history itself.
-- 1,399 pairs / 35.2 M rows per quarter, 30-minute granularity available.
-
-**Two real gaps, both stated plainly:**
-1. **`vwap` is not in the archive.** `vwap_dev = close/vwap - 1` (`rl/data.py:668-674`) therefore cannot be computed for archive history. This is the one place where the Kraken-archive option is *narrower* than the Binance seeder (which derives `vwap = quote_vol/volume`). Options, all of which need a decision: (a) declare `vwap_dev` archive-unavailable and drop it from `feature_groups` — honest but shrinks the observation; (b) synthesise `vwap ≈ (h+l+c)/3` — **fabrication, I do not recommend it**; (c) accept a column that is real on the live tail and NaN→0 across history, which re-creates exactly the normalisation-contamination failure quantified in §2. **My recommendation is (a).**
-2. **The archive lags.** Coverage ends 30 June 2026; the newest published increment is Q2. The gap between 2026-07-01 and today must come from live REST — which is precisely what `read_ohlc_dataframe`'s existing `fetch → upsert → store.read` leg (`data.py:986-1003`) already does, and it is the *same venue*, so the tail seam is benign. Note the corollary: **the seam is at a fixed calendar date, not at a venue change**, so a rolling window that straddles it sees no venue discontinuity.
-
-### A2. Binance public data archive — **what the seeder uses today; reclassified**
-
-| Field | Value |
+| Question | Answer |
 |---|---|
-| Maintenance | Active. README: *"new `daily` data becoming available the next day and new `monthly` data at the first monday of the month"*; monthly + daily klines for all symbols/intervals |
-| Coverage | Spot from 2017; `1s,1m,3m,5m,15m,30m,1h,2h,4h,6h,8h,12h,1d,3d,1w,1mo` |
-| Auth | **none** — `https://data.binance.vision/data/spot/monthly/klines/<SYM>/1h/<SYM>-1h-YYYY-MM.zip` |
-| Rate limits | none published; per-file `.CHECKSUM` published for `sha256sum -c` |
-| Output shape | 12 columns incl. `open_time` (**milliseconds before 2025-01-01, microseconds from 2025-01-01** — the switch the seeder already handles), base `Volume`, `Quote asset volume`, `Number of trades`, `Taker buy …`. Derives `vwap = quote_vol/volume` |
-| Licence | Repo **MIT**; separate `TERMS_AND_CONDITIONS.md` for the dataset |
-| **Verdict** | **Technically excellent, but the WRONG VENUE for this pipeline.** It is strictly worse than A1 for a Kraken-labelled store: worse venue continuity (§2), no DOGE mapping, and a fee/listing-history asymmetry (Binance spot has no listing fee; Kraken's does) baked into every bar. Retain only as a documented fallback or for a deliberate cross-venue experiment. |
-
-### A3. CryptoDataDownload — keyless, **and has a first-party Kraken section**
-
-- Free CSV/XLSX, **no login, no rate limits, no file-size paywall**; refreshed **daily at 00:00 UTC**; since 2017; daily/hourly/1-min.
-- Has **`/data/kraken/`** alongside Binance, Bitstamp, Gemini, Bitfinex.
-- Licence: commercial **and** academic use permitted; *"We only ask that you don't redistribute raw datasets to third parties."*
-- Paid tiers: Plus+ $39.99/mo, API $79.99/mo, PRO $99.99/mo, QuantDesk $149.99/mo. "Zero-Gap OHLCV" (1-min, Jan 2019→present, with a row-level provenance flag `raw`/`reconciled`/`filled`) is **Plus+**.
-- **Verdict:** a genuine second keyless Kraken-venue source, and **daily-fresh** where Kraken's own archive is quarterly — useful for the 2026-07-01→now lag. But it is an *aggregator*, so its "reconciled across alternate venues" rows are a **contamination risk**: provenance flags exist only on the paid tier. Use the free Kraken-only files and verify a sample against `ETHUSD_60.csv` from A1.
-
-### A4. Tardis.dev — tick-level, **not OHLCV**; the right answer for G2, the wrong shape for G3
-
-- Kraken historical data for **all currency pairs since 2019-06-04**; channels `trade`, `book` (L2, `depth=1000`), `ticker`, `instrument`, and (pre-2026-07-10) `spread`.
-- **Only the first day of each month is downloadable without an API key** (free samples, e.g. `https://datasets.tardis.dev/v1/kraken/trades/2019/07/01/XBT-USD.csv.gz`). Full history requires a key and (beyond a small free allowance) payment — **exact tiers need a live account check; I did not sign up.**
-- 7+ years, GCP europe-west2 (London), >99.9% completeness.
-- **Symbol change:** WS v2 uses `BTC`/`DOGE`; v1 used `XBT`/`XDG`; boundary **2026-07-10** (`XBT/USD` → `BTC/USD`, `XDG/USD` → `DOGE/USD`).
-- **Verdict:** data must be **re-aggregated from trades into OHLCV** to feed this pipeline. That is strictly more work than A1 for G3. **Its real value is G2**: it is the only source found that carries historical Kraken L2 depth, which is exactly the resource the audit says cannot be reconstructed. Rank it as the G3 answer *below* A1, and flag it to the lead as a **G2** lead.
-
-### A5. CoinAPI / Kaiko / Amberdata — paid institutional; **not evaluable without a sales conversation**
-
-None publishes list pricing for OHLCV history at the tier this needs, and none can be assessed from a public page. CoinAPI covers Kraken natively; Kaiko and Amberdata are institutional order-book/trade vendors. I did **not** open accounts or contact sales. **Recommendation: do not pursue.** A1 is keyless, first-party, and already downloaded and parsed successfully in 30 minutes. Paying for what A1 gives away is unjustifiable here.
-
-### A6. Kaggle / Hugging Face — rejected
-
-Community-uploaded snapshots of Binance/Bitstamp OHLCV. Stale by construction (upload-date-bounded), venue-mismatched for a Kraken store, and licence-varied per dataset. **Not a source for anything load-bearing.**
+| Store build cost | **158 s wall-clock, 13 MB, 3 commands, zero code.** `market_data_store` is a pure config flip — **proved**: `read_ohlc_dataframe` returned **76,561 bars in 0.48 s** from a seeded store with no code change. |
+| Kraken OHLCVT vs Binance archive | Kraken publishes a real, keyless, venue-consistent archive. **It is still the wrong source, and the reason is publication lag, not basis.** Binance monthly + Kraken-REST forward accumulation beats it on every axis that matters to this pipeline. |
+| Cross-venue basis | Measured on 2,184 real common hourly bars: **+5.41 bps mean, 6.52 bps std, drifting −0.7 → +13.4 bps across the quarter.** The level offset is harmless (everything is z-scored). The *liquidity* gap is not: **18.6× notional, 126× trade count.** |
+| `since`/`until` push-down | **~15 lines, and worth almost nothing on its own.** `since` is a no-op on the non-store leg — Kraken's own OpenAPI says *"older data cannot be retrieved, regardless of the value of `since`."* With a store it is an efficiency win only. **Do not lead with it.** |
+| CAND-4 | **~40 lines, no new dependency needed** — the retrying client is already shipped in the sibling (`market_data.client.KrakenClient`). Plus a 2-line cursor-advance guard that kills a **measured 5-of-6 wasted API calls**. |
+| CAND-5 | **~50 lines, all inputs already computed and printed.** A count gate cannot distinguish a resolved effect from a noise-ranked one; the harness already holds the numbers that can. |
+| Do 4 and 5 gate the others? | **CAND-5 gates every claimed effect, including CAND-3's.** CAND-4 does **not** gate the G3 push-down — nothing gates the push-down. See §7. |
 
 ---
 
-## 2. Part B — The venue-continuity problem, QUANTIFIED (two independent measurements)
+## 1. Store build cost, precisely (Q1)
 
-I measured this rather than assuming it, using two keyless calls each (Kraken `/0/public/OHLC`, Binance `/api/v3/klines`) plus the A1 archive already on disk. **No rate limits approached; 8 requests total.**
+### 1.1 Measured: it is three commands and under three minutes
 
-### B1. Measurement 1 — recent 30 days, 720 aligned hourly bars (ETH/USD vs ETHUSDT)
-
-| Quantity | Result | Verdict |
-|---|---|---|
-| close price diff | mean **+0.032%**, mean\|d\| 0.033%, p95 0.086%, max 0.113% | **negligible** |
-| hourly log-return σ | Kraken 0.4890% vs Binance 0.4880%, **ratio 1.0020** | **identical** |
-| corr(K[t], B[t]) | **0.999575** (lag ±1: 0.026 / 0.025 — neither venue leads) | **the price path is one path** |
-| cross-venue log-price gap | −0.054% → −0.041%, mean −0.032%, per-hour wobble **0.011%** | a stable ~3bp Kraken discount to Binance |
-| **base volume K/B** | **median 0.1036 → Kraken is 9.6× smaller**; IQR [0.073, 0.152]; per-bar log-ratio σ **0.554** | **9.6× and 55% multiplicative noise** |
-| **trades K/B** | **median 0.0231 → Kraken has 43× fewer prints/bar** (2,264 vs 105,586) | **the tape is a different venue's tape** |
-| avg trade size K/B | 0.4951 vs 0.1146 ETH = **4.32× larger on Kraken** | |
-
-### B2. Measurement 2 — 2026-04-01→06-30, 2,183 aligned hourly bars, Kraken **archive** vs Binance (independent regime, 3× the bars)
-
-| Quantity | Result |
-|---|---|
-| price diff | mean **+0.054%** (o/h/l/c all ≈ +0.05%), mean\|d\| 0.066% |
-| hourly log-return σ | Kraken **0.5835%** vs Binance **0.5836%**, ratio **0.9998**, corr **0.999082** |
-| **base volume K/B** | **median 0.0537 → Kraken is 18.6× smaller** (9.6× in the recent window — **the gap is regime-dependent, not a constant**) |
-| per-bar log-ratio σ | **0.772** |
-| **trades K/B** | **median 0.0079 → Kraken is 126× fewer prints/bar** |
-| avg trade size K/B | 0.6179 vs 0.0887 ETH = **6.96×** |
-
-### B3. What that does to the actual features — the decisive table
-
-I reproduced the pipeline's own feature builders (`features.py:563-570`, `data.py:668-686`) on a 360-Kraken-bar + 360-Binance-bar splice vs a venue-consistent Kraken-only control:
-
-| Feature | Kraken-only (control) | Binance-under-Kraken-label | Damage |
-|---|---|---|---|
-| `obv` terminal value (91d) | −3,857 | **−1,025,359** | **266× — and the sign/level is noise** |
-| `obv` terminal value (30d) | 24,898 | **460,690** | 18.5× |
-| `obv_slope_*` | — | inherits the same scale | **broken** |
-| **`volume_zscore_20` at the seam** | max\|z\| 4.35 | **z = +4.29** | **UNCHANGED — the rolling z-score is scale-invariant** |
-| **`trade_count_zscore_20` at the seam** | max\|z\| 4.32 | **z = +4.36** | **UNCHANGED — same reason** |
-| `volume_change_1` at the seam bar | p99 = 855% | **+4,465%** (30d run: **+1,225%**) | **one bar, 5–31× the 99th percentile** |
-| `volume_per_trade` across seam | — | 0.3916 → 0.2083 ETH | 1.9× step; overall median 0.618 → 0.165 |
-| **fitted `NormalizationStats` on `obv`** | train max\|z\| 2.6 | **eval max\|z\| 64.5** (30d run: 50.7) | **eval observations land 50–65σ outside the training distribution** |
-
-### B4. VENUE-CONTINUITY VERDICT
-
-1. **Price-derived features are SAFE.** ~5bp constant premium, return-σ ratio 0.9998–1.0020, path correlation 0.9991–0.9996. A constant offset is annihilated by any differencing (`rsi`, `macd`, `bb`, `atr`) or scale-free rolling window (`sma`, `ema`). The audit does not flag these and is right not to.
-2. **`volume_zscore_20` and `trade_count_zscore_20` are SAFE — the audit over-warns here.** A 20-bar rolling z-score divides by the window's own σ, so a constant level shift cancels *exactly*. Measured z at the seam (+4.29 / +4.36) sits inside the feature's normal range (max 4.35 / 4.32). I would **not** spend effort here.
-3. **`obv`, `obv_slope_*`, `volume_per_trade` and `volume_change_1` are BROKEN at a venue seam.** `obv` is the serious one, because it is a **cumulative** quantity: its terminal level scales with volume, so a 9.6–18.6× volume gap produces a 20–270× OBV discrepancy, and the **fitted z-scores then put evaluation observations 50–65σ outside anything training contained**.
-4. **The fix is free and total.** A1 (Kraken's own archive) is the *same venue*, so the volume and `trades` columns are directly comparable to the REST tail. With A1, items 1–3 all vanish and the audit's "caveat a researcher must carry" is discharged. Only `vwap_dev` is lost (§1-A1 gap 1).
-
----
-
-## 3. Part C — What "the store is a CLIP, not a push-down" costs, and the fix surface
-
-### 3.1 The cost, stated exactly
-`clip_to_window` (`data_window.py:240-272`) filters a frame that has already been read. So with `market_data_store: null`:
-- `pages` bounds the fetch; `since/until` bound the *result*; the fetch is **unaware of the window**.
-- To pin `[since, until)` you must set `--pages` ≥ ceil(span_bars / 720). For the shipped `matrix.example.yaml` 456-bar window that is 1 page — which is why it *appears* to work, and why it silently caps at ~721 bars. It only breaks the moment the window exceeds the ceiling, which is exactly what `pages_may_undershoot` (`:1387-1397`) is warning about.
-- **The failure is silent in the wrong direction:** too few pages → a *shorter* frame → the window clip keeps all of it → `n_bars` is small → `min_bar_ratio` may or may not catch it. One recorded run already sat *below* `min_bar_ratio: 0.5` against a naive denominator (`:560-567`).
-
-### 3.2 The fix surface — three small changes, all on existing seams
-1. **Push-down when a store is configured** (the cheap, complete fix). `read_ohlc_dataframe` already forwards `since`/`until` to `store.read` (`data.py:1003`). With a seeded store, `pages` should stop governing depth at all — `configs/default.yaml:136-138` already says so: *"`pages` only bounds the live *append*, not the depth served."* **So with A1 seeded, this gap is already closed and the only work is turning the key on.**
-2. **Push-down when the store is null** — compute `pages_needed = ceil((until − since)/3600/720) + 1` from the resolved `DataWindow` and pass it to `_page_candles` instead of the caller's `pages`. This cannot actually help beyond 720 bars (the ceiling is absolute, upstream-confirmed), so it is a **guard**, not a fix: it converts a silent short window into a loud one.
-3. **Make the harness's constant honest.** `:1385` uses `pages * 300 < span_bars_for(...)`. With a measured ceiling of 721 bars/page, `300` is roughly 2.4× too strict and `720` roughly correct. Change to `KRAKEN_REST_BAR_CEILING` (`:226`) — the constant already exists in the file and is not used here.
-
-### 3.3 Failure modes of a real push-down
-| Mode | Mechanism | Mitigation |
-|---|---|---|
-| **Memory** | a 6-year 1h ETH history is 52,560 rows × 8 cols — trivial (~4 MB). Even the *full* archive (35.2 M rows/quarter, 1,399 pairs) is only a problem if loaded wholesale. | Read month-slices lazily (`store.read` already takes `since`/`until`). Real risk is low at 1h. |
-| **API page limits** | `_page_candles` (`data.py:763-771`) has **no try, no retry, no backoff, no sleep** (G5). A long push-down multiplies the chance of hitting a transient failure and losing the whole read. | Any long fetch needs G5's retry/backoff *first*. Do not add push-down without it. |
-| **Partial windows** | a fetch that dies at bar 900 of 1,200 yields a frame that clips to a *shorter* window with no error. | Compare `n_bars` against `span_bars_for` and **raise**, not warn. This is the one silent-nonsense failure the audit names. |
-| **Rate limiting** | push-down multiplies requests by `pages_needed`. At 720 bars/page, 6 years of 1h ETH = 73 requests. Nothing. | Non-issue at 1h; would matter at 1m (26,280 requests/year). |
-| **Feature warm-up** | the recorded 202→178 gap means 24 bars of warm-up. Longer windows amortise this; shorter ones pay it more heavily. | Account for it when choosing L (§4). |
-
-### 3.4 A second, orthogonal push-down is missing and matters for §4
-`TradingEnvironment.reset(options=...)` (`environment.py:216-242`) explicitly discards `options`, so **walk-forward is unreachable** (`tools/model_matrix.py` / `data.py:943-947`, `:966-974`). Without it, *one* trained model can only ever be evaluated on *one* eval slice — and §4 shows that one slice is worth ~2–3 independent observations. **Walk-forward is the prerequisite for the entire power story**, and it is ~10 lines of already-signposted code.
-
----
-
-## 4. Part D — Making power a measurement instead of a literal
-
-### 4.1 The single fact that reframes everything
-**`backtest_model` is deterministic** (`backtest.py:328,534`). Given a trained policy and a pinned window, the replay has *zero* variance. Therefore **every bit of the observed 0.3 / 1.0 / 2.7 pp within-config spread is TRAINING variance** (PPO init + minibatch order), and the market path — because the window is pinned — is perfectly *paired* across all cells.
-
-Two consequences:
-- **Policy Monte-Carlo averaging is useless here.** Running K stochastic rollouts of one policy would *add* noise unless averaged, and averaging buys nothing over a noiseless single rollout. (I checked this specifically; the default `deterministic=True` already gives a noiseless measurement.)
-- **Common random numbers across configs is free.** The `seed` axis already flows to `--seed` on `train` (`tools/model_matrix.py:1119-1121`) and is recorded in every result (`REQUIRED_BACKTEST_FIELDS`, `:136`). Running config A and config B at the *same* seed pairs them. **No new data collection is required to do this.**
-
-### 4.2 The audit's own numbers, turned into a power calculation
-Input (from the brief, quoted in the harness at `:96-101` and `:2205-2208`): BTC frictionless, identical config, 3 seeds → 0.3 / 1.0 / 2.7 pp.
-→ sample mean 1.3333 pp, **sample SD σ = 1.2343 pp**, IQR 0.7 pp.
-
-MDD at α=0.05 two-sided, power 0.80 = (1.960 + 0.842) × SE = **2.8016 × SE**.
-
-**Table 1 — unpaired two-group comparison** (SE = σ√(2/N)):
-
-| N seeds/group | SE (pp) | **MDD (pp)** | verdict for a 0.25–0.8 pp effect |
-|---|---|---|---|
-| **3 (today)** | 1.008 | **2.82** | **UNRESOLVABLE — 3.5–11× too big** |
-| 5 | 0.781 | 2.19 | unresolvable |
-| 10 | 0.552 | 1.55 | unresolvable |
-| 20 | 0.390 | 1.09 | unresolvable |
-| 40 | 0.276 | 0.77 | marginal |
-| 96 | 0.179 | 0.50 | resolves a 0.5 pp effect |
-| 200 | 0.123 | 0.35 | resolves |
-| 383 | 0.090 | 0.25 | resolves a 0.25 pp effect |
-
-**Required N, unpaired: 38 seeds per group for 0.8 pp; 96 for 0.5 pp; 383 for 0.25 pp.** Times every (ticker × config-pair). Not viable.
-
-**Table 2 — paired by seed (common random numbers).** SE = σ_d/√N with σ_d = σ√(2−2ρ):
-
-| ρ (seed effect shared across a pair) | σ_d (pp) | N for 0.5 pp | N for 0.25 pp |
-|---|---|---|---|
-| 0.0 (no benefit) | 1.746 | 96 | 383 |
-| 0.5 | 1.234 | 48 | 192 |
-| 0.7 | 0.956 | 29 | 115 |
-| **0.9** | **0.552** | **10** | **39** |
-
-ρ is **unmeasured** — and it is *measurable from records the harness already has*, because `seed` is in every row. If ρ ≈ 0.5–0.7 (plausible: same init, same minibatch order, same bars, only the config differs), pairing halves the seeds needed. **This is the single cheapest power lever available, and it is a ~30-line addition to `summarize`/`cmd_report` with no new runs.**
-
-### 4.3 The second axis the audit did not consider: eval-window L
-The audit says "power is a function of depth". Measured on the Kraken archive (2,183 real 1h bars, three assets), **it is not**:
+The store root `~/Projects/kraken-market-data/store` does not exist (confirmed: `ls` → *No such
+file or directory*). I built a real one under `/tmp/krb-cand3/store2` and measured it.
 
 ```
-ETHUSD  sd(L):  L=24 → 2.58%   L=72 → 4.17%   L=168 → 6.72%   L=336 → 11.42%   L=720 → 15.41%
-XBTUSD  sd(L):  L=24 → 1.92%   L=72 → 3.34%   L=168 → 5.86%   L=336 → 10.62%   L=720 → 16.32%
-DOGUSD  sd(L):  L=24 → 3.81%   L=72 → 4.82%   L=168 → 8.33%   L=336 → 13.63%   L=720 → 17.23%
-sd(L)/sqrt(L) is CONSTANT  →  sigma(L) = sigma_1 * sqrt(L),  sigma_1 ~ 0.40–0.60 %/sqrt(bar)
+# The sibling store's own dev shell (pandas 3.0.4, pyarrow 24.0.0, market_data 0.1.0)
+cd ~/Projects/kraken-market-data
+nix develop --command bash -c \
+  "PYTHONPATH=$HOME/Projects/kraken-deep-history:$HOME/Projects/kraken-market-data \
+   python $HOME/Projects/kraken-deep-history/cli.py seed \
+     --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store2"
 ```
 
-**So a single window's return noise grows as √L.** Lengthening the eval window makes each cell's measurement *noisier*, not quieter. And the effective-information content of a contiguous history is brutal — lag-1 autocorrelation of overlapping window returns:
+| Ticker | Range | Months requested | Months downloaded | Bars | Wall clock | On disk |
+|---|---|---|---|---|---|---|
+| `ETH/USD` | 2018-01-01 → now | 106 | 104 | 75,840 | **57.9 s** | 4.6 MB |
+| `BTC/USD` | 2018-01-01 → now | 106 | 104 | 75,840 | **~60 s** | 4.4 MB |
+| `SOL/USD` | 2020-09-01 → now | 74 | 72 | 52,565 | **~40 s** | 4.0 MB |
+| **total** | | | **280** | **204,245** | **~158 s** | **13 MB** |
 
-| L | ETH/USD | XBT/USD | DOGE/USD |
+Cost per bar: **60 bytes** (parquet, month-sliced). Cost per month: **~0.56 s**, ~42 KiB. All
+three seeds report `"store_mode": "market-data"` — i.e. real parquet, readable by the bot.
+
+A 12-month ETH/USD seed for comparison: **9.3 s, 956 KB** (that run fell into `fallback-csv`
+because I had not put `kraken-market-data` on `PYTHONPATH` — see §1.3).
+
+### 1.2 `plan` is free and the on-disk shape is stable
+
+```
+python cli.py plan --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store
+# -> 106 monthly URLs, 1.4 s, zero network
+```
+`plan` emits `https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1h/ETHUSDT-1h-YYYY-MM.zip`.
+
+Measured on-disk shape after the seed — **exactly** what `INTEGRATION.md` documents:
+
+```
+/tmp/krb-cand3/store2/
+├── _meta.json                     # {"schema":1,"cursors":{"ETH_USD:60":{"since":1788217200,"updated_iso":"..."}}}
+├── ETH_USD/60/2018-01.parquet      # 104 files for ETH_USD/60, 42.5 KiB avg
+└── ...                            # XBT_USD/60/, SOL_USD/60/
+```
+
+Read back:
+
+```
+MarketDataStore('/tmp/krb-cand3/store2').read('ETH/USD', 60)
+  shape (75840, 8)
+  time int64 | open/high/low/close/vwap/volume float64 | count int64
+  index: DatetimeIndex tz=UTC, name='time'
+```
+
+### 1.3 The one build trap: `store_mode` silently degrades to `fallback-csv`
+
+`kraken-deep-history`'s own `nix develop` has **only pytest** — no pandas, no pyarrow, and
+`market_data` is not importable (verified: `ModuleNotFoundError: No module named 'market_data'`).
+`_open_store` (`seeder.py:409-418`) catches `ImportError` and silently returns
+`FallbackStoreWriter`. The JSON report then says `"store_mode": "fallback-csv"` — and that mode
+writes **`.csv` files**, which `MarketDataStore.read` cannot see (it globs `*.parquet`).
+
+I hit this on my first run without noticing the field. **The report's `store_mode` key is the
+only signal**, and it is easy to miss. Two ways out, both fine:
+- run the seed from `kraken-market-data`'s dev shell with `PYTHONPATH` covering both repos (what
+  I did), or
+- seed in `fallback-csv` and then `kraken-market-data backfill --pair X --interval 60 --csv …`
+  (`store.py:423` `upsert_csv`).
+
+This is a 1-line-of-documentation fix in `kraken-deep-history/README.md`, not a code change.
+
+### 1.4 Is `market_data_store` a config flip? **Yes — proved end to end.**
+
+The bot's dev shell *already* carries the sibling (`flake.nix:62,74` →
+`"sibling deps: kraken-market-data, pyarrow, requests"`). No install work. And the store leg is
+already wired (`data.py:1052-1208` `read_ohlc_dataframe`, `data.py:1211` `_resolve_store`).
+
+Measured, against the store I just seeded, from `~/Projects/kraken-trading-bot`:
+
+```python
+read_ohlc_dataframe('ETH/USD', interval=60, pages=1,
+                    market_data_store='/tmp/krb-cand3/store2')
+# shape (76561, 11) elapsed 0.48 s
+# index 2018-01-01 00:00:00+00:00 -> 2026-10-02 12:00:00+00:00
+# cols  time open high low close vwap volume count
+#       vwap_dev trade_count_zscore_20 volume_per_trade
+```
+
+**76,561 bars — 106× the 721-bar ceiling — from one config value, 0.48 s, zero code changes.**
+(76,561 > 75,840 because the `pages=1` live-append leg upserted the current 721 bars on top of the
+seed: fetch → upsert → read, exactly as documented.)
+
+### 1.5 Read/write contract, measured
+
+| | |
+|---|---|
+| `read(pair, interval, since=None, until=None)` | inclusive `since`, exclusive `until`, on bar-bucket start; globs only the months the window touches (`store.py:168-169`); empty window → empty frame with the same columns, caller decides |
+| `upsert(pair, interval, candles)` | dedupes on bar `time`, **keeps last** (re-poll overwrites the still-forming bar with Kraken's revision) |
+| `set_cursor` / `cursor` | `since`-cursor sidecar per `(PAIR_ID, interval)` in `_meta.json`; this is what makes the forward poller append-only |
+| whole-store read | 75,840 rows × 5 reads = **0.71 s** → 0.142 s/read |
+| windowed read (2 months) | **0.010 s** — 14× faster, because it touches 2 parquet files instead of 104 |
+
+**Answers:** yes, it is a config flip once seeded. **There is no code work on the bot side at
+all.** The whole of CAND-3's store half is: seed once (158 s, 13 MB, `/tmp`-safe), set one YAML
+key. `INTEGRATION.md §5` already lists the *follow-on* code (honour `since`/`until`, train/eval
+split, walk-forward) — see §4 for which of those are worth doing now.
+
+---
+
+## 2. Kraken's OHLCVT archive vs Binance's — the central judgement (Q2)
+
+### 2.1 What Kraken actually publishes
+
+Source: <https://support.kraken.com/hc/en-us/articles/360047124832-Downloadable-historical-OHLCVT-Open-High-Low-Close-Volume-Trades-data>
+("Last updated: September 16, 2026"). Quoted and measured:
+
+| Fact | Value | How verified |
+|---|---|---|
+| Coverage | "each pair from its first trade on Kraken through **30 June 2026**" | page text |
+| Increments | "at the end of each **quarter**", single ZIP, no reassembly | page text |
+| Complete dataset | 5 parts × `2097152000` B = **10,485,760,000 B ≈ 10.5 GB**, all 1,399 pairs | `curl -I` `content-length` on `.part00` |
+| Reassembled ZIP sha256 | `fc81b54cba6e12af3e9422dde9416179e6ef76af4831d48d839fbdb43018eaa4` | page text |
+| Per-part sums | `https://assets.kraken.com/marketing/institutions/OHLCVT_Full_PARTS_SHA256SUMS.txt` | fetched, 515 B, 5 lines |
+| Incremental ZIP | `Kraken_OHLCVT_2026Q2.zip` = **537,866,903 B ≈ 538 MB** | `curl -I` |
+| Throughput (this host) | **~21 MB/s** single-stream (40 MiB range GET × 2) | `curl -r 0-41943039` |
+| ⇒ full-archive time | ~500 s one stream, ~100–170 s across 5 parallel parts | arithmetic |
+| ⇒ incremental time | ~26 s | arithmetic |
+| Rate limits | **None published.** No `x-ratelimit`, no `retry-after` header on `assets.kraken.com`; `cache-control: public,max-age=86424`, `last-modified: 2026-09-14` | `curl -I` |
+| Auth | none | — |
+| Terms | Kraken's general ToS / legal disclosures. Nothing in the article restricts redistribution or automated download; it says "These materials are for general information purposes only." | page text |
+
+I read the real archive rather than the marketing page. `Kraken_OHLCVT_2026Q2.zip` central
+directory (ranged GET of 589,176 B at offset 537,277,705) parses to **9,795 entries**; its
+`MANIFEST.json` (extracted via ranged GET):
+
+```json
+{"product":"ohlcvt","schema_version":1,"release":"r1",
+ "columns":["timestamp","open","high","low","close","volume","trades"],
+ "has_header":false,
+ "coverage":{"start":"2026-04-01","end":"2026-06-30"},
+ "pairs":1399,"files":9793,"rows":35247327,"generated":"2026-08-17"}
+```
+
+Real extracted data (`ETHUSD_60.csv`, 2,184 rows, flat, no directories):
+
+```
+1775001600,2103.25,2115.26,2095.55,2112.38,1259.76951889,761
+1775005200,2113.11,2113.56,2090.14,2091.15,1216.79762041,785
+```
+
+Five hard facts fall out of this that the audit did not record:
+
+1. **No `vwap` column.** `columns` is 7 long; the store contract is 8 (`time, open, high, low,
+   close, vwap, volume, count`, `store.py:63`). Kraken's own REST `OHLC` row schema *does* carry
+   `vwap` (Kraken OpenAPI `tickData`: `[time, open, high, low, close, vwap, volume, count]`). So
+   the bulk archive is **strictly poorer than the REST endpoint on shape**. Consequence measured in
+   §2.4.
+2. **No header row** (`has_header: false`), so a CSV writer that assumes one silently misreads.
+3. **Gaps are not zero-filled** — "Only intervals in which trades occurred are included". At 60 m
+   this is a non-issue for liquid pairs: ETHUSD_60 has exactly 2,184 rows = 91 d × 24, i.e.
+   perfectly dense for Q2. It bites at 1 m/5 m.
+4. **The article's interval list contradicts its own MANIFEST.** The intro says "1, 5, 15, 30,
+   60, 240, 720 and 1440"; the "About the data" section and every actual filename is
+   `1/5/15/60/240/720/1440` — **30 is absent** (see `0GEUR_1.csv … 0GEUR_720.csv`, no `_30`).
+   A reader built from the intro paragraph would request a file that does not exist.
+5. **Naming is Kraken's WS notation**: `{PAIR}_{INTERVAL}.csv`, e.g. `XBTUSD_60.csv` — note
+   **XBT, not BTC**, and it does *not* match the bot's `normalize_ticker_id`. A reader needs the
+   same alias table the bot already has (`data.py:105` `_TICKER_ALIASES`, `XBT↔BTC`).
+
+### 2.2 The killer: publication lag, not basis
+
+| | Binance archive | Kraken OHLCVT |
+|---|---|---|
+| Cadence | **monthly** (only the incomplete current month 404s) | **quarterly**, ~6-week publish lag |
+| Newest data available today (2026-10-02) | 2026-09 | **2026-06-30** (`coverage.end`), `generated: 2026-08-17` |
+| Staleness at the newest bar | ~3–30 days | **~94 days** |
+
+Measured on my own seed: the ETH seed reported
+`months_downloaded: 104, months_requested: 106, skipped: ["2026-09: … 404", "2026-10: … 404"]`.
+
+**A Kraken-archive-only store is three months stale, and Q3-2026 has not been published at all.**
+So a Kraken-native reader does not replace the store poller — it *joins* it, and you would still
+need a Kraken REST forward leg to cover the gap. Which means the cross-venue basis is **not
+eliminated by using Kraken's own archive**: the tail of your training data comes from REST either
+way, and any seam where a Binance-seeded month meets a Kraken-REST week is a cross-venue seam.
+
+**The correct architecture is the one already in the repo:** deep backfill from Binance (cheap,
+monthly, 2018→) **+ forward accumulation from Kraken REST** (the `kraken-market-data` poller,
+which the store's `update()` already implements and which writes the same `_meta.json` cursor).
+Deep past is cross-venue and *doesn't need to be venue-exact*; the tail — the part the policy is
+actually evaluated on, and the part `backtest.py` replays — is Kraken's.
+
+### 2.3 What the cross-venue basis actually costs — measured, 2,184 real bars
+
+Kraken `ETHUSD_60` vs Binance `ETHUSDT-1h`, Q2-2026 (2026-04-01 → 2026-06-30), both extracted
+from the real archives, joined on bar time. **2,184 of 2,184 matched — zero missing on either
+side.**
+
+**Price level** (close, basis = `(binance − kraken)/kraken`):
+
+| statistic | value |
+|---|---|
+| mean | **+5.41 bps** |
+| median | +4.22 bps |
+| std | 6.52 bps |
+| min / max | −9.28 / +21.48 bps |
+| mean \|diff\| | 6.63 bps |
+| \|diff\| > 5 bps | **48.4 %** of bars |
+| \|diff\| > 10 bps | **29.2 %** of bars |
+| \|diff\| > 25 bps | 0.00 % of bars |
+
+**It is not zero-mean noise — it is a slow level drift** (this is USDT appreciating against USD
+over the quarter):
+
+| period | mean daily basis |
+|---|---|
+| 2026-04 | **−0.72 bps** |
+| 2026-05 | **+6.63 bps** |
+| 2026-06 | **+9.97 bps** |
+| 2026-06-30 (last day) | **+13.38 bps** |
+| weekly series | +3.05 → −2.85 → +3.41 → **+14.12** → +6.34 → **+14.03** → +14.85 bps |
+
+**The two books are genuinely different, not just offset:**
+
+| microstructural fact | value |
+|---|---|
+| bars where Binance `high` > Kraken `high` | **81.3 %** |
+| bars where Kraken's H/L range does **not** contain Binance's close | **11.3 %** |
+| notional traded, Binance ÷ Kraken (median) | **18.6×** |
+| trades per bar, Binance ÷ Kraken (median) | **126×** (97,298 vs 792) |
+| OHLC max abs diff | `open` 21.9 bps, `high` 34.0 bps, **`low` 923 bps** (a Kraken flash-move artefact), `close` 21.5 bps |
+
+**But the quantity the policy trades on is nearly identical:**
+
+| statistic | value |
+|---|---|
+| hourly-return correlation | **0.999081** |
+| hourly-return std | Kraken **58.29 bps** vs Binance **58.30 bps** (indistinguishable) |
+| bars disagreeing on the **sign** of the 1 h return | **2.06 %** |
+| bars where return magnitude differs by >50 % | **3.89 %** |
+| 24 h return correlation | **0.999931** |
+| 24 h return mean \|diff\| / p95 / max | **2.4 / 6.3 / 14.5 bps** |
+| 24 h return sign disagreement | **0.37 %** |
+
+### 2.4 The judgement (not hedged)
+
+**Do not build a Kraken OHLCVT reader. Use Binance for the deep backfill and Kraken REST for the
+forward tail — which is what the repo already does.**
+
+The reasoning, in the order that actually decides it:
+
+1. **The level basis costs nothing here.** Every observation column is z-scored
+   (`environment.py:488-496`), so a *constant* multiplicative offset cancels exactly. And the
+   measured +5.4 bps mean is **9 % of the 58 bps hourly-return std** — it does not compete with
+   the signal. Even the drift (−0.7 → +13.4 bps across a quarter, i.e. ~14 bps total) is 0.24× one
+   hourly sigma.
+2. **The liquidity basis costs a lot, and no source fixes it.** The 18.6× notional and 126×
+   trade-count gap means every volume- and count-normalised feature is measuring a different
+   thing on Binance bars than on Kraken bars: the `volume` group's 6 columns, plus
+   `volume_per_trade` and `trade_count_zscore_20` (`data.py:812-873`). But this is **inherent to
+   venue, not to archive choice** — Kraken's own OHLCVT carries Kraken's own (tiny) trade counts
+   because it is a different book. The pipeline would need a venue handle either way; the
+   honest fix is to *label* the venue per store (`_meta.json` is already where that belongs), not
+   to pay 10.5 GB for the privilege of a second data source.
+3. **The 11.3 % out-of-range bars and 2.06 % sign disagreements are the real cost, and they are
+   irreducible.** No archive makes two venues the same venue. A Kraken reader would remove the
+   basis from the *deep past* while the *tail* — where the policy is scored — stayed cross-venue
+   against the REST poller anyway (§2.2).
+4. **Kraken's archive is strictly poorer on shape.** **No `vwap` column** (`MANIFEST.columns` is 7
+   long vs the store's 8). Consequence, measured on the next line of code:
+   `add_derived_ohlcv_features` (`data.py:846`) gates on `"close" in df.columns and "vwap" in
+   df.columns` — a frame without `vwap` **silently loses `vwap_dev`**, one of the 52 bare
+   observation columns, and the docstring is explicit that "Nothing here raises or warns when the
+   inputs are absent — silently narrower is the honest answer." So a Kraken-OHLCVT store buys you
+   years of bars at the cost of a **silently narrower observation**, which is precisely the failure
+   mode AUDIT §4.5 already flags ("The observation width is a function of runtime file contents,
+   not config"). Adding 7 years to a 51-column observation to lose a column in exchange is a bad
+   trade.
+5. **Cost.** Kraken reader: ~10.5 GB (or 538 MB/quarter) + a new ZIP central-directory reader +
+   `XBT`/alias translation + headerless-CSV handling + a sparse-gap policy + quarterly
+   re-download orchestration. Binance route: **already implemented, tested, and 158 s.**
+6. **Cadence.** Binance monthly vs Kraken quarterly-with-6-week-lag (§2.2).
+
+**One thing the cross-venue route genuinely does not give you, and it should be written down
+rather than argued away:** `Kraken_OHLCVT_Full_2026Q2.zip` is the only venue-exact route to
+*pre-2018-free* history for 1,399 pairs including pairs Binance never listed. If the roadmap ever
+needs a pair outside `TICKER_SYMBOL_MAP`, Kraken's archive is the fallback — and a ranged GET of
+the central directory makes a targeted `ETHUSD_60.csv` extraction 54 KB, not 538 MB. I verified
+that trick works. It is a footnote, not a plan.
+
+**Recommended accompanying change (cheap, and it discharges the audit's caveat properly):** write
+the venue into the store's `_meta.json` alongside the cursor, and surface it in `read_ohlc_dataframe`'s
+log line. Six lines. It converts an unstated data context into a stated one, which is what
+`kraken-deep-history/INTEGRATION.md §6` already promises and does not deliver.
+
+---
+
+## 3. The `since`/`until` push-down (Q3)
+
+### 3.1 `since` is a no-op on the non-store leg — this is the headline
+
+Kraken's own OpenAPI description for `GET /0/public/OHLC`, verbatim:
+
+> "Returns up to 720 of the most recent entries (**older data cannot be retrieved, regardless of
+> the value of `since`**)."
+>
+> `since`: "Return OHLC entries since the given timestamp (**intended for incremental updates**)"
+
+Measured live against the real endpoint, four different `since` values:
+
+| `since` | rows | `last` | range returned |
 |---|---|---|---|
-| 168 (7d) | **+0.993 → 7.2 effective draws** (of 2,016 overlapping) | +0.994 → 6.0 | +0.981 → 19.8 |
-| 336 (14d) | +0.995 → **4.3** | +0.996 → 3.2 | +0.989 → 9.8 |
-| 720 (30d) | +0.997 → **2.2** | +0.998 → 1.8 | +0.994 → 4.2 |
+| `None` | 721 | 1790938800 | 2026-09-02 12:00 → 2026-10-02 12:00 |
+| now − 30 d | 720 | 1790938800 | 2026-09-02 13:00 → 2026-10-02 12:00 |
+| now − 2 y | **721** | 1790938800 | **2026-09-02 12:00** → 2026-10-02 12:00 |
+| 2018-01-01 | **721** | 1790938800 | **2026-09-02 12:00** → 2026-10-02 12:00 |
 
-**The shipped `matrix.example.yaml` window (456 bars ≈ 19 days) is worth roughly 3 independent observations — the same as the 3 seeds it already runs.** That is the whole problem, stated in one line.
+Identical `last`, identical range. `since` is an **incremental-update cursor, not a history seek**.
+721 is a **hard REST ceiling** and I am stating that plainly because it changes what the store is
+*for*: **the store is not an optimisation of the REST read, it is the only way to reach bars older
+than 30 days, full stop.** Any design that treats `pages` or `since` as a depth lever is wrong.
 
-**Table 4 — history required for a 0.5 pp MDD on the RAW return** (SE = σ₁·L/√H, n = H/L disjoint windows):
+### 3.2 `pages` is worse than inert — it is a replay loop (new finding)
 
-| L (bars) | L (days) | history H needed |
+`_page_candles` (`data.py:946-956`) breaks on `last == 0` or an empty batch. Kraken never returns
+`last == 0` on a live pair; it returns the *forming* bar's timestamp, which is non-zero. So the
+break never fires and `cursor = last` never advances past page 1. Measured:
+
+```
+pages=1 ->   721 raw candles (721 unique), 1 API call, 0.2s
+pages=2 ->   723 raw candles (721 unique), 2 API calls, 0.1s
+pages=3 ->   725 raw candles (721 unique), 3 API calls, 0.1s
+pages=6 ->   731 raw candles (721 unique), 6 API calls, 0.3s
+```
+
+Instrumented call-by-call for `pages=6`:
+
+```
+call 1 (since=None):              721 rows, last=1790942400, NEW bar times=721
+call 2 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
+call 3 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
+call 4 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
+call 5 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
+call 6 (since=1790942400):          2 rows, last=1790942400, NEW bar times=0
+TOTAL: 6 API calls, 721 new bar times, 10 duplicate rows discarded by data.py:1031
+```
+
+**Calls 2–6 are byte-identical requests.** The default `pages=6` (`data.py:962`, `data.py:1056`)
+buys 5 wasted API calls and 0 extra bars per read, on every `train`, `backtest` and `paper-trade`
+tick. A `if last == cursor: break` guard is the whole fix (and belongs in CAND-4 — see §6.2).
+
+### 3.3 Sizing the push-down
+
+| | |
+|---|---|
+| Change | `train.py:215-226` and `backtest.py:400-419` gain `since=`/`until=` from `resolve_data_window(cfg)`, converted to epoch seconds |
+| Plumbing that already exists | `read_ohlc_dataframe(since=, until=)` (`data.py:1057-1058`) → `store.read` (`data.py:1191`). `resolve_data_window` already parses ISO-8601 bounds into `pd.Timestamp` (`data_window.py:100+`). Nothing in the seam needs touching. |
+| Sibling to copy | `paper_trade.py` and `backtest.py` already read `market_data_store` from run config (`backtest.py:414-419`) — same pattern, same line |
+| Non-store leg | **Still `fetch_ohlc_dataframe` and still 721 bars.** `fetch_ohlc_dataframe` accepts `since` and forwards it to `_page_candles` (`data.py:964,1021`) — where §3.1 proves it does nothing. So the push-down must be documented as store-only, or it will read as a fix that isn't one. |
+| Diff size | **~15 lines** across two files |
+| Risk if done without a store | **None** (verified inert) but also **no benefit**, and it invites the reader to believe `since` works on REST. |
+
+### 3.4 Is it correctness or efficiency? **Efficiency — measured.**
+
+With a seeded store, `data_window.clip_to_window` (the post-hoc clip both callers use today)
+produces **the same bars as the pushed-down read**:
+
+```
+post-hoc clip   : 2158 bars 2021-01-01 00:00 -> 2021-03-31 23:00
+pushed-down read: 2158 bars 2021-01-01 00:00 -> 2021-03-31 23:00
+IDENTICAL bar times: True
+```
+
+One real difference, found by comparing NaN counts rather than values:
+
+```
+NaN counts, post-hoc clip : vwap 1, vwap_dev 1, trade_count_zscore_20 0,  volume_per_trade 1
+NaN counts, pushed-down    : vwap 1, vwap_dev 1, trade_count_zscore_20 19, volume_per_trade 1
+max abs diff where both defined: 1.46e-13
+```
+
+Pushing `since` in means `trade_count_zscore_20`'s 20-bar rolling window has **19 bars of warm-up
+inside the returned frame instead of reaching back across the window boundary**, so those 19 bars
+become NaN → `ffill().fillna(0.0)` → a 0.0 z-score instead of a real one. Beyond bar 20 the two
+agree to 1.5e-13. So the push-down is a small *regression* at the leading edge, in exchange for:
+
+| | whole store | pinned window |
 |---|---|---|
-| **24** | 1.0 | 35,473 bars ≈ **4.0 years** |
-| **48** | 2.0 | 141,891 bars ≈ **16.2 years** |
-| 168 | 7.0 | 1,738,160 bars ≈ 198 years |
-| 336 | 14.0 | 6,952,641 bars ≈ 794 years |
-| 720 | 30.0 | 31,925,392 bars ≈ 3,644 years |
+| `read_ohlc_dataframe` | 0.42 s (76,561 bars) | **0.187 s** |
+| `FeaturePipeline.compute` | 0.12 s | **0.04 s** |
 
-> **Caveat, stated honestly:** that table is for the **raw** return. `excess_return` subtracts buy-and-hold on the *same bars*, which cancels market direction — which is exactly why the harness's `HEADLINE = "excess_return"` (`:218`) is the right choice, and it is now quantified: the raw-return MDD on a 178-bar window is **18.7 pp**, i.e. the market direction would swamp everything. The honest H requirement therefore uses the **measured excess-return window spread, which does not exist yet** — that is precisely the number the harness must start reporting.
+**Verdict: worth ~15 lines, but only as a documented store-only efficiency change, and only
+after the store is seeded. It is not a prerequisite for anything else and should not be led
+with.** If a `since`-aware walk-forward (CAND-7) ever needs per-episode bounded reads, the same
+15 lines become the enabling seam — so the cheap thing is to land them *with* CAND-3's store, not
+as a separate claim.
 
-### 4.4 Table 3 — combining seeds and windows
-SE = √(σ_train² + σ_win²/K)/√N. σ_win (the SD of excess return across disjoint windows) is **unmeasured**; parameterised as a multiple of σ_train:
+**One genuine correctness win that *does* need the push-down, and is worth naming:** with a store,
+`read_ohlc_dataframe` currently reads the **whole store** and then clips. The audit's claim that
+"`data_window` is only a post-hoc mask on a trailing fetch" is *true of the non-store leg* and
+**mildly overstated for the store leg** — with the store there is no clipping-to-empty failure
+mode, only wasted work. The real `NotEnoughDataError` risk (`data.py:1297-1298`) is confined to
+runs **without** `market_data_store`.
 
-| σ_win/σ_train | N seeds | K windows | SE (pp) | MDD (pp) |
+---
+
+## 4. CAND-4 — retry / backoff / partial salvage (Q4)
+
+### 4.1 The gap, restated exactly
+
+`data.py:946-956`:
+
+```python
+collected: list[Any] = []
+cursor: int | None = since
+for _ in range(pages):
+    batch, last = manager.ohlc(pair, interval=interval, since=cursor)   # no try
+    if batch: collected.extend(batch)
+    if last == 0 or not batch: break
+    cursor = last
+return collected
+```
+
+No `try`, no retry, no backoff, no sleep, no salvage. Pages 0..k−1 are discarded and the exception
+propagates through `fetch_ohlc_dataframe` → `read_ohlc_dataframe` → `train_ticker` →
+`cmd_train`'s blanket handler (`cli.py:511-516`), which prints `Error training …` and returns 1.
+
+### 4.2 What already exists — this is the whole answer to "which library"
+
+The repo's dependency set is `kraken-python, pandas, numpy, gymnasium, pyyaml` plus sibling
+`kraken-market-data, pyarrow, requests` (`flake.nix:62,74`). **No `tenacity`. No
+`HTTPAdapter`/`urllib3.Retry` mounting.** But:
+
+| layer | retry? | backoff? | throttle? | where |
 |---|---|---|---|---|
-| 1.0 | 3 | 1 *(today)* | 1.008 | **2.82** |
-| 1.0 | 3 | 24 | 0.727 | 2.04 |
-| 1.0 | 10 | 12 | 0.406 | 1.14 |
-| **0.5** | 10 | 12 | 0.394 | 1.10 |
-| **0.5** | 3 | 24 | 0.716 | 2.01 |
+| `kraken_api/transport.py:_request` | **no** — `raise_for_status()` then bare `raise` | no | `_throttle()` (`min_interval`, **default `0.0`**) | `transport.py:179-217` |
+| `kraken_api` error classification | yes — `RateLimitError` on `_RATE_LIMIT_MARKERS = ("EAPI:Rate limit exceeded", "EGeneral:Too many requests")` | — | — | `transport.py:45-48, 249-250` |
+| **`market_data.client.KrakenClient._public`** | **YES** | **YES** — `backoff_seconds(attempt, base=retry_backoff)` | **YES** — `RateLimiter(min_interval)` | `client.py:114-147`, `utils.py:180-211` |
+| `data._page_candles` | no | no | no | `data.py:946-956` |
 
-Note the shape: **adding windows helps far less than adding seeds** (K=1→24 buys 28%; N=3→10 buys 60%) — because σ_win enters *inside* a root-sum-of-squares with σ_train. So if σ_win is small, **seeds and pairing are the right lever; windows only pay once σ_win is comparable to σ_train.** Which is the first thing the harness should *measure*: σ_win. It currently measures neither.
+**The retrying client is already written, already tested, already a dependency of the bot, and
+already implements the exact duck type `_page_candles` consumes** (`ohlc(pair, interval, since) ->
+(candles, last)`). Its knobs are env-overridable (`KRAKEN_RETRY_BACKOFF`) and it defaults to
+`retry_backoff=0.5`, `timeout=20.0`.
 
-### 4.5 The concrete harness slice — quantities computable from data ALREADY collected
-`REQUIRED_BACKTEST_FIELDS` (`tools/model_matrix.py:124-143`) already carries everything except `fee_rate`-adjacent context. From existing result JSONs the harness can compute, per (ticker, config-axis-level) pair:
+So the options, cheapest first:
 
-| # | Quantity | From what exists today | Formula | Decides |
+1. **Swap the source — 1 line per call site.** `read_ohlc_dataframe` already has
+   `market_data_source` (`data.py:1066, 1165`) documented as "Anything exposing
+   `ohlc(pair, interval, since) -> (candles, last)` works (a live `KrakenManager`, **the store's
+   own thin client**, or a fake in tests)." Passing `market_data_source=market_data.client.KrakenClient.from_env()`
+   buys retry+backoff+throttle for free. **This is the recommendation** — it is house-style
+   (duck-typed seam already declared), needs no new dependency, and is testable with the existing
+   fake-source pattern in `tests/test_rl_data_store.py`.
+2. **`HTTPAdapter(max_retries=urllib3.Retry(...))` on the session** — `requests` and `urllib3` are
+   both already present transitively. Fine, but it puts the policy inside a third-party object where
+   the repo's structured-logging convention (`log_event`) cannot see it, and it cannot do
+   **partial salvage** (which is the more valuable half).
+3. **`tenacity`** — a new dependency. The retry logic here is ~15 lines; adding a dependency for
+   it is not worth it, and it would be the only one in the repo.
+
+### 4.3 Rate limits: published, and they did not reproduce — reported honestly
+
+Kraken's published spot REST limits (`docs.kraken.com/api/docs/guides/spot-rest-ratelimits`):
+Starter **max counter 15, decay −0.33/sec** (≈ one call per 3 s sustainable); Intermediate 20 /
+−0.5/s; Pro 20 / −1/s. Error strings: `"EAPI:Rate limit exceeded"` and
+`"EService: Throttled: [UNIX timestamp]"` — the latter **carries a retry-after timestamp**.
+"If the rate limits are reached, additional calls will be restricted for a few seconds (or
+possibly longer if calls continue to be made while the rate limits are active)."
+
+**Measured: a burst of 16 rapid keyless `/public/OHLC` calls from this host returned 16/16 OK, and
+8 calls at 2.5/s returned 8/8 OK.** No throttle. The counter is documented as per-API-key
+("Each API key's counter is separate"), and the RL read path is keyless. So:
+
+- **Refinement of the audit's implicit framing:** rate limiting is **not** the observed exposure on
+  the keyless public path. Transient network failure and 5xx are. CAND-4 should be scoped as
+  *resilience*, not *rate-limit compliance*.
+- **The retry parser should still handle `EService: Throttled: [UNIX timestamp]`** (honour the
+  timestamp) and `EAPI:Rate limit exceeded` (back off). Both are cheap and both are the documented
+  behaviour if a key or a higher tier is ever introduced.
+- **The 5-wasted-calls finding (§3.2) is the concrete rate-limit win** available today: it takes
+  the default read from 6 calls to 1 with no behaviour change.
+
+### 4.4 Proposed shape (~40 lines, no new dependency)
+
+`_page_candles` gains three things, all inside the one function:
+
+```python
+_RETRYABLE = (KrakenError, requests.RequestException, OSError, TimeoutError)
+_CAND4_MAX_ATTEMPTS, _CAND4_BACKOFF = 4, 0.5        # base seconds; cap 8.0
+
+for page in range(pages):
+    for attempt in range(_CAND4_MAX_ATTEMPTS):
+        try:
+            batch, last = manager.ohlc(pair, interval=interval, since=cursor)
+            break
+        except _RETRYABLE as exc:
+            if attempt == _CAND4_MAX_ATTEMPTS - 1 or not collected:
+                raise                       # nothing to salvage -> fail loud
+            delay = backoff_seconds(attempt, base=_CAND4_BACKOFF, cap=8.0)
+            if isinstance(exc, RateLimitError):   # honour "EService: Throttled: <ts>"
+                delay = max(delay, _retry_after(exc) - time.time())
+            _LOGGER.warning("ohlc page %d attempt %d/%d failed (%s); retrying in %.1fs",
+                            page, attempt + 1, _CAND4_MAX_ATTEMPTS, exc, delay)
+            time.sleep(delay)
+    if last == 0 or not batch or last == cursor:   # <-- the cursor-advance guard
+        break
+    cursor = last
+```
+
+Five behaviours, and the reasons each earns its lines:
+
+1. **Retry with capped exponential backoff** — `backoff_seconds` is already in the sibling
+   (`utils.py:205`), so the house primitive is reused rather than reinvented.
+2. **Fail loud on page 0, salvage after.** A failure on page 0 has nothing to salvage. A failure on
+   page *k* with pages 0..k−1 already collected should **return what it has and WARN** — this is
+   precisely `engine.py:57-74`'s pattern, and it is why the audit's contrast is the right standard.
+   Note that because of §3.2 the salvage is almost always sufficient: pages 2+ are byte-identical
+   replays of page 1, so **any single successful call already yields the full 721 bars.**
+3. **Parse `EService: Throttled: [UNIX timestamp]`** and honour it — the only documented
+   retry-after signal Kraken emits.
+4. **`if last == cursor: break`** — kills the replay loop, 1 line, and turns `pages=6` into 1 call.
+5. **Gap detection on the way out.** `fetch_ohlc_dataframe` de-dupes by timestamp
+   (`data.py:1031`) but never checks for **missing bars**. A one-line
+   `(df.index.to_series().diff() > interval).sum()` log line — not an error, a measurement —
+   would make the salvage path honest: "I gave you 480 of 721 bars and here is the hole."
+
+Lines-to-value: **~40 lines, zero new dependencies, zero data cost, and it removes both the
+abort-on-transient failure and the 5× API amplification.** This is the best value-per-line item in
+the whole audit.
+
+### 4.5 Contrast with `engine.py:57-74`
+
+`engine.py` is the correct model and should be quoted as such: three independent `try/except
+Exception` blocks, each degrading to `_LOGGER.warning` and a *partial* dict
+(`data["candles"] = candles[-100:] if candles else []`, `engine.py:66`). Three differences worth
+copying deliberately:
+
+- `except Exception` is broader than my `_RETRYABLE` — right for `engine.py`, because a *strategy*
+  must never die on a market-data hiccup. For `_page_candles` a narrower tuple is better, because
+  a `ValueError` from `manager.ohlc` (bad interval, bad pair — `manager.py:172-175`) is a
+  programming error that retrying cannot fix.
+- `engine.py` degrades each key independently; `_page_candles` must degrade *as a whole*, because
+  a partial candle list that silently loses its tail is worse than a loud failure — unless it is
+  logged with the bar count, which is why item 5 above is in scope.
+
+---
+
+## 5. CAND-5 — the matrix gates on replicate *count*, never on observed *dispersion* (Q5)
+
+### 5.1 The gap, restated exactly
+
+| Fact | Where |
+|---|---|
+| `MIN_REPLICATES_FOR_A_CLAIM = 3`, used **only** as a count | `model_matrix.py:243`; seeds `:1276-1283`; groups `:1339-1347`; claims `:2259-2280` |
+| The dispersion machinery is **already computed** and printed, never compared | `summarize()` → `q1`/`q3`/`min`/`max` (`:328-339`); `quartile()` (`:310-325`); `fmt_iqr()` (`:363-365`); rendered `:1952`, `:2094` |
+| `is_valid()` checks only process failure, required fields, `n_bars` vs a denominator, `num_trades`, NaN metrics | `is_valid` `:963-978` → `assess_cell` `:786-878` |
+| The docstring's own framing ("separated from noise") is never operationalised | `:241-242`, `:1281-1282` |
+| Motivating measurement in-repo: two fetches of the same pair "disagree by 16% on the fitted std of `rsi_24`" | `data_window.py:5-8` |
+
+The prose in `_build_claims` (`:2208-2340`) is genuinely good and already says the right thing in
+words — *"a median cannot be separated from seed noise"*, *"PPO on one config has been measured
+replaying 576 trades and 374"*, and the whole `n=1 → anecdote` branch. **It never checks.** The
+report tabulates `median [q1, q3]` per group and lets a reader eyeball it. Nothing computes
+whether two arms separate.
+
+### 5.2 What a count gate cannot see — demonstrated with the harness's own functions
+
+Run against `model_matrix.summarize` / `fmt_iqr` / `MIN_REPLICATES_FOR_A_CLAIM` as they stand:
+
+| # | arms | median | IQR `[q1, q3]` | n | count gate | pooled IQR | gap | dispersion gate |
+|---|---|---|---|---|---|---|---|---|
+| 1 | control / treatment | +2.00% / +6.00% | `[+2.00,+2.05]` / `[+5.95,+6.05]` | 3 / 3 | **ok** | 0.075 pp | 4.00 pp = **53×** | **RESOLVED** |
+| 2 | control / treatment | +30.00% / +33.00% | `[+16.00,+35.00]` / `[+18.00,+37.50]` | 3 / 3 | **ok** | **19.25 pp** | 3.00 pp = **0.16×** | **NOISE** |
+| 3 | control / treatment | +2.00% / +4.00% | `[+1.60,+3.75]` / `[+3.50,+5.75]` | 3 / 3 | **ok** | 2.20 pp | 2.00 pp = **0.91×** | **NOISE** |
+| 4 | A(576 trades) / B(374 trades) | +2.00% / −3.00% | `[+2.00,+2.00]` / `[−3.00,−3.00]` | 1 / 1 | FAILS | **0.00 pp** | 5.00 pp = **∞** | **UNDEFINED** |
+
+Case 2 is the whole argument: a **3 pp difference with a 19 pp within-group spread** sails through
+`len(seeds) >= 3` and is tabulated as `+30.00% [+16.00%, +35.00%]` vs `+33.00% [+18.00%,
++37.50%]` — two intervals that overlap over almost their entire length. Case 3 is the realistic
+middle: a 2 pp effect against 2.2 pp of seed spread, which the count gate reports and a reader
+should not believe.
+
+**Case 4 is a design constraint I hit while building this, and it must be respected by the fix:**
+when every arm has `n == 1`, `q3 − q1 == 0`, so a pooled-IQR gate is **degenerate** and would
+report `5.00 pp = ∞ → RESOLVED`, i.e. it would happily bless the exact anecdote the surrounding
+prose is trying to kill. **The dispersion gate must sit *behind* the count gate, not beside it**,
+and must additionally require `n ≥ MIN_REPLICATES_FOR_A_CLAIM` **and** `pooled_iqr > 0` on both
+arms before it emits anything.
+
+### 5.3 Sizing the fix (~50 lines, zero new data, zero new deps)
+
+**Estimator.** Pooled within-group spread = **median of the per-group IQRs** (`q3 − q1`). Chosen
+over `max` or `mean`: `max` lets one wild group condemn every comparison (I hit this — my first
+draft used `max` and case 1 collapsed from 53× to 0.21×), `mean` is not robust to the same group.
+`median` of the IQRs is the same order-statistic the harness already uses in `median()`
+(`model_matrix.py:296-308`), so it is house-consistent and needs no new concept. It also degrades
+gracefully at n=3, where a group's own IQR is a 50th-percentile-of-2 estimate — which is exactly
+why the gate reports a **ratio**, not a boolean, and why `n=3` is already labelled "ordering
+hints, not evidence" in the prose.
+
+**Four edits, all inside existing functions:**
+
+| # | Site | Change | ~lines |
+|---|---|---|---|
+| 1 | new `pooled_within_spread(summaries)` next to `summarize()` (`:328`) | median of `q3 − q1` over groups with `n ≥ MIN_REPLICATES_FOR_A_CLAIM`; `None` if fewer than 2 such groups or if the result is `0` | 15 |
+| 2 | `_group_summaries()` (`:1345`) row dict | add `"separation"`: the same ratio per group pair is computed in `_build_claims`, so here just carry `summary` through (already does) | 0 |
+| 3 | `_build_claims()` (`:2208`) | for each adjacent pair of arms in the headline cohort, emit one line: `gap = \|median_A − median_B\|`, `ratio = gap / pooled`, verdict `RESOLVED (≥1×) / NOT SEPARATED (<1×) / UNDEFINED (n<3 or zero spread)`. Replaces the `thin`/else branch at `:2259-2280` rather than adding to it | 25 |
+| 4 | `_print_group_table()` (`:1930`) header | print the pooled IQR once under the table, so a reader sees the yardstick the verdicts used | 10 |
+
+**Why this is ~50 lines and not a rewrite:** `q1`/`q3`/`median`/`n` are already in every row
+(`_group_summaries` `:1345` → `"summary": summarize(values)`), already survive into the JSON
+report (`:2079-2082` `"per_ticker"/"per_config"/"per_axis"`), and are already printed
+(`fmt_iqr` `:363`). **The measurement exists. Only the comparison is missing.** There is no new
+data collection, no new run, no schema change — the gate can be validated against any existing
+results JSONL the moment it lands.
+
+**Why the ratio is the right output, not a pass/fail.** A boolean needs a threshold, and the
+threshold is a judgement call. A ratio is a fact: *"this 2 pp gap is 0.9× the within-group spread
+you measured."* The prose can then say what to do with it, which is the harness's established
+voice. The report should still be able to fail a run — `cmd_report` already returns non-zero on
+no-valid-cells, so a `separated: false` can raise a `warn(...)` in `cmd_plan`'s
+`thin_replication` neighbourhood (`:1339`) with zero new plumbing.
+
+**One honest limitation to state in the docstring.** With n=3, a group IQR is a percentile of two
+values; the pooled estimate inherits that. The gate is therefore a **necessary, not sufficient**,
+condition — it catches "the seeds you have do not resolve this effect", which is exactly the
+wording in my brief. It does not manufacture power. Its value is that it stops a matrix report from
+presenting case 2 as a finding, and the cheapest way to get more power remains what the harness
+already says: 5+ seeds.
+
+---
+
+## 6. Do CAND-4 and CAND-5 gate the others? (Q6)
+
+### 6.1 CAND-5 is a **precondition** for gating any other change on a claimed effect — including CAND-3's
+
+Stated plainly, because this is the load-bearing conclusion of my brief:
+
+- **Nothing can be validated by this repo's own harness until CAND-5 lands.** `tools/model_matrix.py`
+  is the only instrument in the project that turns a config change into a number, and today it
+  reports a 3 pp difference across a 19 pp spread (case 2) identically to a 53× resolved one
+  (case 1). Any claim of the form "change X improves the model" is therefore unmeasurable until
+  the dispersion gate exists.
+- **This includes CAND-3.** The moment a store is seeded, the first question is "does 8 years of
+  bars beat 721 bars?" — which is a headline-metric comparison between two arms. Without CAND-5
+  that comparison's verdict is a coin flip dressed as a measurement. **Seed the store and evaluate
+  it without CAND-5, and you will produce a number you cannot defend.**
+- **It also gates CAND-1, CAND-2, CAND-4, CAND-6, CAND-7** by the same argument. CAND-1's
+  `microstructure` group is one column; CAND-2's signal channels are 8 columns; both are
+  effect-size questions.
+- **But CAND-5 does not gate the *build*.** It gates the *claim*. The store, the retry guard, the
+  signal backfill are all worth building blind, because their value does not depend on the harness
+  measuring them correctly — they are unambiguous. What CAND-5 gates is the decision to **ship
+  or revert based on a reported effect**.
+- **Ordering that follows:** land CAND-5 first or in the same change as anything whose acceptance
+  criterion is a matrix number. It is 50 lines and no data. It is the cheapest gate in the repo.
+
+### 6.2 CAND-4 is **not** a precondition for the G3 push-down — but it lands *with* the store change, for a different reason
+
+- **Not a correctness gate.** §3.4 proved the pushed-down read and the post-hoc clip produce
+  identical bar times, with values agreeing to 1.5e-13 beyond the 19-bar warm-up edge. Retrying
+  does not change which bars you get.
+- **Not a sequencing gate.** Nothing in CAND-3 fails without it, and nothing in CAND-3 is fixed by
+  it.
+- **But they should land together**, for a reason that is specific and cheap: the store change is
+  the moment the pipeline starts reading years of bars, and `_page_candles` is invoked on the
+  store leg too (`data.py:1174`). At that point the 5-wasted-calls-per-read replay loop (§3.2)
+  goes from "annoying" to "6 API calls per tick, per pair, forever", and the salvage path stops
+  being hypothetical because a read failure now means "the tail of my training window is missing".
+  Landing the cursor-advance guard (`if last == cursor: break`) **with** the store flip costs
+  1 line and removes 5/6 of the API load the store introduces.
+- **So: CAND-4 is a precondition for the store change being safe to operate, not for it being
+  correct.** If the store work slips, CAND-4 can land alone and still pay for itself (it removes
+  5 wasted API calls from every existing read *today*).
+
+### 6.3 Recommended landing order
+
+| order | item | ~lines | data cost | why here |
 |---|---|---|---|---|
-| 1 | **σ_within (seed SD)** | `summarize` already groups by (ticker, config) | `sd(excess_return)` over seeds | the σ in every formula above |
-| 2 | **ρ (pairing gain)** | `seed` is in every record | Pearson r of seed s across the two config levels | whether CRN is worth it; halves N if ρ≥0.5 |
-| 3 | **Paired Δ per seed** | same | `r_{A,s} − r_{B,s}` for each shared s | **Wilcoxon signed-rank** over N pairs |
-| 4 | **MDD (power-aware verdict)** | σ_within, N | `2.8016 · σ_within/√N` unpaired; `2.8016 · σ_d/√N` paired | **replaces `MIN_REPLICATES_FOR_A_CLAIM`** |
-| 5 | **Cliff's δ** | all replicates | `(#A>B − #A<B)/(n_A·n_B)` | nonparametric effect size, valid at N=3 where a p-value is meaningless |
-| 6 | **Bootstrap CI on Δmedian** | all replicates | 10k resamples, percentile CI | the direct answer to "do the IQRs overlap" |
-| 7 | **Permutation p** | all replicates | all (n_A+n_B choose n_A) label shuffles | exact at small N, no normality assumption |
-| 8 | **σ_win (across windows)** | needs walk-forward (§3.4) | sd of per-window `excess_return` for one frozen policy | decides whether more windows beat more seeds |
-| 9 | **required N / required H** | (1),(8) | invert Table 1 / Table 4 | turns "add more seeds" into a number |
-| 10 | **overlap flag on the table** | q1/q3 already printed | `q3_lo > q1_hi` for every pair of rows | the missing overlap check the audit names |
+| 1 | **CAND-5** dispersion gate | ~50 | none | gates every claimed effect, incl. #3's own acceptance |
+| 2 | **CAND-4** cursor guard + retry/salvage | ~40 | none | removes 5 wasted calls *today*; makes #3 safe to run |
+| 3 | **CAND-3a** seed the store + flip `market_data_store` | **0** | 158 s, 13 MB, `/tmp` | pure config; 721 → 76,561 bars proved |
+| 4 | **CAND-3b** `since`/`until` push-down + venue label in `_meta.json` | ~21 | none | store-only efficiency; documented as such |
+| 5 | *(deferred)* Kraken OHLCVT reader | ~300 | 10.5 GB | **not recommended** — §2.4 |
 
-**The honest negative-result report shape**, which the harness should emit when nothing is resolvable:
-> *"Config A and config B differ by 0.31 pp in median `excess_return`. The minimum difference this design can resolve at α=0.05/power 0.80 with N=3 seeds is 2.82 pp (σ_within = 1.23 pp). The observed difference is **9× below the detection floor**: this result is consistent with no effect, with a 0.3 pp effect, and with a 2.7 pp effect. **Required to resolve: 96 seeds/group, or 10 seeds/group paired by seed if ρ≥0.9.**"*
-That is a **complete, defensible finding** — and it is available today from results that already exist.
-
-### 4.6 What the harness can and cannot conclude TODAY (3 seeds, ~178-bar eval slice)
-- **CAN:** that a difference of ≲2.8 pp in `excess_return` is unresolvable on a single pinned window — stated as a **design property**, not a result. And that in-sample cells and frictionless cells invalidate any tradeable claim (already correct at `:2172-2195`, `:2229-2245`).
-- **CANNOT:** rank any two configs within 2.8 pp. Attribute anything to `fee_rate`/`slippage` (effect 0.25–0.8 pp). Say anything about generalization beyond the one window. Compare across tickers as if independent (`assets within a ticker are one market` — already correct at `:2278-2280`).
-- **After pairing only (no new runs):** if ρ≥0.7, the floor drops from 2.82 pp to ~1.6 pp — still above the 0.25–0.8 pp effect. **Pairing alone does not fix it.** It must be combined with ≥10 seeds/group.
-- **Bottom line: today the harness can conclude a NEGATIVE result honestly, and nothing else.** That is worth stating in the report, because a negative result is a result.
+**CAND-3a is the cheapest item in the entire audit: 158 seconds, 13 megabytes, 3 commands, and one
+YAML key. It should not be waiting behind anything.** What waits behind CAND-5 is only the claim
+that it worked.
 
 ---
 
-## 5. Part E — How G3 and G4 multiply
+## 7. Findings not in the audit
 
-They are not additive; they are the *same* problem seen from two ends, and G3 is the **enabling** constraint for the only fix G4 has.
-
-1. **G4's σ cannot be reduced by data at all.** σ_train = 1.23 pp is PPO's own variance. More bars do not touch it. The only G4 levers are seeds (N), pairing (ρ), and windows (K, which trades against σ_train).
-2. **G3's contribution to a pinned single window is zero variance reduction.** Because the window is pinned, every cell sees the same bars, so the market path is already fully paired. Deep history does **not** reduce σ_within at all.
-3. **G3's value is orthogonal and comes from a different mechanism: σ_win.** Depth is the *only* way to estimate (let alone reduce) the across-window component, which is what a claim about "in general" requires. Today σ_win is unmeasured *because* depth is zero.
-4. **The multiplication.** With depth = 0, K = 1 is forced. With K = 1, only seeds and ρ are available, and Table 2 says the effect stays unresolvable below ρ≈0.9. With Table 3 saying windows only pay once σ_win ~ σ_train — **which cannot be known without depth — the system is stuck in a loop where each gap is separately unfixable and jointly fixable.**
-5. **Explicit arithmetic for the shipped design.** L_window = 456 bars pinned → 137 eval bars → 178 replayed after warm-up. Effective independent draws from one 456-bar contiguous window ≈ **3** (interpolating the §4.3 table). Seeds = 3. Paired-by-window pairing is unavailable (one window). Unpaired SE = 1.2343·√(2/3) = **1.008 pp**; **MDD = 2.82 pp**; effect 0.25–0.8 pp. **The design resolves nothing below 2.8 pp. It is ~3.5–11× short.**
-6. **The counterfactual.** Same σ_train = 1.23 pp, but with depth seeded from A1 (years, not 721 bars), walk-forward enabled, L_eval = 168 bars, ρ measured by pairing:
-   - ρ = 0.5, N = 48 paired seeds, one window → MDD = 0.50 pp → **resolves the friction effect**.
-   - ρ = 0.7, N = 29 paired seeds → MDD = 0.50 pp.
-   - unpaired N = 96 at one window → MDD = 0.50 pp.
-   None of these is cheap in seeds. **But 29–96 seeds at L=168 bars over a seeded store is ~10–30× less wall-clock than today's equivalent, because a longer window needs no more seeds and short windows amortise warm-up.** And *only* the depth is the hard prerequisite.
-7. **And the cheaper answer still stands:** measure ρ and σ_win from the records that already exist, and **report the detection floor**. At N=3 the correct, honest output is a negative result with a required-N, not a median.
-
----
-
-## 6. Part F — Ranked recommendation, scored on fit to what the RL pipeline consumes
-
-**Consumption shape (this is the scoring key).** The pipeline consumes **one row per (ticker, bar timestamp)**: `time, open, high, low, close, vwap, volume, count` (`rl/data.py:691-727`), consumed positionally by `environment._raw_feature_array`. Anything that must be **re-aggregated, re-timestamped, or reshaped** before that row is cheap; anything that requires a new observation column, a new venue, or a new index is expensive.
-
-| Rank | Action | Fits the consumption shape? | Cost | Why |
-|---|---|---|---|---|
-| **1** | **Replace the Binance seeder's source with Kraken's own OHLCVT archive** in `kraken-deep-history` (same `seed → upsert` seam, new `client.py` adapter). | **Perfect** — the archive row *is* the store row: `timestamp→time`, `volume→volume`, `trades→count`. Only `vwap` is missing. | **~1 file + 1 ticker map + tests.** Download verified working (538 MB/quarter, 10.5 GB full). | Kills the venue discontinuity **completely** (§2-B4), supplies **DOGE/USD**, and removes the Binance dependency. Zero paid cost. |
-| **2** | **Make the harness report a detection floor instead of `MIN_REPLICATES_FOR_A_CLAIM`.** Compute σ_within per group, paired-Δ + Wilcoxon + Cliff's δ + bootstrap CI where ρ>0, and print `MDD = 2.8016·σ/√N` next to every median. | **Perfect** — consumes only `REQUIRED_BACKTEST_FIELDS`, including `seed`, **which is already in every record**. | **~30–60 lines in `summarize`/`cmd_report`, no new runs.** | Converts an unfounded claim into a founded negative result. Highest leverage per line in the entire audit. |
-| **3** | **Turn on `market_data_store`** in `configs/default.yaml` once seeded, and set the example matrix window to something the store can serve. | Perfect — a config key that already exists (`default.yaml:120-142`). | 1 line + a seed run. | Makes `since`/`until` real (`data.py:1003`) and gives G4's σ_win something to measure. |
-| **4** | **Enable walk-forward** by honouring `TradingEnvironment.reset(options=...)` (`environment.py:216-242`), plus the signposted `data.py:943-947` todo. | Perfect — produces more (ticker, window) rows of the *same* shape. | ~10 lines of already-signposted code, blocked only by G8. | The only way K > 1, i.e. the only way to widen a claim beyond one window. |
-| **5** | **Fix `vwap_dev`'s availability** by dropping it from `feature_groups` for archive-backed models (or gating it on a `vwap`-present check — `data.py:668` is already presence-gated, so this is a one-line decision, not a refactor). | Perfect — it removes one column rather than adding one. | ~1 line. | Avoids fabricating `vwap` or reintroducing a normalisation seam on a *different* column. |
-| **6** | **Fix the harness's push-down arithmetic:** `:1385` `pages * 300` → `KRAKEN_REST_BAR_CEILING` (`:226`); and raise (not warn) when `n_bars < span_bars_for(...)`. | Perfect. | ~5 lines. | Removes the silent-short-window failure and an unexplained magic constant. |
-| **7** | **Add G5's retry/backoff to `_page_candles`** (`data.py:763-771`) **before** any long push-down. | Perfect. | ~20 lines. | Precondition for #3/#4: today one 5xx aborts a multi-thousand-bar read with no resumption. |
-| **8** | Use **CryptoDataDownload**'s Kraken CSVs to bridge the 2026-07-01→now archive lag, and as a cross-check on A1. | Perfect — same CSV row shape. | ~1 file. | Keyless, daily-fresh. Verify against `ETHUSD_60.csv` first (paid-tier rows are cross-venue "reconciled"). |
-| 9 | **Shorten eval windows, lengthen history.** Retune the example matrix to L ≈ 48–168 bars with many walk-forward segments rather than one 456-bar window. | Perfect. | Config + #4. | §4.3: σ(L) ∝ √L, so a long window is strictly worse per draw. |
-| 10 | **Tardis.dev** — defer for G3; **flag to the lead as a G2 lead** (historical Kraken L2 `book` depth, since 2019-06-04). | Poor for G3 (needs trade→OHLCV re-aggregation). | Tiers need a live account check. | Right resource, wrong gap. |
-| 11 | CoinAPI / Kaiko / Amberdata. | — | Sales-gated. | **Do not pursue.** A1 is keyless, first-party, and worked first try. |
-| 12 | Kaggle / HuggingFace. | — | — | Reject: stale, venue-mismatched, licence-varied. |
-
-### House-style fit for the new sibling work
-Rank #1 is a change of *source adapter* inside the existing `kraken-deep-history` package — it already matches the house style exactly (`client.py` / `seeder.py` / `export.py` / `utils.py` / `errors.py` / `logging_config.py` behind one facade, typed models, thin `cli.py`, `pyproject.toml` + Nix flake dev shell, `.env.example` with **no secrets**, offline fixture tests, structured JSON logging). Swapping a Binance `urllib`+`zipfile` client for a Kraken one is a like-for-like module substitution; **no new project is warranted.** Ranks #2 and #6 are changes to `tools/model_matrix.py` in this repo, not a sibling at all.
+1. **§3.2 — `pages` is not merely non-scaling, it is a replay loop.** `last` never advances past
+   page 1 (`last == 0` is dead code on a live pair), so calls 2..N are byte-identical requests.
+   Measured: `pages=6` → 6 calls, 721 unique bars, **identical to `pages=1`**. 10 duplicate rows
+   are collected and discarded at `data.py:1031`. Fix: `if last == cursor: break`.
+2. **§1.3 — `kraken-deep-history`'s dev shell cannot produce a bot-readable store.** It has only
+   pytest; `market_data` is not importable, so `_open_store` silently degrades to
+   `fallback-csv` and writes `.csv` files that `MarketDataStore.read` (which globs `*.parquet`)
+   cannot see. Only the `store_mode` field in the JSON report distinguishes them.
+3. **§3.4 — the audit's "`data_window` is only a post-hoc mask → clips to empty" is overstated for
+   the store leg.** With a store there is no clipping-to-empty failure mode; there is wasted work.
+   `NotEnoughDataError` from a pinned window is confined to runs **without** `market_data_store`.
+4. **§3.4 — the push-down has a 19-bar warm-up cost.** `trade_count_zscore_20` goes from 0 to 19
+   NaNs at the window's leading edge, because the 20-bar rolling window can no longer reach back
+   across the boundary. Beyond bar 20 the two paths agree to 1.5e-13.
+5. **§4.3 — Kraken's published rate limits did not reproduce on the keyless public path.** A burst
+   of 16 rapid `/public/OHLC` calls and 8 calls at 2.5/s both returned 100 % OK. CAND-4 should be
+   scoped as *transient-failure resilience*, not *rate-limit compliance* — the exposure is 5xx and
+   connection resets, not 429s.
+6. **§2.1 — Kraken's OHLCVT article contradicts its own MANIFEST on intervals.** The intro
+   paragraph lists 30 minutes; the "About the data" section and every real filename omit it. A
+   reader written from the prose would request a non-existent file.
+7. **§2.1 — Kraken's bulk OHLCVT has no `vwap` column**, so a store seeded from it would
+   **silently lose `vwap_dev`** — one of the 52 bare observation columns — via the presence gate at
+   `data.py:846`. The bulk archive is strictly poorer on shape than the REST endpoint it replaces.
+8. **§1.1 — a store is 60 bytes/bar.** 204,245 bars across three tickers and 8.7 years of 1 h data
+   is 13 MB. Any future "we cannot afford the disk" objection is answered.
 
 ---
 
-## 7. Part G — What I could NOT determine
+## 8. Reproduce this
 
-| Open question | Why | What would settle it |
-|---|---|---|
-| **Does the archive's `volume` equal Kraken REST's `volume` bar-for-bar?** | The Q2-2026 archive covers Apr–Jun 2026; Kraken REST only serves the most recent 720 bars, so there is **no overlap to compare** — and none is possible, because REST's window can never reach back that far. | Download the **Full** archive (10.5 GB) and compare its 2026-04…06 bars against a Binance-free Kraken reference; or wait for the Q3-2026 increment (should publish ~Oct 2026) and compare its last 720 bars against REST. **Until then this is an unverified assumption, and it is the load-bearing assumption of rank #1.** |
-| **`vwap` for archive history** | Not in the OHLCVT schema. | Nothing — it does not exist. Decision #5 is the resolution. |
-| **σ_win (SD of `excess_return` across disjoint windows)** | Requires walk-forward (#4), which is unreachable today. | The harness, after #3+#4, on one frozen policy across many windows. This is the number that decides whether seeds or windows are the better lever (§4.4). |
-| **ρ (pairing gain)** | No records in `results/` from a paired run. | **Cheap and immediate:** run config A and config B at 3–5 *shared* seeds, or read any existing multi-seed matrix with ≥2 config levels. Zero new architecture. |
-| **Tardis.dev, CoinAPI, Kaiko, Amberdata pricing** | No public list price; would require an account or a sales contact. I did not sign up or contact anyone. | A live account check. **Not recommended** — rank #1 makes them moot. |
-| **σ_1 over a multi-year span** | I measured only 91 days (one quarter). Volatility clustering means σ_1 varies by regime; a multi-year figure would firm up Table 4. | The Full archive (10.5 GB) or CryptoDataDownload's Kraken 1-min history. |
-| **Whether Binance's archive `DOGE` coverage would even help** | Moot — `DOGUSD_60.csv` exists in Kraken's own archive (verified). | — |
-| **Rate-limit behaviour of `assets.kraken.com`** | I made 2 requests; no limits observed, none published. | Only relevant if a future pass pulls many quarters. |
+```bash
+# 1. store build cost (158 s, 13 MB, no code)
+cd ~/Projects/kraken-market-data
+nix develop --command bash -c "
+  PYTHONPATH=\$HOME/Projects/kraken-deep-history:\$HOME/Projects/kraken-market-data \
+  python \$HOME/Projects/kraken-deep-history/cli.py seed \
+    --ticker ETH/USD --interval 60 --from 2018-01-01 --store /tmp/krb-cand3/store2"
+du -sh /tmp/krb-cand3/store2          # 4.6M, 104 parquet files
+
+# 2. it is a config flip (76,561 bars, 0.48 s, zero code)
+cd ~/Projects/kraken-trading-bot
+nix develop --command bash -c "python -c \"
+from kraken_trading_bot.rl.data import read_ohlc_dataframe
+df = read_ohlc_dataframe('ETH/USD', 60, pages=1, market_data_store='/tmp/krb-cand3/store2')
+print(df.shape, df.index[0], df.index[-1])\""
+
+# 3. since is a no-op on REST (Kraken's own words + measurement)
+curl -s https://docs.kraken.com/api/docs/rest-api/get-ohlc-data | grep -o 'older data cannot be retrieved[^.]*'
+
+# 4. pages replays (5 of 6 calls are identical)
+nix develop --command bash -c "python -c \"
+from kraken_api import KrakenManager
+from kraken_trading_bot.rl.data import _page_candles
+m = KrakenManager.from_env()
+for p in (1,2,6):
+    print(p, len(_page_candles('ETH/USD',60,p,m,None)))\""
+
+# 5. cross-venue basis (Kraken OHLCVT vs Binance, 2,184 real bars)
+#    ranged GET of the ZIP central directory + MANIFEST.json, then diff vs
+#    https://data.binance.vision/data/spot/monthly/klines/ETHUSDT/1h/ETHUSDT-1h-2026-0{4,5,6}.zip
+#    (both archives extracted under /tmp/krb-cand3/ — not committed)
+```
+
+Everything lives under `/tmp/krb-cand3/`. Nothing was written to the repo but this file.
 
 ---
 
-## 8. Three sentences for the architect
-
-1. **The G3 caveat is free to remove.** Kraken publishes a keyless, first-party OHLCVT archive (`Kraken_OHLCVT_{Q}.zip`, 538 MB/quarter; Full = 10.5 GB; `timestamp,open,high,low,close,volume,trades`) that I downloaded and parsed successfully — it includes `DOGUSD_60.csv`, eliminating both the venue discontinuity **and** the DOGE hole. The only loss is `vwap`.
-2. **G4's arithmetic inverts the audit's intuition.** Measured σ(L) ∝ √L: a longer eval window is a *noisier* measurement, and one 456-bar window is worth ~3 effective independent draws. Power comes from more *short* windows and more seeds — never from one long window — so **G3 is what makes G4 fixable, and depth currently contributes exactly zero variance reduction.**
-3. **The cheapest, highest-leverage change is 30–60 lines in `tools/model_matrix.py`.** `seed` is already in `REQUIRED_BACKTEST_FIELDS`, so pairing, σ_within, Cliff's δ, Wilcoxon, bootstrap CIs and a `MDD = 2.8016·σ/√N` detection floor are computable **from results that already exist** — turning "median 1.3 pp" into "**this design resolves nothing below 2.8 pp; N=96 required**", which is a *correct and defensible finding* rather than an unfounded one.
-
-RESEARCH COMPLETE
+*End of RESEARCH-3. Nothing was written, committed or deleted outside this file.*
