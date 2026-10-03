@@ -554,3 +554,122 @@ recorder is the missing producer, not the feature.
   artifact is honest; alerting on it is ops work nobody has asked for.
 - **`--count` default 100, not 500.** 500 costs ~325 MB/year and buys a
   deeper imbalance basis nobody has measured yet.
+
+---
+
+## Addendum — lead takeover, gap-counter RED run, and the installed-unit defect
+
+The recorder teammate's session was **aborted on a busy-time limit** before it could
+hand over. Its three commits survived on its branch and were squash-merged (`0fe7b85`);
+suite went 519 → **570** (51 new tests). This addendum records the two things its slice
+left unestablished, both closed here.
+
+### 1. The gap counter was never asked a question it could fail
+
+Its own sidecar, recovered from the aborted worktree, read `n_gaps: 0`, `n_records: 2`,
+`coverage_ratio: 1.0`. PLAN.md §8.1 item 4 is explicit that a counter which has only ever
+printed zero is indistinguishable from a counter that cannot count, and that the red run
+is part of the deliverable rather than a follow-up.
+
+**RED RUN — a deliberately skipped interval.** Eight records: hourly for hours 0–4, then a
+**5-hour hole** (hours 5–9 omitted), then hourly for 10–12. Verbatim:
+
+```
+  DEPTH RECORDER GAP REPORT — kraken.public.Depth
+    artifact      : /tmp/g1-red-hole.jsonl
+    expectation   : every 3600s (hole if actual > expected x 1.5)
+    records       : 8   intervals: 7
+    first         : 2026-10-01T00:05:00+00:00
+    last          : 2026-10-01T12:05:00+00:00
+    span          : 43200s observed   slots the span covers: 13   records: 8   coverage: 61.5%
+    SHORT         : 0 (re-fire inside an hour — benign, counted separately from gaps)
+    GAPS          : 1   missing snapshots: 5   longest hole: 21600s
+
+    EXPECTED-VS-ACTUAL INTERVALS
+    STATUS  AFTER                             BEFORE                               ACTUAL   EXPECT      x  MISS
+    OK      2026-10-01T00:05:00+00:00         2026-10-01T01:05:00+00:00              3600     3600   1.00     0
+    OK      2026-10-01T01:05:00+00:00         2026-10-01T02:05:00+00:00              3600     3600   1.00     0
+    OK      2026-10-01T02:05:00+00:00         2026-10-01T03:05:00+00:00              3600     3600   1.00     0
+    OK      2026-10-01T03:05:00+00:00         2026-10-01T04:05:00+00:00              3600     3600   1.00     0
+    GAP     2026-10-01T04:05:00+00:00         2026-10-01T10:05:00+00:00             21600     3600   6.00     5
+    OK      2026-10-01T10:05:00+00:00         2026-10-01T11:05:00+00:00              3600     3600   1.00     0
+    OK      2026-10-01T11:05:00+00:00         2026-10-01T12:05:00+00:00              3600     3600   1.00     0
+
+    *** 1 HOLE(S) — DATA IS MISSING ***
+      hole 1: recorder did not fire between 2026-10-01T04:05:00+00:00 and 2026-10-01T10:05:00+00:00
+              actual 21600s vs expected 3600s  (x6.00)  -> 5 hourly snapshot(s) unrecoverable
+    Kraken's book has NO historical endpoint: these hours cannot be backfilled by anything.
+    VERDICT: RED
+```
+
+**CONTROL — the real log, no hole.** Verbatim:
+
+```
+    records       : 3   intervals: 2
+    span          : 1579s observed   slots the span covers: 3   records: 3   coverage: 100.0%
+    SHORT         : 2 (re-fire inside an hour — benign, counted separately from gaps)
+    GAPS          : 0   missing snapshots: 0   longest hole: 0s
+    VERDICT: GREEN (no interval exceeded the expectation)
+```
+
+The pair is what makes it evidence rather than an assertion: the same code returns RED on a
+planted hole and GREEN on a clean log, so a future `n_gaps: 0` is informative. Note the
+control also exercises the SHORT path (a re-fire inside the hour counted separately from
+gaps), which the planted hole does not.
+
+A first attempt used `--check-gaps` on `record-depth` and failed with
+`unrecognized arguments: --check-gaps`; it is a separate `depth-gaps` subcommand. **That
+run was discarded and re-run** per §8.1 — a failed invocation is not a red run.
+
+### 2. The INSTALLED unit pointed into a git worktree that `team_cleanup` deletes
+
+The committed `systemd/kraken-trading-bot-order-book.service` was always correct: its
+`ExecStart` targets `/home/seanc/Projects/kraken-trading-bot`, the **main checkout**. The
+defect was only in the copy **installed on this host**, which the teammate had installed
+from inside its own worktree, so `@ROOT@` resolved to
+`/home/seanc/.local/share/opencode/worktree/…-recorder`. The timer would therefore have
+fired hourly into a directory about to be deleted — every snapshot lost, and the code it
+invoked vanishing with it. PLAN.md §8.1.1's exact failure: "it works when I run it by hand"
+and "the timer runs the committed tree" are different claims, and only one accumulates data.
+
+Every check except the path said green — `enabled=enabled`, `active=active`,
+`Result=success`, `ExecMainStatus=0`, `NRestarts=0` — which is what made it dangerous.
+`LAST` was `-`, i.e. only manual starts had run.
+
+**Fixed** by re-running `just depth-timer` from the merged main checkout. Verified after:
+
+```
+ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-trading-bot#kraken-trading-bot
+  -- record-depth --pair ETH/USD --output /home/seanc/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl
+  --count 100
+```
+
+with no `worktree` substring anywhere in the installed unit.
+
+### 3. The two recovered snapshots, preserved
+
+Rescued from the aborted worktree to `/tmp/g1-rescued/` **before** the merge, then seeded
+into the main checkout's `signals/`. They are the §8.1 "two real snapshots with DISTINCT
+timestamps" evidence, and they carry the recorder's own clock — a book snapshot has none,
+each level's timestamp being that order's placement time:
+
+```
+#1 recorded_at=2026-10-03T19:10:45.752567+00:00  hour=2026-10-03T19:00:00+00:00  bid=100 ask=100 best=2683.52000/2683.53000 spread=0.01
+#2 recorded_at=2026-10-03T19:12:55.755671+00:00  hour=2026-10-03T19:00:00+00:00  bid=100 ask=100 best=2683.51000/2683.52000 spread=0.01
+```
+
+Three distinct timestamps after a manual start against the corrected path:
+
+```
+#1 2026-10-03T19:10:45.752567+00:00  bid=2683.52000 ask=2683.53000 levels=200
+#2 2026-10-03T19:12:55.755671+00:00  bid=2683.51000 ask=2683.52000 levels=200
+#3 2026-10-03T19:37:04.693310+00:00  bid=2681.57000 ask=2681.58000 levels=200
+```
+
+### 4. Still open: the first UNATTENDED fire
+
+Everything above is manual or planted. §8.1.3 requires the *timer* to have fired with
+`LAST` in the past relative to `NOW` and `NEXT` in the future — "an enabled timer is not a
+running timer", and `enabled`/`active`/has-fired are three different claims. The first
+unattended fire after the corrected install is the first real evidence, and it is what
+turns this slice from "a recorder exists" into "depth is accumulating".
