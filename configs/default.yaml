@@ -255,9 +255,8 @@ market_data_store: null
 # and logged with the store root, so a run log states it: nothing else in
 # the output distinguishes them.
 #
-#   kraken-live-rest              (default) an UNSEEDED store: every bar in
-#                                 it was appended by this run's own live
-#                                 fetch leg, so it is Kraken's.
+#   kraken-live-rest              a store this run appended to itself over
+#                                 live REST: every bar in it is Kraken's.
 #   binance-spot-archive-seeded   a store seeded by `kraken-deep-history`,
 #                                 which is Binance-*USDT spot. Its basis
 #                                 against Kraken has been measured at
@@ -267,13 +266,31 @@ market_data_store: null
 #                                 LABELLED, because a store-vs-live
 #                                 comparison measures history AND venue
 #                                 together.
+#   unknown                       (the shipped default) nothing has said
+#                                 which venue these bars are, so that is
+#                                 what the read logs, with a WARNING that
+#                                 names this key.
+#
+# WHY THE DEFAULT IS `unknown` AND NOT `kraken-live-rest`. The old default
+# asserted a venue that no config key had established, and paper trade did
+# not forward the key at all -- so the one leg that places orders labelled
+# a Binance-seeded store as Kraken's own, in silence. Nothing inside the
+# store can settle it either: `_meta.json` carries only `schema` and
+# `cursors`, and the Binance seeder writes cursors too, so "no cursor =>
+# not live" is refuted. A default may not claim what nothing established.
+#
+# So: set this key whenever you turn `market_data_store` on. Leaving it
+# `unknown` costs you nothing but a warning line per read; mislabelling a
+# seeded store costs a reviewer the ability to compare a store arm against
+# a live one. `configs/deep-history.example.yaml` sets it to
+# `binance-spot-archive-seeded` for exactly that reason.
 #
 # Recorded in models/{ticker_id}/{model_name}/config.yaml beside
 # `n_features`/`n_bars`, i.e. on the artifact a reviewer already opens.
 # It lives here rather than in the seeder's `_meta.json` because this repo
 # consumes kraken-market-data as a PINNED flake input (rev 055d7f6): a
 # sibling edit would not reach `nix develop` without a lock bump.
-market_data_store_venue: "kraken-live-rest"
+market_data_store_venue: "unknown"
 
 # --- Data window (pinning + train/eval split) ---------------------------
 # WHY THIS EXISTS. `train` and `backtest` each fetched their own FRESH

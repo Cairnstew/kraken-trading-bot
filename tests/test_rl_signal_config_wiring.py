@@ -529,6 +529,68 @@ def test_every_consumer_threads_both_signal_keys() -> None:
     assert not missing, "signal config wiring gaps: " + "; ".join(missing)
 
 
+def test_every_read_ohlc_dataframe_call_site_forwards_venue() -> None:
+    """Every ``read_ohlc_dataframe(`` call site forwards the venue key.
+
+    The sibling above walks a fixed list of four consumers.  This one walks
+    the whole package instead, because the failure mode is a *new* leg
+    appearing rather than an existing one changing — a list of four is a
+    snapshot, and a snapshot is what let this ship.  ``paper_trade``
+    forwarded all five signal keys and omitted exactly one keyword,
+    ``market_data_store_venue``, so the one leg that places orders logged
+    ``kraken-live-rest`` for a store the ``kraken-deep-history`` seeder had
+    filled with Binance-*USDT spot (G-B(i)).  One kwarg, on the leg that
+    orders.
+
+    Asserted at every call site, and for the five signal keys as well: the
+    claim is that this *class* of config key is forwarded at the seam, and
+    that the venue key is now part of the class.
+
+    The ``**kwargs`` case is reported rather than skipped — a call that
+    splats cannot be proved to forward anything, and "cannot be proved" is
+    not "is fine".
+    """
+    data_module = __import__("kraken_trading_bot.rl.data", fromlist=["*"])
+    package = Path(inspect.getsourcefile(data_module) or "").parent.parent
+    required = (*_SIGNAL_KEYS, "market_data_store_venue")
+
+    gaps: list[str] = []
+    found = 0
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = getattr(func, "id", None) or getattr(func, "attr", None)
+            if called != "read_ohlc_dataframe":
+                continue
+            # The definition is a FunctionDef, never a Call, so every hit
+            # here is a call site.
+            found += 1
+            where = f"{path.relative_to(package.parent)}:{node.lineno}"
+            keywords = {kw.arg for kw in node.keywords if kw.arg}
+            if len(keywords) != len(node.keywords):
+                gaps.append(f"{where}: forwards **something, so no key is provable")
+                continue
+            gaps.extend(
+                f"{where}: does not forward {key}"
+                for key in required
+                if key not in keywords
+            )
+
+    # A scan that finds nothing passes vacuously, which is the one way this
+    # guard could stop being able to fire at all.
+    assert found >= len(_CONSUMERS), (
+        f"found {found} read_ohlc_dataframe call sites in {package}, expected "
+        f"at least one per consumer ({', '.join(_CONSUMERS)})"
+    )
+    assert not gaps, (
+        "read_ohlc_dataframe call sites missing config keys:\n"
+        + "\n".join(gaps)
+    )
+
+
 def test_paper_trade_deliberately_passes_no_since() -> None:
     """``since`` stays unset on paper trade's read; the freshness pair is
     computed against the frame's own bars, so it does not depend on it.

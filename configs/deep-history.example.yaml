@@ -126,9 +126,10 @@ market_data_store: ~/Projects/kraken-market-data/store
 # archives, so these bars are NOT Kraken's: the basis has been measured
 # at +5.41 bp of level shift against a 58.30 bp hourly sigma (z-scoring
 # removes the level, but a store-vs-live comparison therefore measures
-# history AND venue together and has to be described that way). Leave this
-# key at the `kraken-live-rest` default only if you seeded nothing and are
-# reading the live leg's own append.
+# history AND venue together and has to be described that way). Set it to
+# `kraken-live-rest` only if you seeded nothing and are reading the live
+# leg's own append; the shipped default is `unknown`, which logs that
+# nothing established the venue and warns you once per read.
 market_data_store_venue: "binance-spot-archive-seeded"
 
 # --- Pinned window + out-of-sample split (REQUIRED here) -----------------
