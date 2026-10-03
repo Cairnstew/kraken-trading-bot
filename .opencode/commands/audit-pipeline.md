@@ -893,6 +893,60 @@ inventory only.
     so teammates can `git show` them instead of being handed absolute paths — this also removes a
     class of "the artifact I was told to read is not in my worktree" failures.
 
+- 2026-10-02 (later) — IMPROVE-EXISTING pass (G2, backfill Kraken's own funding history into the
+  existing signal file). Gate **PASS**; 8 commits pushed `e027621..6bef125`, 455 → 457 tests.
+  Detail: `.data-audit/RUN-LOG.md`. The lessons that changed tooling or guidance:
+  - **A checker in the guard chain had never once fired — and neither had the check beside it.**
+    `just audit-findings` scanned `\bF(\d+)\b` and looked up the literal token `F{n}`, but the
+    repo's finding convention is HYPHENATED (`F-1`, `F-7`), so every run printed "no F<n>
+    identifiers" and returned 0. `just audit-evidence` meanwhile **crashed** (`ValueError`) on a
+    legitimate absolute cross-repo citation, because `REPO / <absolute>` yields the absolute path
+    and then `relative_to(REPO)` raises. Both are the RUN LOG's standing class — *a green check
+    whose defect it hunts is still present* — one by vacuity, one by crash. **Run a check's own
+    audit-verify BEFORE trusting its PASS**, and if it reports nothing found, verify that "nothing
+    found" is reachable at all. Proof the repair bites: on its first real run `audit-findings`
+    reported 16 findings and exited 1 on a genuine `F-16 MISSING`.
+  - **The `#` in a "copy-pasteable" hint is a half-run that passes every guard.** Phase 4B
+    implemented DECISION §5.2 literally, and the lead (me) checked the producer string was not
+    *executed* — no `subprocess`, no `shell=True` — and called it safe. But `data.py:208`
+    documents that string as copy-pasteable, and pasted into a shell `#` comments out the rest:
+    only the backfill ran, so `spread` silently became an all-zero column **at unchanged width**.
+    The integrator caught it. **When verifying a hint, ask whether it is copy-pasted, not only
+    whether it is executed** — and prefer `&&` over `#` in any two-step instruction string.
+  - **A decision's own acceptance criteria can be unsatisfiable and still read as authority.**
+    §7.3 asserted `n_features == 57` / `== 49`; both are **3 low** because the fixture they were
+    measured on lacked `vwap`/`count`, so `vwap_dev` / `volume_per_trade` /
+    `trade_count_zscore_20` were absent (sane range 52–60). A reviewer honouring the literals
+    reports a failure on a correct implementation. This is the 2026-10-01 "width per
+    configuration" lesson arriving a third time, so it is now a **gate-authoring rule**: state
+    the axis the figure's fixture included, and never let the gate assert a literal width the
+    architect measured on a synthetic frame.
+  - **Two agents measuring the same quantity differently is a finding, not a disagreement to
+    adjudicate.** F-9 (non-finite cells 684 vs 0) and F-11 (`spread` nonzero 13 vs 24) were
+    left OPEN in `DECISION.md` §7.8 rather than resolved by fiat; the reviewer then re-derived
+    both with exact arithmetic (684 = 697 − 13, frame mismatch; 24 = 13 + 11 ffill, one arm two
+    frames) **and corrected the builder's "identical in both arms" as well as the integrator's
+    "byte-identical both arms" — both were wrong.** Writing a disputed figure into the artifact
+    as "the answer" is how a false number becomes load-bearing.
+  - **Check the sibling's real production path before briefing a command.** The brief assumed
+    `nix develop --command kraken-funding-rates` and the reviewer found the binary is not on the
+    dev-shell PATH; `nix run ~/Projects/kraken-funding-rates#kraken-funding-rates` is what the
+    timer's own `ExecStart`, both justfile recipes and the config hint already use. The
+    reviewer's substitute was *stronger* evidence than what I asked for. For a
+    `flake.nix`-unpinned sibling, `nix run` is the production path — brief it that way.
+  - **`audit_checks.py` is not in its own `PY_FILES`,** so fixing a crash in it leaves
+    `executable-ast` MATCH and `model_matrix.py` byte-identical. The gate instrument can be
+    repaired for robustness without weakening any assertion — but `model_matrix.py`, the
+    pre-registered **estimator**, must stay byte-identical (2026-10-02's rule, re-confirmed).
+  - proposal: `tools/width_check.py:53-55` calls `compute()` but never
+    `add_derived_ohlcv_features`, so a raw OHLCV parquet fingerprints at **49** where every
+    shipped state composes 52/60 — the reviewer's own `verify --frame` receipt printed it and had
+    to be flagged do-not-paste. Docstring-only fix (auto-calling would invalidate the committed
+    CAND-3a fingerprints); a follow-up slice should add a `--derived` flag instead.
+  - proposal: teammates using the Playwright MCP leave `.playwright-mcp/` untracked in the repo
+    root, which trips `just audit-closeout`'s clean-tree check. Now gitignored (89cbb12); any
+    other tool with a repo-root scratch dir wants the same.
+
 ## Matrix-harness pass (2026-10-01, follow-on to the Gap 1 pass)
 
 Not a data-pipeline audit phase — a separate build the user asked for after the audit landed: a
