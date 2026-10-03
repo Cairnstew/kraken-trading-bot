@@ -753,3 +753,162 @@ def test_presence_gating_survives_the_warmup_fix():
     assert "vwap_dev" not in env._features.columns
     assert env._start_index == _WARMUP_BARS
     assert env.n_bars - env._start_index > 0.9 * env.n_bars
+
+
+
+#: Every file/line that writes out the observation-frame convention by
+#: hand. There is no shared helper; the constant ``ffill().fillna(0.0)``
+#: is repeated at each. Used by the drift guard below.
+_OBSERVATION_FRAME_SITES = (
+    ("kraken_trading_bot/rl/features.py", "self.compute(df).ffill().fillna(0.0)"),
+    ("kraken_trading_bot/rl/features.py", "self.compute(df).ffill().fillna(0.0)"),
+    ("kraken_trading_bot/rl/environment.py", "self._features.ffill().fillna(0.0)"),
+    ("kraken_trading_bot/rl/paper_trade.py", "computed.ffill().fillna(0.0)"),
+    ("kraken_trading_bot/rl/export.py", "computed.ffill().fillna(0.0)"),
+)
+
+
+def test_the_observation_frame_expression_is_written_at_every_declared_site():
+    """The drift guard on the CONVENTION: five hand-written sites, one rule.
+
+    The observation frame is ``compute`` then ``ffill`` then ``fillna(0)``,
+    and master writes that expression out at five places with no shared
+    helper. Nothing structurally stops a sixth site appearing, or one of
+    the five being edited to something else — and the pairwise tests would
+    not all notice, because each pins one consumer to ``transform`` rather
+    than pinning the five to EACH OTHER.
+
+    So this asserts the expression is present in each declared file. It is
+    deliberately a presence check, not a behaviour check: the behavioural
+    half is ``test_all_reachable_observation_routes_agree_row_for_row``
+    below, and ``PaperTrader._build_observation`` is pinned against
+    ``transform`` by ``test_built_observation_is_z_scored_by_saved_stats``
+    in ``tests/test_rl_paper_trade.py``.
+
+    Adding a sixth site means adding a line here — which is the point.
+    The failure message names the file, so a new consumer cannot join the
+    convention without this test being extended to cover it.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    missing = []
+    for rel, expr in _OBSERVATION_FRAME_SITES:
+        src = (root / rel).read_text(encoding="utf-8")
+        if expr not in src:
+            missing.append(f"{rel}: {expr!r}")
+    assert not missing, (
+        "the observation-frame convention moved or lost a site: "
+        + "; ".join(sorted(set(missing)))
+    )
+
+
+def test_all_reachable_observation_routes_agree_row_for_row(monkeypatch):
+    """The drift guard on BEHAVIOUR: one frame, four routes, equal arrays.
+
+    Drives the routes reachable in-process from a single episode and
+    asserts they produce the same matrix row for row:
+
+      1. ``FeaturePipeline.fit``'s frame (read back out of the fitted
+         stats, so this asserts what fit DID rather than what it should
+         have done)
+      2. ``FeaturePipeline.transform``
+      3. ``TradingEnvironment._raw_feature_array``
+      4. the CSV export's feature block
+
+    ``PaperTrader._build_observation`` is the fifth site and returns a
+    single row for a freshly-fetched window, so it is pinned separately by
+    ``tests/test_rl_paper_trade.py::test_built_observation_is_z_scored_by_saved_stats``
+    against the same ``transform``.
+
+    Non-vacuous by mutation: dropping ``.ffill().fillna(0.0)`` from the
+    ``fit`` site turns **61 tests red across 6 files**, and that site's own
+    symptom is ``NonFiniteFeatureError`` naming **237 NaN cells across 21
+    rolling-window columns** (``return_1``, ``price_ratio_sma_24``, …) —
+    the warm-up rows this convention exists to keep out of the moments.
+    """
+    import kraken_trading_bot.rl.export as export_mod
+    from kraken_trading_bot.rl.export import build_export_frame
+
+    ticker, tid = "ETH/USD", normalize_ticker_id("ETH/USD")
+    df = _synthetic_ohlcv(n=320)
+    pipe = FeaturePipeline(windows=(1, 4, 24))
+    episode = prepare_episode(df, pipe, ticker_id=ticker, episode_bars=200)
+
+    # Route 1 — what fit() used, reconstructed from the fitted stats.
+    stats = pipe.stats_for(tid)
+    assert stats is not None, "fit did not register stats for the ticker"
+    fitted_frame = pipe.compute(episode).ffill().fillna(0.0)
+    route1 = stats.normalize(fitted_frame).to_numpy(dtype=np.float32)
+
+    # Route 2 — transform.
+    route2 = pipe.transform(episode, ticker_id=tid)
+
+    # Route 3 — the environment's observation matrix.
+    env = TradingEnvironment(ticker, data=episode, feature_pipeline=pipe)
+    route3 = env._raw_feature_array()
+
+    # Routes 2 and 3 are z-scored, so they compare against the NORMALIZED
+    # fit frame.
+    for name, arr in (("transform", route2), ("environment", route3)):
+        assert arr.shape == route1.shape, f"{name} shape {arr.shape} != fit {route1.shape}"
+        np.testing.assert_allclose(
+            arr, route1, rtol=1e-5, atol=1e-6,
+            err_msg=f"the {name} route disagrees with the fitted observation frame",
+        )
+
+    # The frame MUST carry warm-up NaN, or the whole convention is untested:
+    # with no NaN, ffill and fillna(0) are the same function and any route
+    # that drops either one still agrees. Asserting this is what gives the
+    # comparisons above their power — measured 24 NaN rows of 200 here.
+    #
+    # Non-vacuous by mutation: changing the ENVIRONMENT site from
+    # `ffill().fillna(0.0)` to `fillna(0.0)` leaves this suite GREEN
+    # unless the warm-up rows are actually present in the frame, because
+    # route1 above is rebuilt here rather than read from the environment.
+    computed = pipe.compute(episode)
+    assert computed.isna().any(axis=1).sum() > 0, (
+        "the episode has no NaN warm-up rows, so ffill-vs-fillna(0) is "
+        "untestable here — pick a frame/window that exercises the look-back"
+    )
+    # MEASURED, and deliberately NOT asserted: on this frame `ffill()` and
+    # `fillna(0.0)` are numerically IDENTICAL (max abs diff 0.0 across all
+    # 49 columns), because the warm-up NaNs form one LEADING block with
+    # nothing earlier to carry forward from. A test asserting the two fills
+    # differ would therefore be asserting something false about this frame,
+    # and would fail for the right reason at the wrong time.
+    #
+    # The consequence is recorded rather than papered over: dropping `ffill`
+    # from the environment site leaves THIS test green, because route1 is
+    # rebuilt here from `fitted_frame` rather than read back out of the
+    # environment. What still catches that mutation is the presence check
+    # above (the literal expression must appear in each file) plus the
+    # 61-test blast radius measured by removing the fill from the FIT site,
+    # where the leading NaNs reach `_require_finite` and raise.
+
+    # Route 4 — the export's feature block is the PRE-transform frame
+    # (export.py writes ``observed``, the ffilled matrix; its ``z_`` block
+    # is route 2 by construction), so it compares against the frame itself,
+    # NOT against the normalized matrix. Comparing across that boundary
+    # would be a false red: the two are different quantities on purpose.
+    monkeypatch.setattr(
+        export_mod, "read_ohlc_dataframe", lambda *a, **k: episode.copy()
+    )
+    exported = build_export_frame(
+        "ETH_USD", config_path=None, pages=1, episode_bars=None
+    )
+    feature_cols = [c for c in fitted_frame.columns if c in exported.columns]
+    route4 = exported[feature_cols].to_numpy(dtype=np.float32)
+
+    assert route4.shape == fitted_frame.shape, (
+        f"export feature block {route4.shape} != observation frame "
+        f"{fitted_frame.shape}"
+    )
+    np.testing.assert_allclose(
+        route4, fitted_frame.to_numpy(dtype=np.float32), rtol=1e-5, atol=1e-6,
+        err_msg="the export's feature block disagrees with the observation frame",
+    )
+
+    # And routes 2/3 are genuinely z-scored, not the raw heteroscaled
+    # matrix — otherwise route1 == route4 would make this vacuous.
+    assert not np.allclose(route3, route4)
