@@ -946,6 +946,25 @@ inventory only.
   - proposal: teammates using the Playwright MCP leave `.playwright-mcp/` untracked in the repo
     root, which trips `just audit-closeout`'s clean-tree check. Now gitignored (89cbb12); any
     other tool with a repo-root scratch dir wants the same.
+  - **Plan-error record for this pass — three corrections, all caught before the gate closed.**
+    Keep these as the standing sample of what a decision doc can get wrong: (1) **§6.1's
+    hour-dedup DIRECTION was inverted** — it claimed the appended live record wins the overlap
+    hour, but `duplicated(keep="last")` runs *before* the hour-floor and the `groupby().last()`,
+    so the loser is dropped by file order and `last()` never sees it; following it literally
+    NaN'd 13 real `spread` readings. (2) **§7.3's width CONSTANTS were 3 low** (57/49 vs a
+    measured 52/60) because the fixture lacked `vwap`/`count`. (3) **F-9 and F-11 were both
+    measured wrong by both agents** — the builder's "non-finite identical in both arms" and the
+    integrator's "spread byte-identical both arms" each failed re-derivation (684 vs 697, and
+    0/721). None of the three was a typo; all three were plausible, sourced, and wrong.
+  - **RULE FOR THE NEXT ARCHITECT — added at the lead's direction after this pass.** Every
+    **constant** and every **direction** (which record wins, which key wins, which frame is
+    authoritative) stated in a decision document gets **re-derived from the artifact before a
+    gate is built on it**. Cite the artifact and the line for each, and mark which of the two
+    the architect *measured* versus *inferred from a fixture*. A figure measured on a synthetic
+    frame is a hypothesis, and a direction asserted from reading rather than from running is a
+    guess — this pass turned one into a NaN and another into a gate that fails on a correct
+    implementation. The builder and the integrator each caught one of these from the consumer's
+    own code; make that a requirement rather than luck.
 
 ## Matrix-harness pass (2026-10-01, follow-on to the Gap 1 pass)
 

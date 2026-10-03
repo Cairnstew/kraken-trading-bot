@@ -218,3 +218,85 @@ the committed one.
 
 All scratch (models, stores, exports, frames) under `/tmp/rev/`. Never
 committed. No real API key used — the funding endpoint is keyless.
+
+---
+
+## 8. NEXT PASS — ordered, and the first item is time-sensitive
+
+### 8.0 ⚑ A DECISION THE LEAD OWES — not for the team to pick up
+
+**`configs/default.yaml`'s `data_window.since` / `until: null`.** This is
+deliberately left at the top of the next checkpoint as an open decision, not
+a task. Every arm in this pass's integration test was **IN-SAMPLE** because
+those two are null on the shipped default, which is why the return and
+Sharpe rows could not be read as an effect. Related machinery that is
+already present but unused: `data.py:1298-1302` (`.. todo::` — honour
+`since`/`until` from config) and `data_window.eval_split`, which the
+matrix-harness pass showed is **inert unless the window is pinned**.
+
+Deciding it changes what "an effect" can even mean for this bot, so it
+should be settled deliberately, with the store's available depth in hand —
+**after** G4 — rather than picked up opportunistically.
+
+### 8.1 FIRST ACTION — start the G1 recorder, and do it before any feature work
+
+**The depth is unrecoverable by construction.** Kraken's order book is a
+live snapshot with **no historical endpoint** (Kraken's public archive is
+OHLCVT-only; Binance Vision `bookDepth` was falsified directly against the
+S3 bucket with `KeyCount=0` against a klines control that returned 2), and a
+`count=10` snapshot at *t* does not encode *t−1h*. **Every day without the
+recorder is data that cannot be recovered later.** This is the only
+time-critical item in the whole plan, which is why it goes first and why
+nothing else may precede it.
+
+**Keep the brief small.** The recorder is the deliverable; the feature is
+NOT. Do not touch `rl/features.py`, `_SIGNAL_COLUMNS`,
+`_SIGNAL_BUILDER_INPUT_COLUMNS`, or any observation width in this slice.
+
+1. **Record snapshots.** `kraken-python` already wraps the producer —
+   `manager.order_book(pair, count)` → `client.depth()` → keyless
+   `/0/public/Depth`, plus the keyless `book` channel on `ws.kraken.com/v2`.
+   **No new dependency**: `cryptofeed` is AGPL-3.0-or-later and needs
+   Python ≥3.13; `ccxt` is MIT but unnecessary. Do not build a
+   `kraken-order-book` sibling that re-wraps an existing sibling — the
+   house-style answer is a small recorder inside the funding/producer
+   family, following the "log, not state" convention the JSONL seam
+   already uses.
+2. **Append-only, with your own timestamps.** A book snapshot carries **no
+   timestamp of its own** — each level's timestamp is that order's placement
+   time. The recorder must stamp its own clock, and must **record the depth
+   used**, because depth is not comparable across a `count` change.
+3. **Include a gap counter**, given what F-6 showed about silent holes: a
+   run that stops for a week and appends happily afterwards is
+   indistinguishable from a run that never stopped. Report expected-vs-actual
+   intervals alongside the data, and make a hole visible in the artifact
+   rather than only in stdout.
+4. **Do not consume the recorded data in this pass.** No `_SIGNAL_COLUMNS`
+   change, no observation-width change, no merge into the observation. The
+   recorder runs, accumulates, and reports its gap count. Wiring the feature
+   is a later slice, once there is history worth wiring — which is also why
+   it must not be attempted before the recorder has been running for a while.
+
+### 8.2 Then, in order
+
+- **G4 — deepen the price frame.** Now formally recorded as **F-18**: funding
+  is 366 d deep while the price frame is 721 bars (~30 days), so funding has
+  ~11× more depth than the episode it is merged into. Funding depth cannot
+  buy episode length until the price side is deepened. G1 and G4 are coupled
+  for the same reason — recorder depth is bounded by whatever episode length
+  the store eventually allows.
+- **G3 — retry / backoff / rate-limit handling.** Still zero. Re-read F-15's
+  note: `tools/width_check.py` fingerprints a raw parquet at 49 where shipped
+  states compose 52/60 (logged proposal, deliberately unchanged, because
+  auto-calling the derived step would invalidate the committed CAND-3a
+  fingerprints).
+- **G5 / G6 / G7** — untouched; G6 in particular means the default run is
+  still frictionless, so every in-sample number in this file is flattered.
+
+### 8.3 Carry into the next architect
+
+**Re-derive every constant and every direction from the artifact before a
+gate is built on it.** This pass produced three sourced, plausible, wrong
+claims — an inverted dedup direction, width constants 3 low, and two
+findings both agents measured wrong. Mark each figure in a decision as
+*measured* or *inferred from a fixture*.

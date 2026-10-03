@@ -93,13 +93,27 @@ scratch config differing in exactly one key (`funding_features_file`).
 | obs features (trained) | **60** | **60** |
 | **bars replayed** | **697 / 721** | **697 / 721** |
 | **trades taken** | **546** | **558** |
-| total return | **7.52 %** | **7.10 %** |
-| Sharpe | 0.987 | 0.827 |
-| max drawdown | 5.58 % | 6.57 % |
+| total return † | 7.52 % | 7.10 % |
+| Sharpe † | 0.987 | 0.827 |
+| max drawdown † | 5.58 % | 6.57 % |
 | buy & hold | 6.44 % | 6.44 % |
-| excess return | 1.08 % | 0.66 % |
-| final equity | 10,751.58 | 10,709.55 |
+| excess return † | 1.08 % | 0.66 % |
+| final equity † | 10,751.58 | 10,709.55 |
 | evaluation | IN-SAMPLE | IN-SAMPLE |
+
+**† READ THE THREE ROWS MARKED † AS A WIDTH AND PLUMBING CHECK, NOT AS AN
+EFFECT.** They are **one run per arm**, on a 721-bar in-sample window, with
+PPO's own run-to-run stochasticity unquantified here. The 0.42-pt return
+difference and the 0.827 → 0.987 Sharpe difference are **not evidence that
+the backfill improved results**, and must never be quoted as if they were.
+A single paired run cannot separate a real effect from seed noise, and
+this repo's own `model-matrix` skill exists precisely because within-config
+seed spread routinely exceeds the between-config effect being measured.
+What these rows establish is narrower and sufficient for the gate: the run
+**completes at unchanged width, replays the same 697 bars, takes a normal
+number of trades, and does not error** — i.e. the channel is plumbed and
+the observation is intact. The *feature vectors* are what must match, and
+they do (§6).
 
 **Equivalence gate: PASS.** |Δ return| = **0.42 pts**, same sign, against
 the ~5-pt band. Not gated on exact equality — PPO is stochastic across
@@ -520,12 +534,45 @@ change every historical fingerprint).
   60**, with fitted STD **×6.941**.
 - Magnitude clause satisfied with numbers, not with "no error":
   **697/721 bars replayed** and **546 trades** (baseline 697 and 558).
-- Equivalence gate met: **|Δ return| 0.42 pts**, same sign, inside the
-  ~5-pt band.
+- Equivalence gate met on the return figure as a **plumbing check only**:
+  **|Δ return| 0.42 pts**, same sign, inside the ~5-pt band. One run per
+  arm, in-sample — **not** an effect measurement (§2, † rows).
 - **Both OPEN findings re-derived and resolved** (F-9 → frame mismatch,
   exact arithmetic; F-11 → one arm, two frames, with the right-edge
   mechanism), plus F-8 and F-10 confirmed and pinned to measured values.
 - Coverage and persistence proven from the **production seeding path**.
+
+### 9.1 What was recovered, and what was given up — stated together
+
+**This pass recovers 1 of 6 columns, and it recovers the SAME series the live
+snapshot already read.** The evidence is an exact-value match, not a
+correlation: the checked-in one-line file's `funding_rate` of
+`0.02527185133308243` matches **exactly one** of the 8,791 records Kraken's
+`/historical-funding-rates` returns, at the checked-in hour. So this is not a
+proxy series or a cross-venue substitute — it is the identical series,
+recovered 366 days deep.
+
+| column | before | after |
+|---|---|---|
+| `funding_rate` | 13/721 bars, **2** distinct values, 98.2 % literal `0.0` | **721/721 bars, 721 distinct** — std ×6.94 |
+| `basis` | 13/721 real | **13/721 — unchanged** |
+| `open_interest` | 13/721 real | **13/721 — unchanged** |
+| `funding_rate_prediction` | 13/721 real | **13/721 — unchanged** |
+| `vol24h` | 13/721 real | **13/721 — unchanged** |
+| `spread` | 13/721 real | **13/721 — unchanged** |
+
+The gain and the loss belong in one table because they are one change. The
+five columns that keep their zero-fill are the honest cost of this pass: they
+now read **constant zero** rather than "13 real readings then zero", so the
+degenerate-STD count rose **3 → 10** and their absence is no longer
+distinguishable from a genuine reading of zero. Nothing about the backfill
+*removed* those readings — Kraken publishes no history for them at any cost —
+but the failure mode moved from "sparse" to "constant", which is a different
+kind of silent.
+
+**Do not let the first row carry this section on its own.** `funding_rate`
+going from 2 distinct values to 721 is the headline; the five rows beneath it
+are what the headline cost.
 
 Stated plainly, and not as a footnote: **this pass recovers 1 of 6
 columns**, 5 columns lose the 13 readings the single live snapshot gave
