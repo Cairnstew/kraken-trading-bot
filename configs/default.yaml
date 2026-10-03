@@ -234,6 +234,38 @@ signal_require_ticker: true
 # a per-model `config.yaml` or in `configs/deep-history.example.yaml`,
 # which is why those files carry the header explaining how to seed first.
 #
+# ...AND WHY THAT IS NOT A CONTRADICTION WITH THE THREE NON-NULL SIGNAL
+# KEYS ABOVE, which have exactly the same fresh-clone property: `signals/`
+# is gitignored, so all three raise `SignalFileNotFoundError` on a clone
+# whose timers have never fired.  The two cases ship differently because
+# of TWO differences, and the rule is one line:
+#
+#   SHIP A KEY NON-NULL ONLY IF THE REPO ITSELF CAN PRODUCE THE FILE.
+#
+# 1. WHO CAN PRODUCE IT.  `signals/*.jsonl` is written by recipes this
+#    repo ships — `just news-pull`, `just funding-backfill && just
+#    funding-pull`, `just social-pull` — plus three linkable user timers,
+#    and the funding recipe is keyless, so a fresh clone can populate all
+#    three in three commands.  `~/Projects/kraken-market-data/store` cannot
+#    be conjured by anything here: it needs a sibling clone plus a
+#    multi-minute seed, which is precisely the "a store that clone does
+#    not have" clause above.
+# 2. THE FAILURE MODES ARE NOT SYMMETRIC.  A mis-set signal key raises
+#    loudly, naming the key, the value as written and a copy-pasteable
+#    producer command, BEFORE any artifact exists.  A mis-set store key
+#    computes WRONG NUMBERS SILENTLY — the paragraph below measures 158
+#    missing bars and a 39-hour hole at the seed seam, across which
+#    `return_1` reports a 39-hour return as though it were 1-hour.  Only
+#    the silent one has to default to the safe side.
+#
+# So: the signal keys ship ON (a fresh clone gets a loud, fixable refusal
+# naming its own remedy); this one ships OFF (a fresh clone gets a clean
+# run on the live fetch).  Both are the correct default for their own key,
+# and the difference is the rule above, not an oversight.
+# `tests/test_three_channel_seam.py::
+#  test_the_store_key_and_the_signal_keys_ship_differently_on_purpose`
+# pins the shipped values, so flipping either one has to come back here.
+#
 # KNOWN LIMITATION OF A SEEDED STORE — read before trusting a store-arm
 # number. The store reader globs the month files and concatenates, so a
 # hole in the series is invisible downstream: features are computed on BAR
