@@ -72,16 +72,29 @@ _TRADE_COUNT_ZSCORE_WINDOW = 20
 # look-back window (max window + a small return/rolling cushion).
 _WARMUP_PAD = 6
 
-# Venue label for a read served by the local store.  "Kraken live REST" is
-# what an UNSEEDED store means: whatever is in it was appended by this
-# same live leg, so the bars are Kraken's.  A store seeded by the sibling
-# `kraken-deep-history` is Binance-*USDT spot, i.e. a DIFFERENT venue —
-# its basis against Kraken has been measured at +5.41 bp of level shift
-# against a 58.30 bp hourly sigma, which z-scoring removes but which must
-# still be LABELLED rather than silently assumed away.  The config key
-# `market_data_store_venue` overrides the default so the artifact's own
-# config.yaml states which venue the bars came from.
-DEFAULT_STORE_VENUE = "kraken-live-rest"
+# Venue label for a read served by the local store.  Two real venues reach
+# this seam and nothing else in the run log tells them apart: a store this
+# run appended to over live REST holds Kraken's own bars, and a store the
+# sibling `kraken-deep-history` seeded holds Binance-*USDT spot, whose
+# basis against Kraken has been measured at +5.41 bp of level shift against
+# a 58.30 bp hourly sigma — harmless for z-scored features, but it must be
+# LABELLED, because a store-vs-live comparison then measures history AND
+# venue together and can only be described that way.
+#
+# WHY THE DEFAULT IS "unknown" AND NOT "kraken-live-rest".  Asserting
+# "kraken-live-rest" when nobody said so was the G-B(i) defect: paper trade
+# omitted the `market_data_store_venue` keyword, so the one leg that places
+# orders logged Kraken's venue for a store the seeder filled from Binance.
+# The store cannot settle it either — `_meta.json` holds only `schema` and
+# `cursors` (`store.py:491-502`) and the Binance seeder DOES write cursors,
+# so "no cursor => not live" is refuted; a seeded store and a live-appended
+# store are indistinguishable from inside.  So the default now claims only
+# what is true — nothing established the venue — and the read warns LOUDLY
+# (naming the store root and both candidates) instead of guessing.  Set the
+# `market_data_store_venue` config key and the guess disappears; it is
+# recorded beside `n_features`/`n_bars` in the artifact's config.yaml.
+DEFAULT_STORE_VENUE = "unknown"
+LIVE_STORE_VENUE = "kraken-live-rest"
 SEEDED_STORE_VENUE = "binance-spot-archive-seeded"
 
 # How to fill an empty store, in the words the error has to use.  Kept as a
@@ -1303,11 +1316,13 @@ def read_ohlc_dataframe(
             :func:`_resolve_store`).
         market_data_store_venue: Provenance label for the store's bars
             (the ``market_data_store_venue`` config key), logged once on
-            the store leg.  Defaults to :data:`DEFAULT_STORE_VENUE`
-            ("kraken-live-rest"), which is what an UNSEEDED store means:
-            the bars in it were appended by this same live leg.  A store
-            seeded by ``kraken-deep-history`` is a different venue and
-            must say so — see :data:`SEEDED_STORE_VENUE`.
+            the store leg, and WARNED about when absent.  Unset resolves to
+            :data:`DEFAULT_STORE_VENUE` ("unknown") because nothing in the
+            store itself can establish the venue — a store this run
+            appended to holds Kraken's own bars (:data:`LIVE_STORE_VENUE`),
+            and one seeded by ``kraken-deep-history`` holds Binance-*USDT
+            spot (:data:`SEEDED_STORE_VENUE`) — so the honest unstated value
+            is "unknown" plus a warning, never a guess.
         market_data_source: Fetch source for the upsert leg; defaults to
             ``manager``.  Anything exposing ``ohlc(pair, interval, since)
             -> (candles, last)`` works (a live ``KrakenManager``, the
@@ -1367,18 +1382,40 @@ def read_ohlc_dataframe(
 
     # VENUE PROVENANCE, once per store leg.  A store-backed frame can
     # come from two different venues and nothing else in the run log
-    # distinguishes them: an unseeded store holds exactly what this live
-    # leg appended (Kraken), a `kraken-deep-history` seed holds
+    # distinguishes them: a store this leg appended to over live REST
+    # holds Kraken's own bars, a `kraken-deep-history` seed holds
     # Binance-*USDT spot.  The basis between them has been measured at
     # +5.41 bp of level shift against a 58.30 bp hourly sigma -- harmless
     # for z-scored features, but it must be LABELLED, because a
     # store-vs-live comparison therefore measures history AND venue
-    # together and can only be described that way.
+    # together and can only be described that way.  So the label is
+    # logged; and because the store itself cannot establish it (see
+    # `DEFAULT_STORE_VENUE`), an unstated one warns rather than guesses.
     venue = market_data_store_venue or DEFAULT_STORE_VENUE
     if isinstance(market_data_store, (str, os.PathLike)):
         where = str(_resolve_config_path(market_data_store))
     else:
         where = f"<{type(market_data_store).__name__}>"
+    if venue == DEFAULT_STORE_VENUE:
+        # Loud, specific, and actionable: the store root, the two labels
+        # it could honestly carry, and the one key that settles it.  This
+        # is per read, so a paper-tick loop repeats it once a minute --
+        # deliberately, at the same cadence as the INFO line below it.
+        _LOGGER.warning(
+            "Store at %s was read with NO venue established: `market_data"
+            "_store_venue` is unset, so these bars are labelled %r and "
+            "their provenance is unestablished. A store this run appended "
+            "to is %r (Kraken's own REST bars); a store seeded by "
+            "`kraken-deep-history` is %r (Binance-*USDT spot, ~+5.41 bp of "
+            "level shift against a 58.30 bp hourly sigma). The store cannot "
+            "tell you which -- set the `market_data_store_venue` config key "
+            "to the truth. Until then a store-vs-live comparison measures "
+            "history AND venue together.",
+            where,
+            DEFAULT_STORE_VENUE,
+            LIVE_STORE_VENUE,
+            SEEDED_STORE_VENUE,
+        )
     _LOGGER.info(
         "Reading %d-minute %s bars from the market-data store at %s "
         "(venue: %s)",

@@ -306,6 +306,15 @@ class PaperTrader:
             signal_max_age_hours=self.config.get("signal_max_age_hours"),
             signal_require_ticker=self.config.get("signal_require_ticker", True),
             market_data_store=self.config.get("market_data_store"),
+            # Venue provenance, from the artifact's own config — the same
+            # `record.config` that supplies `market_data_store` one line
+            # up.  Without it the read falls back to
+            # `data.DEFAULT_STORE_VENUE`, which labels a store the
+            # `kraken-deep-history` seeder filled from Binance-*USDT spot
+            # as Kraken's own.  `tests/test_rl_signal_config_wiring.py::
+            # test_every_read_ohlc_dataframe_call_site_forwards_venue`
+            # is what keeps this line from being dropped again.
+            market_data_store_venue=self.config.get("market_data_store_venue"),
         )
 
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:

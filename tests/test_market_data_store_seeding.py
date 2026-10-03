@@ -23,6 +23,7 @@ training, no writes outside ``tmp_path``.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import sys
 import types
@@ -48,7 +49,11 @@ from kraken_trading_bot.rl import (  # noqa: E402
     resolve_data_window,
     training_frame,
 )
-from kraken_trading_bot.rl.data import _resolve_store  # noqa: E402
+from kraken_trading_bot.rl.data import (  # noqa: E402
+    LIVE_STORE_VENUE,
+    SEEDED_STORE_VENUE,
+    _resolve_store,
+)
 from tools.store_guard import (  # noqa: E402
     REQUIRED_STORE_MODE,
     StoreModeError,
@@ -497,3 +502,107 @@ def test_example_config_pins_a_window_the_seeded_store_can_actually_serve():
     # The seeder's earliest mapped month, to the month before the pin.
     assert window.since >= pd.Timestamp("2018-01-01", tz="UTC")
     assert window.until <= pd.Timestamp("2026-10-01", tz="UTC")
+
+class _StoreLegStore:
+    """Duck-typed store serving one canned frame; the read contract only."""
+
+    def __init__(self, frame: pd.DataFrame) -> None:
+        self._frame = frame
+        self.upserts: list[object] = []
+
+    def upsert(self, pair, interval, candles):
+        self.upserts.extend(candles)
+        return len(candles)
+
+    def read(self, pair, interval, since=None, until=None):
+        return self._frame.copy()
+
+
+class _NoCandleSource:
+    """Kraken-compatible source that yields nothing: a store-only read."""
+
+    def ohlc(self, pair, interval=60, since=None):
+        return [], 0
+
+
+def _read_store_leg(**kwargs) -> pd.DataFrame:
+    """One store-leg read with a baked frame, offline and credential-free."""
+    return read_ohlc_dataframe(
+        "ETH/USD",
+        60,
+        pages=1,
+        manager=_NoCandleSource(),
+        market_data_store=_StoreLegStore(_hourly(48)),
+        **kwargs,
+    )
+
+
+def test_shipped_default_venue_makes_no_claim_about_the_bars():
+    """The default must be the "nobody said" label, not a venue.
+
+    Pinning this at the config level is deliberate: the old shipped default
+    was ``kraken-live-rest``, a claim no key had established, and the four
+    consumers agreed with it only because they all read it.  Putting a
+    venue back here has to be a change somebody makes on purpose, in this
+    test, with the store-vs-live comparison in mind.
+    """
+    assert DEFAULT_STORE_VENUE == "unknown"
+    assert _load(DEFAULT_CONFIG)["market_data_store_venue"] == "unknown"
+
+
+def test_store_leg_with_no_venue_labels_unknown_and_warns_loudly(caplog):
+    """Unstated venue -> an "unknown" label and a warning that names the fix.
+
+    This is the behaviour half of G-B(i).  ``paper_trade`` omitted
+    ``market_data_store_venue``, so the read fell back to
+    ``DEFAULT_STORE_VENUE`` and logged ``kraken-live-rest`` for a store the
+    seeder had filled with Binance-*USDT spot -- silently, on the one leg
+    that places orders.  The store cannot settle the question itself
+    (``_meta.json`` carries only ``schema`` and ``cursors``, and the Binance
+    seeder writes cursors too), so a fallback that guesses cannot be made
+    correct; it can only be made loud.
+
+    Asserted on the log, not on a return value, because the label exists
+    only there -- which is exactly why it needed a test.
+    """
+    with caplog.at_level(logging.INFO, logger="kraken_trading_bot.rl.data"):
+        df = _read_store_leg()
+
+    # The read itself still worked: this is a provenance label, not a gate.
+    assert len(df) == 48
+
+    # The label says what is true, and specifically NOT kraken-live-rest.
+    assert f"(venue: {DEFAULT_STORE_VENUE})" in caplog.text
+    assert f"(venue: {LIVE_STORE_VENUE})" not in caplog.text
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    venue_warnings = [m for m in warnings if "market_data_store_venue" in m]
+    assert venue_warnings, (
+        "no warning about the unestablished venue; got "
+        + repr(warnings)
+    )
+    said = venue_warnings[0]
+    # Names where the bars came from, both candidates, and the one key
+    # that settles it -- otherwise it is a shrug with a severity level.
+    assert "_StoreLegStore" in said
+    assert LIVE_STORE_VENUE in said
+    assert SEEDED_STORE_VENUE in said
+    assert DEFAULT_STORE_VENUE in said
+
+
+def test_store_leg_with_a_venue_states_it_and_warns_about_nothing(caplog):
+    """The positive control: a stated venue is logged and not second-guessed.
+
+    Without this, "a warning appeared" would be satisfied by a module that
+    warns unconditionally -- the control is what makes the warning mean
+    "nobody told us".
+    """
+    with caplog.at_level(logging.INFO, logger="kraken_trading_bot.rl.data"):
+        _read_store_leg(market_data_store_venue=SEEDED_STORE_VENUE)
+
+    assert f"(venue: {SEEDED_STORE_VENUE})" in caplog.text
+    assert not [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "market_data_store_venue" in r.getMessage()
+    ]
