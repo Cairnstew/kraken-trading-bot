@@ -161,6 +161,37 @@ def parse_timestamp(value: Any) -> datetime | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+#: sha256 of the two RAW LINES of ``signals/eth_usd_orderbook.jsonl`` that were
+#: **seeded** — copied byte-for-byte out of the aborted recorder worktree via
+#: ``/tmp/g1-rescued/`` on 2026-10-03, not appended by a run in this checkout.
+#:
+#: They are real Kraken readings (real prices, the recorder's own clock, full
+#: 100-level books) but they are NOT on the hourly cadence and NOT unattended
+#: fires, so they are excluded from the depth count.  The log is append-only and
+#: rewriting it to tag them is forbidden, and a future consumer reading the file
+#: will never see EVIDENCE §6 — so the exclusion is pinned BY HASH here, where
+#: the code that does the excluding can enforce it.
+#:
+#: Hashing the raw line (not the parsed record) means the pin identifies the exact
+#: bytes on disk: a re-serialisation that changed a float, a key order, or a
+#: timestamp would not match, which is the point — it must be the same reading.
+SEEDED_RECORD_SHA256: frozenset[str] = frozenset(
+    {
+        # 2026-10-03T19:10:45.752567+00:00  bid=2683.52000
+        "392e06b46fc9597cc4ed30220e2a5217b4fc82654336cd53bdebaa751099ff0f",
+        # 2026-10-03T19:12:55.755671+00:00  bid=2683.51000
+        "7d7b62cc62390fcbeb24ce65a09ec7ce02e2e5375f9b94aacf498f6a6f4aaacd",
+    }
+)
+
+#: Target depth N, counted in DISTINCT HOURLY BUCKETS holding a valid record —
+#: never in rows.  Counting rows reaches N early the moment two records share an
+#: hour, which is exactly what happened here: records #3 (19:37) and #4 (19:42)
+#: are five minutes apart in the same bucket, so 7 rows cover only 4 hours.
+#: Re-derived in RUN-LOG §22.8; 365 days at one snapshot per hour.
+TARGET_DEPTH_HOURS: int = 8760
+
+
 @dataclass(frozen=True, slots=True)
 class Interval:
     """One consecutive pair of records, classified against the expectation."""
@@ -205,15 +236,29 @@ class GapReport:
     first_recorded_at: str | None
     last_recorded_at: str | None
     observed_span_seconds: float
+    #: DISTINCT floored hours holding at least one record.  This — not
+    #: ``n_records`` — is the unit depth N is counted in, so two records in one
+    #: hour (the bring-up pair, or a double-firing timer) cannot inflate it.
+    n_hours_covered: int = 0
+    #: Rows present but excluded by :data:`SEEDED_RECORD_SHA256` — real readings
+    #: that are not on the cadence, so not part of the depth count.
+    n_seeded_excluded: int = 0
     #: The GAP-classified intervals, verbatim — same objects as ``intervals``.
-    #: Not :class:`Hole` (that dataclass is unused); the annotation said so until now.
     holes: tuple[Interval, ...] = ()
     intervals: tuple[Interval, ...] = ()
 
     @property
     def ok(self) -> bool:
-        """True when no interval exceeded ``expected * gap_factor``."""
-        return self.n_gaps == 0
+        """True when no interval exceeded ``expected * gap_factor`` AND the log
+        is not running a sustained double cadence.
+
+        Gaps alone are not sufficient.  A double timer produces two records per
+        hour, ~1800 s apart: no interval is long, so ``n_gaps == 0``, and the
+        old verdict read ``GREEN`` on a misconfigured recorder.  ``>= 2`` SHORT
+        intervals is the sustained-pattern threshold — a single SHORT is the
+        expected ``Persistent=true`` catch-up at enablement and stays green.
+        """
+        return self.n_gaps == 0 and self.n_short_intervals < 2
 
     @property
     def expected_span_seconds(self) -> float:
@@ -248,8 +293,14 @@ class GapReport:
 
     @property
     def coverage_ratio(self) -> float | None:
-        """Fraction of the hourly slots the log's own span covers that hold a
+        """Fraction of the hourly buckets the log's span covers that hold a
         record.
+
+        Counted in **distinct floored hours**, not rows.  A row is not a unit of
+        depth: records #3 (19:37) and #4 (19:42) sit five minutes apart in the
+        same hour, so counting rows would reach a target N early and would let a
+        double-firing timer inflate progress.  Two records in one hour cover that
+        hour once.
 
         ``None`` when there are not yet two records, because "coverage" of a
         single record is not a number, and a fabricated ``0.0`` would read as
@@ -260,14 +311,33 @@ class GapReport:
         five-hour hole** — the hole made the file longer, and the clamp hid it.
         Measured on that revision: 4 records spanning 8 hours read as
         ``coverage_ratio == 1.0`` with ``n_gaps == 1``.  Hence the observed-span
-        denominator.
+        denominator, and hence hours rather than rows.
         """
-        if self.n_records < 2:
+        hours = self.hours_in_span
+        if hours <= 0 or self.n_records < 2:
+            # One record spans exactly one hour, so the hour-based denominator
+            # would read 1/1 = 100% — a green coverage claim off a single
+            # reading.  Coverage of one record is not a number.
             return None
-        slots = self.expected_slots
-        if slots <= 0:
-            return None
-        return min(1.0, self.n_records / slots)
+        return min(1.0, self.n_hours_covered / hours)
+
+    @property
+    def hours_in_span(self) -> int:
+        """Distinct hourly buckets between the first and last record inclusive.
+
+        The denominator coverage is measured against.  Hour-based rather than
+        record-based for the same reason :attr:`coverage_ratio` is.
+        """
+        first = parse_timestamp(self.first_recorded_at)
+        last = parse_timestamp(self.last_recorded_at)
+        if first is None or last is None:
+            return 0
+        return int((floor_hour(last) - floor_hour(first)).total_seconds() // 3600) + 1
+
+    @property
+    def depth_fraction(self) -> float:
+        """Progress toward :data:`TARGET_DEPTH_HOURS`, in hours covered."""
+        return self.n_hours_covered / TARGET_DEPTH_HOURS if TARGET_DEPTH_HOURS else 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -281,9 +351,14 @@ class GapReport:
             "longest_gap_seconds": round(self.longest_gap_seconds, 3),
             "first_recorded_at": self.first_recorded_at,
             "last_recorded_at": self.last_recorded_at,
-            "observed_span_seconds": round(self.observed_span_seconds, 3),
-            "expected_span_seconds": round(self.expected_span_seconds, 3),
-            "expected_slots": self.expected_slots,
+"observed_span_seconds": round(self.observed_span_seconds, 3),
+                "n_hours_covered": self.n_hours_covered,
+                "hours_in_span": self.hours_in_span,
+                "n_seeded_excluded": self.n_seeded_excluded,
+                "target_depth_hours": TARGET_DEPTH_HOURS,
+                "depth_fraction": round(self.depth_fraction, 9),
+                "expected_span_seconds": round(self.expected_span_seconds, 3),
+                "expected_slots": self.expected_slots,
             "coverage_ratio": (
                 None if self.coverage_ratio is None else round(self.coverage_ratio, 6)
             ),
@@ -388,6 +463,7 @@ def scan_gaps(
         first_recorded_at=ordered[0].isoformat() if ordered else None,
         last_recorded_at=ordered[-1].isoformat() if ordered else None,
         observed_span_seconds=span,
+        n_hours_covered=len({floor_hour(s) for s in ordered}),
         holes=holes,
         intervals=intervals,
     )
@@ -399,12 +475,69 @@ def scan_gap_file(
     expected_interval_seconds: float = DEFAULT_EXPECTED_INTERVAL_SECONDS,
     gap_factor: float = DEFAULT_GAP_FACTOR,
 ) -> GapReport:
-    """Scan a recorded JSONL file's timestamps.  A missing file is zero records."""
-    return scan_gaps(
-        read_recorded_at(path),
+    """Scan a recorded JSONL file's timestamps.  A missing file is zero records.
+
+    Seeded rows are counted and reported but **excluded from the depth count**.
+    They are real readings that are not on the cadence (see
+    :data:`SEEDED_RECORD_SHA256`), and the exclusion has to happen HERE, where
+    the file is read — a consumer opening the raw file will not know.
+    """
+    p = Path(path)
+    raw = read_recorded_at(p)
+    report = scan_gaps(
+        raw,
         expected_interval_seconds=expected_interval_seconds,
         gap_factor=gap_factor,
     )
+    seeded = seeded_record_hashes(p)
+    if not seeded:
+        return report
+    seeded_stamps = {
+        ts for ts, h in _stamps_with_hashes(p) if h in SEEDED_RECORD_SHA256
+    }
+    kept = [ts for ts in raw if ts not in seeded_stamps]
+    # Intervals are re-derived over the kept rows only, so a seeded row cannot
+    # manufacture a SHORT interval or a hole either.
+    rescanned = scan_gaps(
+        kept,
+        expected_interval_seconds=expected_interval_seconds,
+        gap_factor=gap_factor,
+    )
+    from dataclasses import replace
+
+    return replace(
+        rescanned,
+        n_records=len(raw),
+        n_seeded_excluded=len(raw) - len(kept),
+    )
+
+
+def _stamps_with_hashes(path: str | Path) -> list[tuple[datetime, str]]:
+    """``(recorded_at, sha256-of-raw-line)`` for every parseable line."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    import hashlib
+    import json as _json
+
+    out: list[tuple[datetime, str]] = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = _json.loads(line)
+            ts = parse_timestamp(rec.get("recorded_at"))
+        except ValueError:
+            continue
+        if ts is not None:
+            out.append((ts, hashlib.sha256(line.encode("utf-8")).hexdigest()))
+    return out
+
+
+def seeded_record_hashes(path: str | Path) -> set[str]:
+    """The :data:`SEEDED_RECORD_SHA256` pins actually present in ``path``."""
+    present = {h for _, h in _stamps_with_hashes(path)}
+    return present & SEEDED_RECORD_SHA256
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -699,18 +832,30 @@ def format_report(
     lines.append(
         f"  records       : {report.n_records}   intervals: {report.n_intervals}"
     )
+    if report.n_seeded_excluded:
+        lines.append(
+            f"                 ({report.n_seeded_excluded} SEEDED record(s) excluded —"
+            " real readings, not on the cadence; RUN-LOG 22.1/22.8)"
+        )
     lines.append(
         f"  first         : {report.first_recorded_at or '(none)'}"
     )
     lines.append(
         f"  last          : {report.last_recorded_at or '(none)'}"
     )
+    lines.append(
+        f"  hours covered : {report.n_hours_covered} distinct hour(s) of"
+        f" {report.hours_in_span} in span"
+    )
+    lines.append(
+        f"  depth N       : {report.n_hours_covered} / {TARGET_DEPTH_HOURS} hours"
+        f" ({report.depth_fraction * 100:.3f}%)  <- COUNTED IN HOURS, not rows"
+    )
     coverage = report.coverage_ratio
     lines.append(
         f"  span          : {report.observed_span_seconds:.0f}s observed"
         + (
-            f"   slots the span covers: {report.expected_slots}"
-            f"   records: {report.n_records}"
+            f"   hours in span: {report.hours_in_span}"
             f"   coverage: {coverage * 100:.1f}%"
             if coverage is not None
             else ""
@@ -736,24 +881,32 @@ def format_report(
         "                   counted separately from gaps, and NEITHER a duplicate-record "
         "count NOR a depth shortfall"
     )
-    if report.n_short_intervals:
-        # A SHORT interval is benign exactly once in a bring-up burst and is a
-        # SYMPTOM afterwards: two independent timers (the NixOS system unit and
-        # the `just depth-timer` user unit) each firing hourly, or one timer
-        # misfiring, both show up ONLY here.  The recipe guard stops the second
-        # timer being installed after the first; it cannot stop the reverse
-        # order, so this line is the detection for that case.
+    if report.n_short_intervals >= 2:
+        # ONE short interval is a legitimate, documented catch-up:
+        # `Persistent=true` fires immediately when the timer is enabled and the
+        # slot was missed, which on this very log produced 19:37:04 -> 19:42:32
+        # (327 s apart) from a SINGLE timer.  A second timer does not produce one
+        # short interval, it produces a SUSTAINED pattern — two records every
+        # hour, ~1800 s apart, repeating — so the hint waits for repetition
+        # rather than firing on the catch-up every host sees once at enablement.
         lines.append(
-            f"                   >> {report.n_short_intervals} SHORT interval(s) AFTER "
-            "the first record is not benign: if these are not your own manual"
+            f"                   >> {report.n_short_intervals} SHORT interval(s) is a"
+            " PATTERN, not a catch-up. If these are not your own manual pulls,"
         )
         lines.append(
-            "                      pulls, CHECK FOR A SECOND TIMER — `systemctl "
+            "                      CHECK FOR A SECOND TIMER — `systemctl "
             "is-enabled kraken-trading-bot-order-book.timer`"
         )
         lines.append(
             "                      (system) vs `systemctl --user is-active "
-            "kraken-trading-bot-order-book.timer` (user). Both fire hourly."
+            "kraken-trading-bot-order-book.timer` (user). Both fire hourly;"
+        )
+        lines.append(
+            "                      two timers put two records in one hour, ~1800s apart.")
+    elif report.n_short_intervals == 1:
+        lines.append(
+            "                   (one SHORT interval is the expected `Persistent=true`"
+            " catch-up at enablement; see RUN-LOG 22.9)"
         )
     lines.append(
         f"  GAPS          : {report.n_gaps}   "
@@ -807,6 +960,27 @@ def format_report(
             "backfilled by anything."
         )
         lines.append("  VERDICT: RED")
+    elif report.n_short_intervals >= 2:
+        # A sustained SHORT pattern is a DEFECT, so it must not sit under a GREEN
+        # verdict.  Measured: a synthetic double-timer log (12 records, 6 hours,
+        # 1800s apart) reported `GAPS 0` and therefore "GREEN — no interval
+        # exceeded the expectation", while the recorder was running at double
+        # cadence.  Gaps measure LOSS; a double timer is the opposite fault and
+        # the old verdict was blind to it.  The hours-based depth count already
+        # resists the inflation (12 rows -> 6 hours), but the verdict has to say
+        # so too, or a reader trusts GREEN.
+        lines.append(
+            f"  VERDICT: RED — {report.n_short_intervals} SHORT intervals is a"
+            " sustained pattern, not loss."
+        )
+        lines.append(
+            "  No hour is missing, but the recorder is not on its cadence: the"
+            " likely cause is a SECOND TIMER."
+        )
+        lines.append(
+            "  Two timers put two records in every hour and duplicate the depth"
+            " series' cadence."
+        )
     else:
         lines.append("  VERDICT: GREEN (no interval exceeded the expectation)")
     return "\n".join(lines)

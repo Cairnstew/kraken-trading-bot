@@ -1495,3 +1495,164 @@ host's storage still does.** The lead's stated concern is **still open** — the
 left the disk, not the machine. Recorded that way rather than letting "verified restore" imply
 more than it covers, and noted in EVIDENCE §9 that the recipe's "off-host copy" wording should
 be read as *off-disk-or-remote, whichever you point it at*.
+
+## 23. N counted in hours, the seeded rows pinned, and the off-machine copy DONE
+
+### 23.1 Off-machine: OPEN → DONE, and what "done" was required to mean
+
+The lead's correction stands and was applied first: `/mnt/media` is a different **disk** in
+the same **machine**, so it covers one failure mode and leaves the stated one — machine
+loss, theft, or loss of this host's storage — uncovered. It stays as a second local copy.
+
+**A target that exists today.** All six tailnet peers are **offline** (`laptop` 2d, `server`
+30d, `alarm` 90d), so the Tailscale/rsync route exists only on paper and no restore can be
+verified against it. `ssh git@github.com` has no key on this host, but HTTPS credentials work,
+so the off-machine target is a **private git remote**: `Cairnstew/kraken-depth-archive`
+(`visibility=PRIVATE`, `private=true`).
+
+**"Done" was defined before doing it:** a restore read back from the off-machine copy and
+checked byte-identical, reported with output. Not "the push succeeded".
+
+```
+$ just depth-backup-git
+  weekly incremental for 2026-W40: 7 new record(s)
+  pushed -> https://github.com/Cairnstew/kraken-depth-archive.git
+  raw_sha256=a7b540d1df792f9a86eebfd8fc9c3f551e6e1adb7d261d316d70319cf62d7038 records=7 hours=4 bytes=51702
+
+$ just depth-verify-offmachine
+  fetching the OFF-MACHINE copy from https://github.com/Cairnstew/kraken-depth-archive.git ...
+  fetched rolling/depth.jsonl.gz (9937 bytes compressed)
+    local  sha256 = a7b540d1df792f9a86eebfd8fc9c3f551e6e1adb7d261d316d70319cf62d7038
+    remote sha256 = a7b540d1df792f9a86eebfd8fc9c3f551e6e1adb7d261d316d70319cf62d7038  (after gunzip)
+    records: local=7  remote=7
+  RESTORED OFF-MACHINE AND BYTE-IDENTICAL to the live log
+    DEPTH LOG VERIFY (read-only) — .../roundtrip.jsonl
+      records 7 | schema OK | short of depth 0 | dedup 7 rows -> 4 | wrote anything: no
+      VERDICT: PASS
+```
+
+The comparison is on the **GUNZIPPED** bytes, not the container — a gzip stream's bytes vary
+with the gzip version and flags, so comparing the compressed file would compare the tool, not
+the data. Remote tree: `rolling/depth.jsonl.gz` (9,937 B) and
+`checkpoints/depth.2026-W40.jsonl.gz` (9,913 B).
+
+**Trigger, recorded as the lead specified.** Until a copy exists on a different machine:
+**no consumer work starts, and no "recorder complete" claim is made.** Now satisfied — but
+it was a *gate*, and it is only satisfied while the weekly run keeps running, so it is a
+standing condition rather than a one-off.
+
+### 23.2 Copy strategy: daily timestamped fulls would have cost 11.8 GB
+
+The first design wrote the WHOLE file under a new timestamped name on every run. At one
+record per hour (7,386 B/record, measured):
+
+| strategy | a year |
+|---|---|
+| daily full copies (365 runs) | **11.8 GB** |
+| weekly full copies (52 runs) | 3.4 GB |
+| **weekly INCREMENTAL + one rolling** | **129 MB** — 92× less |
+
+So: `depth-backup` now writes **one rolling** file (force-updated, always current), and
+`depth-checkpoint` writes a **weekly dated INCREMENTAL** — only the bytes added since the
+last checkpoint, which is safe precisely because the log is append-only, and it asserts the
+slice is contiguous (`prev_lines + n == total_lines`) so a discontinuity fails loudly.
+`depth-reassemble` concatenates rolling + incrementals and `cmp`s the result against the
+live log, which is what proves an incremental archive is *complete* rather than merely
+present.
+
+### 23.3 N re-derived: hours, not records — and the real log was over-counting
+
+The lead is right, and it was not a rounding issue. **Records #3 (19:37:04) and #4
+(19:42:32) are five minutes apart in the same floored hour.** So the log held 7 records
+covering **4 hours**, and "8,760 snapshots" as a record count would be reached early — and a
+double-firing timer would inflate progress every hour, indefinitely.
+
+**N is now defined as distinct hourly buckets holding a valid record**, so 8,760 means 8,760
+*hours covered*. Coverage moved to the same unit (`n_hours_covered / hours_in_span`), and the
+status line reports it:
+
+```
+  records       : 7   intervals: 4
+                 (2 SEEDED record(s) excluded — real readings, not on the cadence; RUN-LOG 22.1/22.8)
+  first         : 2026-10-03T19:37:04.693310+00:00
+  hours covered : 4 distinct hour(s) of 4 in span
+  depth N       : 4 / 8760 hours (0.046%)  <- COUNTED IN HOURS, not rows
+  span          : 11186s observed   hours in span: 4   coverage: 100.0%
+```
+
+Two consequences worth naming: `first` is now **19:37:04** — the cadence clock starts at the
+first unattended fire, not at the seeded pull — and `intervals` fell 5 → 4 because the
+seeded rows no longer manufacture intervals.
+
+### 23.4 Consumption date restated from #3
+
+First unattended fire **2026-10-03T19:37:04Z**, not the 19:10 manual pull:
+
+- **89-day floor** from 2026-10-03 → earliest possible evaluation **2026-12-31**.
+- **N = 365 days** from 2026-10-03 → first consumer run **2027-10-03** (the earlier
+  2027-10-04 came from anchoring on the manual pull and is corrected).
+
+The floor's caveat is unchanged and still the first thing a consumer must check: the 178-bar
+seed-noise figure was measured on the **price-only** policy, and carrying it to book features
+is an assumption (22.2).
+
+### 23.5 The seeded rows pinned by sha256, so a second reader cannot miscount
+
+Records #1–#2 are real readings that were **copied in** byte-for-byte from the aborted
+worktree. Leaving them in the append-only file is right, but a consumer reading the file will
+never see EVIDENCE §6 — so the exclusion is enforced in code, keyed on the **sha256 of the raw
+line** (not the parsed record, so a re-serialisation cannot fake a match):
+
+```
+392e06b46fc9597cc4ed30220e2a5217b4fc82654336cd53bdebaa751099ff0f   # 19:10:45.752567  bid=2683.52000
+7d7b62cc62390fcbeb24ce65a09ec7ce02e2e5375f9b94aacf498f6a6f4aaacd   # 19:12:55.755671  bid=2683.51000
+```
+
+The file is **untouched** — pinned rows are still reported in `records` and flagged, and
+excluded from the depth count and from interval derivation. **The mutation the lead asked
+for:** removing one pin changes `n_seeded_excluded` 2 → 1 while `n_records` stays 4, proving
+the exclusion is load-bearing rather than decorative.
+
+Honest scope note: hour coverage happens to be identical either way, because both seeded rows
+share hour 19 with a genuine timer fire. So on *this* log the pin changes the excluded count
+and `intervals`, not `hours_covered` — it becomes load-bearing for `hours_covered` only if a
+seeded row ever sits in an hour nothing else covers.
+
+### 23.6 Double-timer detection: red run, and it turned out GREEN first
+
+Fed a realistic double-timer log — 6 hours × 2 records, 1800 s apart, on 2026-10-05 so it is
+outside the bring-up hour. The hint appeared, **and the verdict still said GREEN**:
+
+```
+  records       : 12   intervals: 11
+  hours covered : 6 distinct hour(s) of 6 in span
+  SHORT         : 11 interval(s) closer than 2400s ...
+                     >> 11 SHORT interval(s) is a PATTERN, not a catch-up. If these are not your own manual pulls,
+                        CHECK FOR A SECOND TIMER — `systemctl is-enabled kraken-trading-bot-order-book.timer`
+                        two timers put two records in one hour, ~1800s apart.
+  GAPS          : 0   missing snapshots: 0   longest hole: 0s
+  VERDICT: GREEN (no interval exceeded the expectation)     <-- WRONG
+```
+
+**Gaps measure loss; a double timer is the opposite fault, so `n_gaps == 0` and the old
+verdict was blind to it.** Left alone, a reader would trust GREEN over a misconfigured
+recorder. `ok` and the verdict now both treat a sustained SHORT pattern as RED:
+
+```
+  VERDICT: RED — 11 SHORT intervals is a sustained pattern, not loss.
+  No hour is missing, but the recorder is not on its cadence: the likely cause is a SECOND TIMER.
+```
+exit code **1**, so a gate can see it too.
+
+**The threshold is `>= 2`, and that is a correction to my own first attempt**, which fired on
+*any* SHORT and therefore cried wolf on the real log — where the single SHORT (19:37:04 →
+19:42:32, 327 s) is the legitimate `Persistent=true` catch-up that every host sees once at
+enablement. One short interval is a catch-up; a second timer produces a *sustained* pattern.
+The control is the real log itself: **1 SHORT → GREEN, exit 0**, with the catch-up named in
+the output. (My synthetic control was also mis-built — hours apart rather than seconds, so
+it exercised nothing; the real log is the genuine control.)
+
+### 23.7 One regression caught while making the coverage change hour-based
+
+Switching `coverage_ratio` to an hour-based denominator made a **single record report 100%
+coverage**: one record spans exactly one hour, so 1/1. `test_single_record_has_no_interval_and_does_not_claim_green_coverage` caught it, and the `n_records < 2 → None` guard is restored — coverage of one record is still not a number. Suite 620 → 626.

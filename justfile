@@ -633,61 +633,215 @@ clean:
 depth-backup dest output="signals/eth_usd_orderbook.jsonl":
   #!/usr/bin/env bash
   set -euo pipefail
+  # ONE ROLLING COPY, not a dated full copy per run.
+  #
+  # Timestamp-per-run was the first design and it is wrong at a year: each run
+  # wrote the WHOLE file under a new name, so the archive grew by the full file
+  # every time.  Measured at one record per hour (7,386 B/record):
+  #     daily full copies, 365 runs        11.8 GB
+  #     weekly full copies, 52 runs         3.4 GB
+  #     weekly INCREMENTAL + rolling        129 MB      <- this design, 92x less
+  # One rolling file always holds the current state; dated copies are WEEKLY and
+  # INCREMENTAL (only the records added since the last checkpoint).
   if [ -z "{{dest}}" ]; then
     echo "dest is REQUIRED and has no default." >&2
-    echo "  It must be a path OFF this machine. A local path would leave every" >&2
-    echo "  copy on the same disk as the original, which is the failure this" >&2
-    echo "  recipe exists to remove. Examples:" >&2
-    echo "    just depth-backup /mnt/nas/kraken-depth" >&2
-    echo "    just depth-backup 'user@host:/srv/kraken-depth'   # via ssh/rclone" >&2
+    echo "  It must resolve OFF this machine. A local path would leave every copy" >&2
+    echo "  on the same disk as the original, which is the failure this recipe" >&2
+    echo "  exists to remove." >&2
     exit 2
   fi
   root="{{justfile_directory()}}"
   src="$root/{{output}}"
   [ -f "$src" ] || { echo "no such log: $src" >&2; exit 1; }
-  # Refuse a destination that is not writable, before claiming success.
   mkdir -p "{{dest}}" 2>/dev/null || {
     echo "cannot create destination '{{dest}}' — is the remote mounted?" >&2
     echo "  An unmounted network mount would silently accumulate in a local dir." >&2
     exit 1; }
   [ -w "{{dest}}" ] || { echo "destination not writable: {{dest}}" >&2; exit 1; }
-  # Refuse a destination that is not a DIFFERENT PHYSICAL DISK, not merely a
-  # different filesystem.  Comparing `df --output=source` alone is not enough:
-  # it yields a per-partition device string, so another partition of the SAME
-  # disk (sda5 vs sda3) reads as a different place while offering exactly zero
-  # additional durability.  Walk up to the physical disk and compare that.
+
+  # Refuse a destination on the SAME PHYSICAL DISK, not merely a different
+  # filesystem.  `df --output=source` is a PER-PARTITION string, so another
+  # partition of the same disk (sda5 vs sda3) reads as a different place while
+  # offering exactly zero extra durability.  Walk up to the physical disk.
   src_disk="$(lsblk -no PKNAME "$(df --output=source "$src" | tail -1)" 2>/dev/null | head -1)"
   dst_disk="$(lsblk -no PKNAME "$(df --output=source "{{dest}}" | tail -1)" 2>/dev/null | head -1)"
   if [ -z "$src_disk" ] || [ -z "$dst_disk" ]; then
     echo "REFUSING: cannot determine the physical disk for both paths." >&2
-    echo "  log:  $src_disk   dest: $dst_disk" >&2
     exit 1
   fi
   if [ "$src_disk" = "$dst_disk" ]; then
     echo "REFUSING: '{{dest}}' is on the SAME PHYSICAL DISK as the log (/dev/$src_disk)." >&2
-    echo "  That is a second copy on one disk, not an off-host copy. A disk failure" >&2
-    echo "  still loses both. Pick a different physical disk or a remote host." >&2
+    echo "  That is a second copy on one disk, not an off-machine copy." >&2
     exit 1
   fi
-  echo "  off-host check: log on /dev/$src_disk, dest on /dev/$dst_disk — different disks"
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  base="$(basename "{{output}}")"
-  out="{{dest}}/${base}.${stamp}"
-  cp "$src" "$out"
-  # Verify what was just written: same bytes, same line count, parses as JSONL.
-  # An unverified copy is a hope, not a backup.
-  if cmp -s "$src" "$out"; then
-    echo "copied -> $out"
-  else
-    echo "COPY MISMATCH: $out differs from $src" >&2
-    exit 1
-  fi
-  n="$(wc -l < "$out")"
-  echo "  records: $n   bytes: $(wc -c < "$out")   verified byte-identical"
+  echo "  location check: log on /dev/$src_disk, dest on /dev/$dst_disk — different disks"
 
-# Read a copy back off-host and prove it is COMPLETE and PARSEABLE.  Run this
-# after depth-backup: the first checkpoint is worthless until one restore has
-# actually been read back from the far side.
+  base="$(basename "{{output}}")"
+  # A `user@host:/path` destination is REMOTE: rsync it with --append-verify,
+  # which sends only the tail an append-only file has grown by and verifies the
+  # destination's existing prefix against the source.  Without it a 64 MB file
+  # is re-sent whole every run.  A plain path is a mounted filesystem, so cp.
+  case "{{dest}}" in
+    *@*:*)
+      remote_host="${dest%%:*}"
+      remote_dir="${dest#*:}"
+      ssh "$remote_host" "mkdir -p '$remote_dir'"
+      rsync --append-verify --quiet "$src" "$remote_host:$remote_dir/$base"
+      rolling="$remote_dir/$base"
+      echo "  rsync --append-verify -> ${remote_host}:${rolling}"
+      cmp -s "$src" <(ssh "$remote_host" "cat '$rolling'") \
+        || { echo "REMOTE COPY MISMATCH via ssh cat" >&2; exit 1; }
+      echo "  records: $(ssh "$remote_host" "wc -l < '$rolling'")   verified byte-identical over ssh"
+      exit 0
+      ;;
+  esac
+  rolling="{{dest}}/$base"
+  cp "$src" "$rolling"
+  if cmp -s "$src" "$rolling"; then
+    echo "rolling copy current -> $rolling"
+  else
+    echo "ROLLING COPY MISMATCH: $rolling differs from $src" >&2
+    exit 1
+  fi
+  echo "  records: $(wc -l < "$rolling")   bytes: $(wc -c < "$rolling")   verified byte-identical"
+
+# WEEKLY, INCREMENTAL, dated checkpoint.  Only the records added since the last
+# checkpoint, so a year of checkpoints costs ~64 MB rather than a full copy each.
+# `state` marks the byte offset and record count of the previous checkpoint.
+depth-checkpoint dest output="signals/eth_usd_orderbook.jsonl" state=".depth-backup-state":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -z "{{dest}}" ]; then echo "dest is REQUIRED." >&2; exit 2; fi
+  root="{{justfile_directory()}}"
+  src="$root/{{output}}"
+  [ -f "$src" ] || { echo "no such log: $src" >&2; exit 1; }
+  mkdir -p "{{dest}}"
+  base="$(basename "{{output}}")"
+  total_bytes=$(wc -c < "$src")
+  total_lines=$(wc -l < "$src")
+  prev_bytes=0; prev_lines=0
+  if [ -f "{{state}}" ]; then
+    read -r prev_bytes prev_lines < "{{state}}" || true
+  fi
+  if [ "$total_bytes" -le "$prev_bytes" ]; then
+    echo "nothing new since the last checkpoint ($total_bytes <= $prev_bytes bytes)" >&2
+    exit 1
+  fi
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  out="{{dest}}/${base}.weekly.${stamp}.incremental"
+  # Byte range since the last checkpoint.  This is only safe because the log is
+  # APPEND-ONLY: earlier bytes can never change.
+  tail -c +$((prev_bytes + 1)) "$src" > "$out"
+  n=$(wc -l < "$out")
+  echo "  incremental checkpoint: $n new record(s), $(wc -c < "$out") bytes"
+  echo "    (records $((prev_lines + 1))..$total_lines of $total_lines)"
+  if [ "$((prev_lines + n))" -ne "$total_lines" ]; then
+    echo "LINE COUNT DISCONTINUITY: $((prev_lines + n)) != $total_lines" >&2
+    echo "  The log is append-only, so an incremental slice must be contiguous." >&2
+    exit 1
+  fi
+  printf '%s %s\n' "$total_bytes" "$total_lines" > "{{state}}"
+  echo "  -> $out"
+  echo "  VERIFY IT: just depth-verify-restore $out"
+
+# Reassemble the full log from the rolling copy plus the weekly incrementals,
+# and CHECK the result is byte-identical to the original.  This is what proves an
+# incremental archive is actually complete, rather than merely present.
+depth-reassemble dest output="signals/eth_usd_orderbook.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  src="$root/{{output}}"
+  base="$(basename "{{output}}")"
+  rebuilt="$(mktemp)"
+  cat "{{dest}}/$base" > "$rebuilt"
+  for inc in $(ls -1 "{{dest}}/${base}.weekly."*.incremental 2>/dev/null | sort); do
+    cat "$inc" >> "$rebuilt"
+  done
+  echo "  rebuilt from rolling + $(ls -1 "{{dest}}/${base}.weekly."*.incremental 2>/dev/null | wc -l) incrementals"
+  if cmp -s "$src" "$rebuilt"; then
+    echo "  REASSEMBLED IDENTICAL to the live log ($(wc -l < "$rebuilt") records, $(wc -c < "$rebuilt") bytes)"
+    rm -f "$rebuilt"; exit 0
+  fi
+  echo "  REASSEMBLED DIFFERS: live=$(wc -c < "$src") rebuilt=$(wc -c < "$rebuilt")" >&2
+  echo "  kept the rebuilt file at $rebuilt for inspection" >&2
+  exit 1
+
+# OFF-MACHINE copy via a PRIVATE GIT REMOTE — the target that exists today.
+#
+# Why this rather than the Tailscale/rsync path: all six tailnet peers are
+# OFFLINE right now (laptop last seen 2d, server 30d), so an rsync target exists
+# only on paper and no restore can be verified against it.  A private remote is
+# reachable immediately, so "done" can mean an actual verified restore today.
+# The rsync path in depth-backup is kept and works for `user@host:/path` dests
+# once a peer is up.
+#
+# Layout, chosen so the archive does not grow without bound:
+#   rolling/depth.jsonl.gz              one rolling file, force-updated
+#   checkpoints/depth.<week>.jsonl.gz   WEEKLY INCREMENTAL, dated, never a full copy
+depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  src="$root/signals/eth_usd_orderbook.jsonl"
+  state="$root/.depth-backup-state"
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  repo="$work/repo"
+  if [ ! -d "$repo/.git" ]; then
+    git init -q "$repo"
+    git -C "$repo" remote add origin "{{remote}}"
+    git -C "$repo" config user.name "depth-recorder"
+    git -C "$repo" config user.email "depth-recorder@localhost"
+    mkdir -p "$repo/rolling" "$repo/checkpoints"
+  fi
+  # Rolling: the current whole log, gzip-compressed and force-updated so history
+  # does not accumulate a new full copy per run.
+  gzip -9 -c "$src" > "$repo/rolling/depth.jsonl.gz"
+  total_bytes=$(wc -c < "$src"); total_lines=$(wc -l < "$src")
+  hours=$(nix run "$root"#kraken-trading-bot -- depth-gaps --output "$src" --json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["n_hours_covered"])')
+  # Weekly incremental: only the bytes added since the last checkpoint.
+  prev_bytes=0; prev_lines=0
+  if [ -f "$state" ]; then read -r prev_bytes prev_lines < "$state" || true; fi
+  if [ "$total_bytes" -gt "$prev_bytes" ]; then
+    week="$(date -u +%G-W%V)"
+    tail -c +$((prev_bytes + 1)) "$src" | gzip -9 -c > "$repo/checkpoints/depth.$week.jsonl.gz"
+    printf '%s %s\n' "$total_bytes" "$total_lines" > "$state"
+    echo "  weekly incremental for $week: $((total_lines - prev_lines)) new record(s)"
+  else
+    echo "  no new records since the last checkpoint"
+  fi
+  ( cd "$repo" && git add -A && git commit -q -m "depth: rolling + weekly $(date -u +%Y%m%dT%H%M%SZ)" \
+    && git push -q --force origin HEAD:main )
+  echo "  pushed -> {{remote}}"
+  echo "  raw_sha256=$(sha256sum "$src" | cut -d' ' -f1) records=$total_lines hours=$hours bytes=$total_bytes"
+
+# READ BACK the off-machine copy and check it byte-for-byte against the live log.
+# This is what "done" means: not that a push happened, but that the pushed bytes
+# GUNZIP to exactly the local file.  Anything less is a hope, not a backup.
+depth-verify-offmachine remote="https://github.com/Cairnstew/kraken-depth-archive.git":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  src="$root/signals/eth_usd_orderbook.jsonl"
+  work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+  echo "  fetching the OFF-MACHINE copy from {{remote}} ..."
+  git clone -q --depth 1 "{{remote}}" "$work/remote"
+  echo "  fetched rolling/depth.jsonl.gz ($(wc -c < "$work/remote/rolling/depth.jsonl.gz") bytes compressed)"
+  gzip -dc "$work/remote/rolling/depth.jsonl.gz" > "$work/roundtrip.jsonl"
+  local_sha="$(sha256sum "$src" | cut -d' ' -f1)"
+  remote_sha="$(sha256sum "$work/roundtrip.jsonl" | cut -d' ' -f1)"
+  echo "    local  sha256 = $local_sha"
+  echo "    remote sha256 = $remote_sha  (after gunzip)"
+  echo "    records: local=$(wc -l < "$src")  remote=$(wc -l < "$work/roundtrip.jsonl")"
+  if [ "$local_sha" != "$remote_sha" ]; then
+    echo "  MISMATCH — the off-machine copy is NOT the live log" >&2
+    exit 1
+  fi
+  echo "  RESTORED OFF-MACHINE AND BYTE-IDENTICAL to the live log"
+  nix run "$root"#kraken-trading-bot -- depth-verify --output "$work/roundtrip.jsonl" | sed 's/^/    /'
+
 depth-verify-restore src:
   #!/usr/bin/env bash
   set -euo pipefail

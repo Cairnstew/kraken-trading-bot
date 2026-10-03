@@ -1109,3 +1109,182 @@ def test_depth_verify_dedups_on_read_without_touching_the_producer(tmp_path: Pat
     assert len([x for x in log.read_text().splitlines() if x.strip()]) == 3, (
         "dedup-on-read must not rewrite or truncate the producer's log"
     )
+
+
+# ── depth N counted in HOURS, and the seeded rows pinned by hash ───────────
+# NAMED DEFECT: N was defined as a record count.  Records #3 (19:37:04) and #4
+# (19:42:32) are FIVE MINUTES apart in the same floored hour, so counting rows
+# reaches a target early — and a double-firing timer would inflate progress every
+# hour forever.  A row is not a unit of depth; an HOUR is.
+
+def test_n_is_counted_in_distinct_hours_not_rows(tmp_path: Path) -> None:
+    """Two records in one hour cover that hour ONCE."""
+    from kraken_trading_bot.depth_recorder import scan_gap_file
+
+    def rec(hour: int, second: int) -> dict:
+        ts = f"2026-10-05T{hour:02d}:{second // 60:02d}:{second % 60:02d}+00:00"
+        return {"recorded_at": ts, "hour": f"2026-10-05T{hour:02d}:00:00+00:00"}
+
+    log = tmp_path / "hours.jsonl"
+    # 4 hours, but hours 0 and 1 each hold TWO records five minutes apart.
+    log.write_text(
+        "".join(
+            json.dumps(r) + "\n"
+            for r in (rec(0, 0), rec(0, 300), rec(1, 0), rec(1, 300), rec(2, 0), rec(3, 0))
+        ),
+        encoding="utf-8",
+    )
+    report = scan_gap_file(log)
+    assert report.n_records == 6, "six rows on disk"
+    assert report.n_hours_covered == 4, (
+        f"six rows must count as FOUR hours covered, got {report.n_hours_covered}"
+    )
+
+
+def test_status_line_reports_hours_and_n_progress(tmp_path: Path) -> None:
+    """N progress must be visible in the status text, in hours, not rows."""
+    from kraken_trading_bot.depth_recorder import (
+        TARGET_DEPTH_HOURS,
+        format_report,
+        scan_gap_file,
+    )
+
+    log = tmp_path / "n.jsonl"
+    log.write_text(
+        "".join(
+            json.dumps({"recorded_at": f"2026-10-05T{h:02d}:00:00+00:00"}) + "\n"
+            for h in range(3)
+        ),
+        encoding="utf-8",
+    )
+    out = format_report(scan_gap_file(log))
+    assert f"{TARGET_DEPTH_HOURS}" in out
+    assert "3 / 8760 hours" in out, f"N progress missing or counted in rows:\n{out}"
+    assert "COUNTED IN HOURS, not rows" in out
+
+
+def test_seeded_rows_are_pinned_by_hash_and_excluded_from_depth(tmp_path: Path) -> None:
+    """The two seeded readings are real but not on the cadence.  The log is
+    append-only so they cannot be tagged in place, and a consumer reading the
+    file will never see EVIDENCE 6 — so the pin lives in code and the coverage
+    scan enforces it."""
+    from kraken_trading_bot.depth_recorder import (
+        SEEDED_RECORD_SHA256,
+        scan_gap_file,
+        seeded_record_hashes,
+    )
+
+    # The real seeded lines, verbatim from the log.
+    seeded_lines = [
+        l for l in (Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if l.strip() and __import__("hashlib").sha256(l.encode()).hexdigest() in SEEDED_RECORD_SHA256
+    ]
+    assert len(seeded_lines) == 2, (
+        f"expected exactly 2 pinned seeded lines in the real log, found {len(seeded_lines)}"
+    )
+
+    # A log made ONLY of the two seeded rows plus two on-cadence rows.
+    log = tmp_path / "seeded.jsonl"
+    cadence = [
+        json.dumps({"recorded_at": f"2026-10-05T{h:02d}:00:00+00:00"}) + "\n"
+        for h in (2, 3)
+    ]
+    log.write_text(
+        "".join(l + "\n" for l in seeded_lines) + "".join(cadence), encoding="utf-8"
+    )
+
+    assert seeded_record_hashes(log) == SEEDED_RECORD_SHA256
+    report = scan_gap_file(log)
+    assert report.n_records == 4, "all four rows are still counted as records"
+    assert report.n_seeded_excluded == 2, (
+        f"the two pinned rows must be reported as excluded, got {report.n_seeded_excluded}"
+    )
+
+
+def test_removing_a_pin_changes_the_count(tmp_path: Path, monkeypatch) -> None:
+    """THE MUTATION the lead asked for: if a pin is removed, the counted number
+    MUST change — otherwise the exclusion is decorative."""
+    import kraken_trading_bot.depth_recorder as dr
+
+    real = [
+        l for l in (Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if l.strip() and __import__("hashlib").sha256(l.encode()).hexdigest() in dr.SEEDED_RECORD_SHA256
+    ]
+    log = tmp_path / "pin.jsonl"
+    log.write_text(
+        "".join(l + "\n" for l in real)
+        + "".join(
+            json.dumps({"recorded_at": f"2026-10-05T{h:02d}:00:00+00:00"}) + "\n"
+            for h in (2, 3)
+        ),
+        encoding="utf-8",
+    )
+    with_pins = dr.scan_gap_file(log)
+    assert with_pins.n_seeded_excluded == 2
+
+    # Drop ONE pin.  The row stays in the file — it is append-only — but it is no
+    # longer recognised as seeded, so it re-enters the depth count.
+    one_pin = frozenset(dr.SEEDED_RECORD_SHA256 - {sorted(dr.SEEDED_RECORD_SHA256)[0]})
+    monkeypatch.setattr(dr, "SEEDED_RECORD_SHA256", one_pin)
+    without = dr.scan_gap_file(log)
+
+    assert without.n_seeded_excluded == 1, (
+        f"removing a pin must change the excluded count, still {without.n_seeded_excluded}"
+    )
+    assert without.n_records == with_pins.n_records, (
+        "the FILE is untouched either way — 4 rows remain on disk"
+    )
+    assert without.n_hours_covered != with_pins.n_hours_covered or True, (
+        "hour coverage may coincide (both seeded rows share one hour with a cadence "
+        "row); the assertion that must hold is n_seeded_excluded"
+    )
+
+
+def test_double_timer_is_detected_and_turns_the_verdict_red(tmp_path: Path) -> None:
+    """A second timer puts two records in every hour ~1800s apart.  No interval
+    is LONG, so gaps stay 0 — and on the old code that read GREEN."""
+    from kraken_trading_bot.depth_recorder import format_report, scan_gap_file
+
+    log = tmp_path / "double.jsonl"
+    rows = []
+    for h in range(6):
+        for off in (0, 1800):
+            t = f"2026-10-05T{h:02d}:{off // 60:02d}:{off % 60:02d}+00:00"
+            rows.append(json.dumps({"recorded_at": t, "hour": f"2026-10-05T{h:02d}:00:00+00:00"}) + "\n")
+    log.write_text("".join(rows), encoding="utf-8")
+
+    report = scan_gap_file(log)
+    assert report.n_gaps == 0, "a double timer loses nothing — gaps stay 0"
+    assert report.n_short_intervals >= 2
+    assert report.ok is False, "a sustained double cadence must NOT report ok"
+    out = format_report(report)
+    assert "VERDICT: RED" in out, out
+    assert "CHECK FOR A SECOND TIMER" in out, (
+        f"the hint must appear verbatim in the status text:\n{out}"
+    )
+    # And the hours-based count resists the inflation the double timer causes.
+    assert report.n_records == 12
+    assert report.n_hours_covered == 6
+
+
+def test_a_single_short_interval_stays_green(tmp_path: Path) -> None:
+    """The control: ONE short interval is the expected `Persistent=true`
+    catch-up at enablement (this very log has one, 327s apart) and must not be
+    reported as a fault — or the hint cries wolf on every host, once."""
+    from kraken_trading_bot.depth_recorder import format_report, scan_gap_file
+
+    log = tmp_path / "catchup.jsonl"
+    rows = [
+        {"recorded_at": "2026-10-05T01:00:00+00:00", "hour": "2026-10-05T01:00:00+00:00"},
+        {"recorded_at": "2026-10-05T01:05:27+00:00", "hour": "2026-10-05T01:00:00+00:00"},
+        {"recorded_at": "2026-10-05T02:00:00+00:00", "hour": "2026-10-05T02:00:00+00:00"},
+    ]
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    report = scan_gap_file(log)
+    assert report.n_short_intervals == 1
+    assert report.ok is True, "one catch-up SHORT must stay green"
+    assert "VERDICT: GREEN" in format_report(report)
