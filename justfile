@@ -651,12 +651,25 @@ depth-backup dest output="signals/eth_usd_orderbook.jsonl":
     echo "  An unmounted network mount would silently accumulate in a local dir." >&2
     exit 1; }
   [ -w "{{dest}}" ] || { echo "destination not writable: {{dest}}" >&2; exit 1; }
-  # Refuse a destination on the SAME filesystem as the source: that is not a copy.
-  if [ "$(df --output=source "$src" | tail -1)" = "$(df --output=source "{{dest}}" | tail -1)" ]; then
-    echo "REFUSING: '{{dest}}' is on the SAME filesystem as the log." >&2
-    echo "  That is a second copy on one disk, not an off-host copy." >&2
+  # Refuse a destination that is not a DIFFERENT PHYSICAL DISK, not merely a
+  # different filesystem.  Comparing `df --output=source` alone is not enough:
+  # it yields a per-partition device string, so another partition of the SAME
+  # disk (sda5 vs sda3) reads as a different place while offering exactly zero
+  # additional durability.  Walk up to the physical disk and compare that.
+  src_disk="$(lsblk -no PKNAME "$(df --output=source "$src" | tail -1)" 2>/dev/null | head -1)"
+  dst_disk="$(lsblk -no PKNAME "$(df --output=source "{{dest}}" | tail -1)" 2>/dev/null | head -1)"
+  if [ -z "$src_disk" ] || [ -z "$dst_disk" ]; then
+    echo "REFUSING: cannot determine the physical disk for both paths." >&2
+    echo "  log:  $src_disk   dest: $dst_disk" >&2
     exit 1
   fi
+  if [ "$src_disk" = "$dst_disk" ]; then
+    echo "REFUSING: '{{dest}}' is on the SAME PHYSICAL DISK as the log (/dev/$src_disk)." >&2
+    echo "  That is a second copy on one disk, not an off-host copy. A disk failure" >&2
+    echo "  still loses both. Pick a different physical disk or a remote host." >&2
+    exit 1
+  fi
+  echo "  off-host check: log on /dev/$src_disk, dest on /dev/$dst_disk — different disks"
   stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   base="$(basename "{{output}}")"
   out="{{dest}}/${base}.${stamp}"

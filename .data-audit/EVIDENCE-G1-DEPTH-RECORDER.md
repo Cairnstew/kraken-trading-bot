@@ -855,3 +855,58 @@ never been read back is a hope, not a backup.
 **No destination is currently reachable from this host** — 0 Tailscale peers online, no named
 SSH host, no NFS/CIFS/sshfs mount, no rclone. The mechanism is built and refusing by default;
 the destination is the lead's choice and the first verified restore is still owed.
+
+## 9. First verified restore — done, and it is a PARTIAL mitigation
+
+The lead chose a NAS/NFS destination. **No NAS is mounted on this host** and no NFS/CIFS
+client is installed (`mount.nfs`, `mount.cifs`, `sshfs`, `rclone` all absent; `/etc/fstab`
+has no NFS or CIFS entry at all), so the true off-machine destination cannot be wired yet.
+Rather than leave the mechanism unexercised, it was exercised against the best destination
+this host actually has.
+
+**The same-filesystem guard had a hole, found by checking rather than by reading.** It
+compared `df --output=source`, which yields a **per-partition device string**. The log is on
+`/dev/sda5`; `sda` also carries `sda1` (`/boot`), `sda3` and `sda4`. A destination on
+`sda3` would have produced a *different* `df` string while being **the same physical disk**,
+offering zero additional durability — exactly what the recipe exists to prevent. The guard
+now walks to the physical disk (`lsblk -no PKNAME`) and compares *that*:
+
+```
+  log_disk=sda  dest_disk=sdb        -> ALLOWED (different disk)
+  log_disk=sda  dest_disk=nvme0n1    -> ALLOWED (different disk)
+  log_disk=sda  dest_disk=sda        -> REFUSED (same disk)
+```
+
+Live proof of all three refusals on this host:
+
+- **no default** → `dest is REQUIRED and has no default`, exit 2
+- **`/mnt/data` unwritable** (root-owned docker-data) → `destination not writable`, exit 1
+- **`/tmp` same physical disk as the log** → refused on the disk check
+
+**The verified restore:**
+
+```
+$ just depth-backup /mnt/media
+  off-host check: log on /dev/sda, dest on /dev/nvme0n1 — different disks
+  copied -> /mnt/media/eth_usd_orderbook.jsonl.20261003T231511Z
+  records: 7   bytes: 51702   verified byte-identical
+
+$ just depth-verify-restore /mnt/media/eth_usd_orderbook.jsonl.20261003T231511Z
+  records          : 7
+  schema           : OK
+  short of depth   : 0 record(s)
+  dedup on read    : 7 rows -> 4 (3 collapsed, last-wins per floored hour)
+  wrote anything   : no
+  VERDICT: PASS
+```
+
+A real file, 51,702 bytes, not a link, read back **off the original path** and fully parsed.
+
+**What this does and does not cover — stated plainly.** `/mnt/media` is a **different
+physical disk** (`nvme0n1` vs `sda`), so a single-disk failure no longer takes the log. It is
+**the same machine**, so it does **not** survive machine loss, theft, or the failure of this
+host's storage generally. That was the lead's actual concern and it is **still open**: the
+first copy has left the *disk*, not the *machine*. Until a NAS or remote host is mounted and
+the recipe pointed at it, the honest status is "one disk protected, machine loss not" — and
+the recipe's own comment claiming an "off-host copy" is accurate only for the case just
+demonstrated, so the naming should be read as *off-disk-or-remote, whichever you point it at*.

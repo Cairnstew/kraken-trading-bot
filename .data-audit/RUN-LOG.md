@@ -1445,3 +1445,53 @@ explaining a failure rather than in producing one: *a claim that attributes a fa
 tooling — a formatter, a hook, the environment — is checked for the mechanism before it is
 reported.* Name the tool, the hook or config, and whether it still applies; or state that no
 such mechanism exists. The 2026-10-03 case is recorded there as the measured instance.
+
+### 22.7 Off-host copy: guard hole found and fixed, first restore done — but machine loss is still open
+
+The lead chose NAS/NFS. **No NAS is mounted and no client is installed** (`mount.nfs`,
+`mount.cifs`, `sshfs`, `rclone` all absent; `/etc/fstab` has no NFS or CIFS entry), so the
+real off-machine destination cannot be wired. Exercised against the best destination this
+host has: `/mnt/media` (`nvme0n1`, vs the log's `sda`).
+
+**The guard I wrote in 22.5 had a hole, found by checking instead of re-reading.** It compared
+`df --output=source`, which is a **per-partition** device string. The log is on `/dev/sda5`,
+and `sda` also carries `sda1` (`/boot`), `sda3` and `sda4` — so a dest on `sda3` would have
+produced a *different* `df` string, passed the guard, and been the **same physical disk**:
+a second copy offering zero extra durability, which is the precise failure the recipe exists
+to prevent. Now compares the physical disk via `lsblk -no PKNAME`.
+
+Worth recording *how* this was found: I first asserted the opposite — that `/mnt/data` was a
+same-disk hole — from a `df` comparison alone. Then I checked `lsblk` and found `/mnt/data` is
+`/dev/sdb1`, a genuinely different disk, and my own printed "proof" line was **self-contradictory**
+(`/ = sda5`, `/mnt/media = nvme0n1p1` — I had captioned them the same disk). Discarded, and
+the real hole found by looking at the partition layout rather than at two mount points.
+
+Three refusals verified live:
+
+```
+  no default dest        -> "dest is REQUIRED and has no default", exit 2
+  /mnt/data unwritable   -> "destination not writable", exit 1   (root-owned docker-data)
+  /tmp                   -> refused: same PHYSICAL disk as the log (/dev/sda)
+```
+
+**First verified restore:**
+
+```
+$ just depth-backup /mnt/media
+  off-host check: log on /dev/sda, dest on /dev/nvme0n1 — different disks
+  copied -> /mnt/media/eth_usd_orderbook.jsonl.20261003T231511Z
+  records: 7   bytes: 51702   verified byte-identical
+
+$ just depth-verify-restore /mnt/media/eth_usd_orderbook.jsonl.20261003T231511Z
+  schema OK | short of depth 0 | dedup 7 rows -> 4 | wrote anything: no | VERDICT: PASS
+```
+
+A real 51,702-byte file, not a link, read back **off the original path** and fully parsed. So
+the copy is proven, not assumed.
+
+**And the honest limit.** `/mnt/media` is a different *disk* but the same *machine*. A
+single-disk failure no longer takes the log; **machine loss, theft, or the failure of this
+host's storage still does.** The lead's stated concern is **still open** — the first copy has
+left the disk, not the machine. Recorded that way rather than letting "verified restore" imply
+more than it covers, and noted in EVIDENCE §9 that the recipe's "off-host copy" wording should
+be read as *off-disk-or-remote, whichever you point it at*.
