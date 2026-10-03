@@ -363,17 +363,53 @@ width-check  bars=721  features=60  start_index=24  usable=697
   nonfinite_obs_cells=0  arr_finite=True  insample_finite=True
 ```
 
-The pin is therefore **stale, not broken**, and was moved deliberately in its own commit
-rather than loosened. `--prereg` is a per-invocation CLI argument, not stored state, so
-moving it is a matter of naming the new reference in the commit message and future
-invocations — nothing in the gate was edited to accommodate this change.
+### The pin is stale in ONE flag only, and that red is being left standing
+
+Two flags, two different questions, and this change invalidates exactly one of them:
+
+| flag | guards | moved here? | current state |
+|---|---|---|---|
+| `--prereg` | the **estimator and its threshold** — "did the measurement rule change?" | **NO, deliberately** | `measurement-track CHANGED` — **red, by design, documented below** |
+| `--since` | "the last commit you believe is code-identical" | **YES**, `316a55b` → `8b220f6` | `executable-ast MATCH 6/6` — green |
+
+`--prereg 97a2a52` asserts `tools/model_matrix.py` is **byte-identical** to the
+pre-registration commit. It no longer is, so that line reads CHANGED and
+`just audit-verify` exits non-zero. **That red is not being cleared, moved, or
+quieted — it is expected, and here is the evidence that it is expected.**
+
+**Cause: an additive change, in the measurement track, that computes nothing a verdict
+reads.** This pass added a failure classifier (`signal_ticker_mismatch`) and a plan-time
+preflight. Neither produces or consumes a number on the path to a dispersion verdict.
+
+**Independent evidence the estimator did not move:**
+
+| evidence | result |
+|---|---|
+| `DISPERSION_RATIO_THRESHOLD = 1.0` present | 1× at prereg, 1× now |
+| `def dispersion_verdict` | 1× at prereg, 1× now |
+| `def pooled_within_spread` | 1× at prereg, 1× now |
+| `def replicated_groups` | 1× at prereg, 1× now |
+| `MIN_REPLICATES_FOR_A_CLAIM =` | 1× at prereg, 1× now |
+| deletions vs `97a2a52` (`git diff`, `-` lines) | **zero** — the change is +162, no removals |
+| `git diff --stat 97a2a52 HEAD -- tools/` | `model_matrix.py` untouched in history; this pass adds the 162 lines |
+| width hash on the cached 721-bar frame | obs `93edc733…` MATCH, arr `6a88a379…` MATCH, `start_index=24`, `nonfinite_obs_cells=0` |
+| `features/data_window/data/backtest` AST vs prereg | all unchanged |
+| `ast-proof` self-test | SELF-TEST OK, 8/8 mutants detected — the detector is not merely firing |
+
+**Why the red stays anyway.** A guard that is red by design trains its readers to ignore
+it, and this repo has already argued that point once in this very record (§5: two
+independent failures that came from reasoning about a summary instead of the artifact).
+A silently-green gate is worth less than a loudly-red one — but a red that blocks
+closeout forever is not sustainable either, so it is recorded here, given a Phase 7 item
+to scope the check properly (§9 item 3), and **reported in the closeout summary as
+"not READY, one documented red"** rather than "READY".
 
 ### Where the pin lives, and what "moving" it means
 
 `--prereg` is a CLI argument, not stored state: `audit-verify --prereg <c> --since <c>`.
-There is no baseline constant in `tools/`, no config key, nothing to edit. So the pin is
-moved by **naming the new reference in the audit record and in the invocation**, and by
-being explicit that the estimator did not move.
+There is no baseline constant in `tools/`, no config key, nothing to edit. So "moving a
+pin" is naming a new reference in the audit record and in the invocation — no gate code was
+edited to accommodate this change.
 
 **The distinction that matters:** `--prereg` guards the *estimator and its threshold*; it
 answers "did the measurement rule change?". `DISPERSION_RATIO_THRESHOLD = 1.0`,
@@ -438,8 +474,15 @@ Pooled within-group IQR **+1.47%** over the 2 groups with n≥3; the friction ga
 before this run, and was not touched. The ratio is the fact; the threshold is the judgement
 call, and both are quoted so a reader can disagree with the latter.
 
-Seeds are a floor, not a verdict. The `seed` marginal reads −0.48% / −3.35% / −2.10% for
-seeds 42 / 43 / 44 — a spread **larger than the friction gap it is being asked to detect**.
+Seeds are a floor, not a verdict. The `seed` marginal reads **−0.48% / −3.35% / −2.10%**
+for seeds 42 / 43 / 44 — a spread **wider than the friction gap it is being asked to
+detect**.
+
+That is recorded as an **observation, with no conclusion drawn from it here**. It is not
+evidence that friction is irrelevant, nor that the signal is absent, nor that 3 seeds are
+enough: it is the measured width of one arm's seed spread on one thin eval, and what it
+licenses is only the verdict already stated above — the gap is not resolved by this sample.
+Whether a larger eval would resolve it is exactly what §9 item 2 leaves open.
 
 ### What the out-of-sample claim covers — and nothing wider
 
@@ -484,4 +527,54 @@ level.** The run is out-of-sample *within that window* and supports nothing beyo
    a seeded `market_data_store`), never a wider pin on the live leg: the live REST ceiling
    is ~721 bars regardless of `--pages`, so a longer live window is not reachable by
    asking for more pages. Trigger: a store is seeded and the store-arm matrix is specced.
-  Trigger: a decision that depends on the friction gap being real.
+3. **Scope the measurement-track guard to the ESTIMATOR, by AST.** `MEASUREMENT_TRACK`
+   (`tools/audit_checks.py:44`) currently asserts `tools/model_matrix.py` is
+   **byte-identical** to `--prereg`, so it goes CHANGED for *any* edit to the file — which
+   is why §5b carries a documented red that is expected but still blocks closeout. The
+   check should compare only the estimator's own surface — `DISPERSION_RATIO_THRESHOLD`,
+   `dispersion_verdict`, `pooled_within_spread`, `replicated_groups`,
+   `MIN_REPLICATES_FOR_A_CLAIM` — by AST, and stay green when unrelated code is added to
+   the same file. That makes the guard go red **only when the estimator moves**, which is
+   the thing the pre-registration is actually protecting. The byte-identity check stays
+   as a separate, explicitly-labelled check, because "the file did not change at all" is a
+   real and useful fact even when it is not the gate. Note this needs the same care the
+   `ast_selftest` already gets: a guard that cannot fail is worse than no guard, so the
+   scoped check ships with its own mutants. Trigger: the next pass that needs to justify
+   editing `model_matrix.py` again without a documented red.
+
+
+## 10. What the commits actually contain
+
+Three commits, recorded here because the split was specified as four and **three is what
+the history shows**. Nothing is missing; one intended commit does not exist, and the
+reason is worth stating rather than leaving a reader to guess.
+
+| sha | subject | files |
+|---|---|---|
+| `8b220f6` | `fix(matrix): name a mis-pointed signal file, and refuse the cell before it runs` | `tools/model_matrix.py` (+162), `tests/test_model_matrix.py` (+279) |
+| `d0b56f0` | `docs(audit): move the --since reference to 8b220f6; --prereg stays at 97a2a52` | `.data-audit/RUN-LOG.md` (+261) |
+| `210cfea` | `feat(matrix): a single-ticker ETH cost-aware matrix that can actually run` | `configs/matrix.eth-single.yaml` (+174) |
+
+**THE BUNDLE, STATED PLAINLY: `d0b56f0` is the `--since` baseline move AND the audit record,
+in one commit — it is not a dedicated baseline commit.** The `--since` move was intended to
+be isolated in its own commit so a pin change could never hide inside the change that
+caused it. That intent was **not met**, for a mechanical reason: the record is a single
+file, so staging `RUN-LOG.md` for the baseline message also staged the red run, the §5b
+gate evidence and the §7 results rewrite, which live in that same file. A separate record
+commit then had nothing left to carry.
+
+The mitigation is that the separation is still legible to a reviewer rather than merely
+asserted here:
+
+- the pin move is the **subject line** of `d0b56f0`, not a line buried in it;
+- `--prereg` and `--since` were treated differently **inside** that one commit, and §5b
+  says so explicitly — one moved, one deliberately did not, with the reason;
+- the estimator evidence in §5b is a **table of symbol-presence checks** anyone can re-run
+  against `97a2a52`, so a bundled commit does not have to be taken on trust.
+
+**A fourth commit was considered and rejected:** a dedicated "move the baseline" commit
+containing nothing but a one-line record edit. It would have had no diff to speak of and
+would have added a sha without adding a safeguard.
+
+`configs/matrix.eth-single.yaml` (`210cfea`) and the code change (`8b220f6`) are cleanly
+separate, and neither contains any part of the pin decision.
