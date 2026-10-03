@@ -843,3 +843,91 @@ patch-id, **seven** hold nothing new (CONTAINED), and **three** are genuinely un
 **Not deleted.** The instruction named three commits and two branches; these are neither, and
 "almost certainly" is not the standard the rest of this cleanup was held to. They are cheap to
 assess (the §14 method) whenever that is wanted. `team_cleanup` remains uncalled.
+
+## 19. Both bbdbe56 reds are GREEN; closeout is NOT READY and says why
+
+`audit-closeout` run at HEAD `cf31f9e`, verbatim:
+
+```
+  closeout  branch=master  upstream=origin/master
+    HEAD == upstream   NO  (cf31f9ed)
+    working tree       2 dirty entry(ies)
+                       M .gitignore
+                       ?? notebooks/
+
+    ordered steps:
+      1. just audit-verify --prereg <pre-reg> --since <last-code-identical>
+      2. git push                                         # push, THEN re-check step 1
+      3. just audit-verify --prereg <same> --since <same>  # in the PUSHED state
+      4. just audit-findings                             # every F<n> has a disposition
+      5. just audit-evidence                             # nothing cited is /tmp-only
+      6. Phase 8 self-improvement -> append the RUN LOG entry
+      7. shutdown every teammate, THEN team_cleanup      # order matters; see command file
+
+    RESULT  NOT READY — resolve the above first
+```
+
+Both reds are closed:
+
+| check | result |
+|---|---|
+| `audit-evidence` | **PASS** — the last error was this file's own `RUN-LOG.md:615`, a single-backtick citation to a file the same sentence establishes is absent. A quotation, not a citation; wrapped as ``…``. |
+| `audit-findings` | **PASS** — `PIN OK 16/16 rows, all ids pinned, every disposition cell non-vacuous` |
+| `audit-verify` | `suite PASS 602 passed`; `measurement-track CHANGED` — the **documented expected red** from `8b220f6` |
+
+### 19.1 The measurement-track line was stating the opposite of its own verdict
+
+The check was always right. The sentence was not:
+
+```
+before:  measurement-track  CHANGED  tools/model_matrix.py byte-identical to prereg 97a2a52
+after:   measurement-track  CHANGED  differs from prereg 97a2a52 (+162/-0 lines) — NOT byte-identical
+         measurement-track  MATCH   byte-identical to prereg HEAD
+```
+
+The trailing clause was an **unconditional f-string**, so a CHANGED verdict still
+printed "byte-identical". On the one line a reader trusts when deciding whether the
+estimator moved, the tool asserted the opposite of what it had just measured. Both
+branches now verified by running them. `_numstat()` returns `(0, 0)` rather than raising
+when a ref cannot be diffed, deliberately: the verdict is already decided by the byte
+comparison, so a *reporting* failure must not become a false red.
+
+The `+162` is `8b220f6`'s `signal_ticker_mismatch` classifier and preflight. Unchanged by
+this commit, which touches only the message.
+
+### 19.2 What is still blocking NOT READY — and neither item is mine to close
+
+1. **`HEAD == upstream NO`.** 21 commits local, unpushed. Step 2 is `git push` and the
+   push is **the user's**, by standing instruction. Step 3 then re-verifies *in the
+   pushed state*, which is a distinct claim: a verification run on unpushed HEAD is not
+   the same artifact as one on pushed HEAD.
+2. **Working tree dirty**: `M .gitignore`, `?? notebooks/`. Both are the standing
+   notebook exclusion — notebook files stay out of every commit. `.gitignore` carries an
+   unstaged `.ipynb_checkpoints/` rule that predates this work. Not committed by me
+   because it is notebook work and the rule is explicit; it is the user's call whether
+   that rule lands as its own commit.
+
+### 19.3 A seventh wrong-measurement-tool, same family as the others
+
+`audit-verify` shells out to bare `pytest`. Run from outside the dev shell it produces
+**19 collection errors** (`ModuleNotFoundError: No module named 'kraken_api'`) because
+`PYTHONPATH`, which carries the `kraken-python` sibling, is absent — so the suite gate
+reads `NO SUMMARY` and `RESULT FAIL` for a suite that passes 602. My first two attempts to
+reproduce closeout hit exactly this and I initially took the FAIL at face value.
+
+Both were **discarded and re-run inside `nix develop`**, per §8.1. Not yet recorded in the
+tooling as a fix; flagged for the next pass, because an audit gate that reports FAIL
+because of the caller's shell is a gate that can cry wolf.
+
+That is now five wrong tools in one day, all the same family — a plausible-looking check
+answering a different question than the one being asked:
+
+| tool | claimed | reality |
+|---|---|---|
+| line-order `diff` | mass divergence | artifact: same lines, shifted |
+| set-difference `comm` | 84 lines missing | artifact: master refactored the logic |
+| `comm` on `grep`-prefixed output | everything missing | artifact: `grep` prefixes filenames |
+| patch-id after a squash-merge | 3 commits uncontained | artifact: a squash patch is a *union* |
+| bare `pytest` outside the dev shell | 19 collection errors | artifact: `PYTHONPATH` absent |
+
+Each was caught only by checking a *different* way and demanding the two agree.
