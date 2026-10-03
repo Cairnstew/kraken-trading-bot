@@ -311,15 +311,30 @@ social-timer ticker="ETH/USD" output="signals/eth_usd_social.jsonl":
 depth-timer pair="ETH/USD" output="signals/eth_usd_orderbook.jsonl" count="100":
   #!/usr/bin/env bash
   set -euo pipefail
+  # ONE timer path, never two. `nix/module.nix` declares a SYSTEM unit
+  # (systemd.services/systemd.timers, off by default behind `ob.enable`);
+  # this recipe installs a USER unit. They are independent units and neither
+  # suppresses the other, so enabling both snapshots TWICE an hour and every
+  # depth series silently doubles its own cadence. Refuse rather than allow it.
+  if systemctl is-enabled --quiet kraken-trading-bot-order-book.timer 2>/dev/null; then
+      echo "REFUSING: the SYSTEM timer kraken-trading-bot-order-book.timer is enabled." >&2
+      echo "  Two timers would each fire hourly. Pick one path:" >&2
+      echo "    - keep the system timer: skip this recipe, set ob.enable = true" >&2
+      echo "      in nix/module.nix and rebuild the host instead;" >&2
+      echo "    - keep this user timer: disable the system unit first, e.g." >&2
+      echo "        systemctl disable --now kraken-trading-bot-order-book.timer" >&2
+      echo "      or set ob.enable = false, then re-run." >&2
+      exit 1
+  fi
   unit_dir="$HOME/.config/systemd/user"
   root="{{justfile_directory()}}"
   mkdir -p "$unit_dir" "$root/$(dirname {{output}})"
   sed -e "s|@ROOT@|$root|" -e "s|@PAIR@|{{pair}}|" \
-      -e "s|@OUTPUT@|$root/{{output}}|" -e "s|@COUNT@|{{count}}|" \
-      "$root/systemd/kraken-trading-bot-order-book.service.in" \
-      > "$unit_dir/kraken-trading-bot-order-book.service"
+    -e "s|@OUTPUT@|$root/{{output}}|" -e "s|@COUNT@|{{count}}|" \
+    "$root/systemd/kraken-trading-bot-order-book.service.in" \
+    > "$unit_dir/kraken-trading-bot-order-book.service"
   ln -sf "$root/systemd/kraken-trading-bot-order-book.timer" \
-      "$unit_dir/kraken-trading-bot-order-book.timer"
+    "$unit_dir/kraken-trading-bot-order-book.timer"
   systemctl --user daemon-reload
   systemctl --user enable --now kraken-trading-bot-order-book.timer
   echo "enabled. Next fire:"

@@ -1105,3 +1105,190 @@ user's), the working tree dirty with the notebook exclusion, and `measurement-tr
 as the documented expected red. `.gitignore` and `notebooks/` are the user's to land or
 leave — untouched. The checks are re-run **in the pushed state from the dev shell** after the
 push; READY is not written before that.
+
+## 21. The lead's six challenges — `SHORT`, the N floor, the double timer, provenance, and a retracted claim
+
+### 21.1 `SHORT 3` explained; my §20.5 summary was the thing that was wrong
+
+The lead was right to stop on this and right that the report as I gave it did not add up.
+**My summary said "five distinct timestamps about an hour apart".** That was the error: only
+the last two intervals are about an hour apart. The first four records are all inside hour
+19. `SHORT` is an **interval status**, and the three it flagged are:
+
+```
+  expected = 3600s   gap_factor = 1.5
+  SHORT if delta < 2400s      GAP if delta > 5400s
+
+  #  from                       to                             delta status missing  same_hour
+  1  2026-10-03T19:10:45.752567+00:00  2026-10-03T19:12:55.755671+00:00   130s SHORT  0  YES
+  2  2026-10-03T19:12:55.755671+00:00  2026-10-03T19:37:04.693310+00:00  1449s SHORT  0  YES
+  3  2026-10-03T19:37:04.693310+00:00  2026-10-03T19:42:32.145878+00:00   327s SHORT  0  YES
+  4  2026-10-03T19:42:32.145878+00:00  2026-10-03T20:41:34.444635+00:00  3542s OK     0  no
+  5  2026-10-03T20:41:34.444635+00:00  2026-10-03T21:43:30.815136+00:00  3716s OK     0  no
+```
+
+So the three SHORT intervals are the three sub-40-minute gaps inside the **bring-up hour**:
+a manual pull, the planted-hole measurement, the worktree-defect re-seed, and the first
+unattended fire all landed within 19:00–19:42. Intervals 4 and 5 are the unattended hourly
+cadence and are **OK**.
+
+**Answering the lead's two hypotheses directly, because both were reasonable and one was
+right to worry about:**
+
+- *"SHORT means the book returned fewer levels"* — **no.** `SHORT` is computed purely from
+  the timestamp delta (`classify_interval`, lines 315-360); it never reads the book. But the
+  underlying worry is already covered: every snapshot records
+  `depth = {requested_count, bid_levels, ask_levels, levels_total, truncated}`, and all six
+  snapshots show `bid_levels=100, ask_levels=100, truncated=false` — 0 short of request. A
+  short book would surface there, not in `SHORT`.
+- *"state it in the status output's own wording"* — **done.** The line used to read
+  `SHORT : 3 (re-fire inside an hour — benign, counted separately from gaps)`, which is
+  what I over-read as "3 duplicates". It now reads:
+
+  ```
+  SHORT         : 3 interval(s) closer than 2400s (= 3600s expected / 1.5 factor)
+                   a sub-hour re-fire, timer catch-up, or two manual pulls in quick succession;
+                   counted separately from gaps, and NEITHER a duplicate-record count NOR a depth shortfall
+  ```
+
+  The threshold is printed rather than only the count, so a nonzero value can never again sit
+  unexplained beside a `VERDICT` line. The docstring's "benign" is also gone: a timer
+  misfiring twice in 40 minutes is `SHORT` too and is **not** benign.
+
+### 21.2 The `holes` annotation was wrong (found by the type checker, pre-existing)
+
+`GapReport.holes` is annotated `tuple[Hole, ...]`, but it is assigned GAP-classified
+`Interval` objects, and `class Hole` is constructed nowhere in the repo. Annotations are not
+enforced at runtime, so every number reported so far is unaffected — but it misdescribed the
+field to any reader, in the same file where "don't leave state unexplained" is the rule.
+Now `tuple[Interval, ...]`, with a comment saying so. **Pre-existing, not introduced here**
+(confirmed by AST-reading the stashed tree).
+
+### 21.3 N: which number is the floor and which is the choice
+
+§20.6 blurred these. Precisely:
+
+| | value | kind |
+|---|---|---|
+| **`bars_needed` 2,136** = train 1,424 + eval 712 | **89 days** | **THE FLOOR.** Derived from measured numbers; a consumer running below it cannot separate signal from seed noise. Hard gate. |
+| **N = 365 days = 8,760 snapshots** | 365 days | **THE CHOICE.** Not derived — selected. |
+
+**Why 365 and not 89.** The floor answers "when is an evaluation *possible*". 89 days buys
+exactly one train/eval split, which is the matrix-harness finding already paid for once:
+within-config seed spread **exceeded** the between-config effect at short eval widths, so a
+single split at the floor measures the seed, not the config. 365 days buys four independent
+quarterly splits — **Q4 2026, Q1, Q2 and Q3 2027 are four different volatility regimes** —
+so the question becomes "does the effect hold across regimes or was it one regime?", which is
+the only form of the claim worth making about a signal that will gate real capital. It also
+matches the funding channel's existing ~366-day window, so book and funding are evaluated over
+the same span instead of the comparison being silently confounded by unequal coverage.
+
+**89 days is recorded as a hard floor: no consumer may run below it.** N = 365 is the target.
+
+**Consumption date implied by the first snapshot.** First record
+`2026-10-03T19:10:45Z` + 365 days → **2027-10-03**, so a consumer may first run on
+**2027-10-04** (the first full day past the window). That is ~14 months out, and the lead's
+point stands: a timer left unobserved for a year needs its status line *seen*, not assumed.
+The evidence trail therefore records the unattended cadence as it accumulates — six records
+and three unattended fires at the time of writing — and §21.4 makes the survivability
+question explicit rather than leaving it to chance.
+
+### 21.4 The double timer is settled now: the recipe refuses
+
+Chosen over deleting either path, because both serve real hosts: `nix/module.nix` is the
+declarative route for a NixOS host, `just depth-timer` is the route for a host this repo is
+merely checked out on (this one). Deleting a path would break one of those two cases.
+
+`just depth-timer` now **refuses before writing anything** if the system unit is enabled:
+
+```
+if systemctl is-enabled --quiet kraken-trading-bot-order-book.timer 2>/dev/null; then
+    echo "REFUSING: the SYSTEM timer kraken-trading-bot-order-book.timer is enabled." >&2
+    ... names both remedies (ob.enable = true, or disable the unit) ...
+    exit 1
+fi
+```
+
+Refuse, not warn: a warning is what produced this defect in the first place. Three tests,
+each extracting the recipe body and running it against a **fake `systemctl`** on `PATH` with
+`HOME` redirected, so the assertion neither depends on nor touches this host's units:
+
+- `test_depth_timer_refuses_when_the_system_timer_is_enabled` — non-zero exit, `REFUSING` on
+  stderr, and it must name `ob.enable` so the user chooses rather than guesses.
+- `test_depth_timer_proceeds_when_the_system_timer_is_absent` — no false block; reaches its
+  normal success path. Without this, a guard that always fires would pass the first test.
+- `test_the_two_timer_paths_are_both_declared` — the NixOS declaration still exists, so if
+  someone deletes a path deliberately they must delete the guard and this test together.
+
+Verified on the real host afterwards: guard silent (`systemctl is-enabled` → `not-found`),
+`just depth-timer` completes, timer still `active`, 6 records.
+
+**Normalisation found on the way.** `depth-timer` was the **only one of 42 recipes** indented 4
+spaces, and was internally *mixed* — a 4-space header block over a 2-space body. The body is
+now 2-space like every other recipe, and the test's recipe extractor no longer assumes an
+indent width (it takes lines while blank-or-indented, which is how `just` itself delimits).
+
+### 21.5 Survives logout: yes, already — verified rather than assumed
+
+`loginctl show-user seanc -p Linger` → **`Linger=yes`**, so the user manager persists past
+logout and the timer keeps firing with no session. This was already the case; it had never
+been checked, and the lead is right that it had to be. Suspend is handled separately and
+already: `Persistent=true` means a missed wall-clock slot is caught up on resume, and the
+gap counter then shows the *record* of what was missed — it cannot recover the depth itself,
+which is precisely why the hourly cadence matters and why §21.3's floor exists.
+
+### 21.6 Recorder commits pinned by a proper ref; harness branch deleted
+
+The lead's concern was right: `opencode/ensemble-…-x622s1-recorder` sat in a harness
+namespace that a later cleanup or rename could drop. Resolving the question asked — *are the
+commits needed, or only their content?* — path by path against master:
+
+```
+IDENTICAL  README.md, justfile, kraken_trading_bot/cli.py,
+           kraken_trading_bot/depth_recorder.py, nix/module.nix,
+           systemd/kraken-trading-bot-order-book.{service,service.in,timer},
+           tests/test_depth_recorder.py
+SUPERSET   .data-audit/EVIDENCE-G1-DEPTH-RECORDER.md — master's 734 lines contain the
+           branch's 556 verbatim, plus the lead takeover addendum
+EXCLUDED   --.status.json — a CLI arg-parse accident, never wanted in master
+```
+
+(This corrects §20.1's "all seven files byte-identical": it was **nine** identical paths plus
+one superset plus one deliberate exclusion. The count was wrong; the conclusion held.)
+
+**Only the content is needed — it is already in master.** So `archive/g1-recorder-x622s1` now
+pins the three commits (`ac44ffd`, `6f8576d`, `e64a2ef`, all verified reachable by name) and
+the `opencode/*` branch is deleted. `refs/heads/opencode/*` is now **empty**.
+
+All four archive tags resolve by name: `archive/g1-recorder-x622s1`→`e64a2ef`,
+`archive/e57056d-normalization-wiring`→`e57056d`, `archive/ab44f11-extra-features-seam`→`ab44f11`,
+`archive/4c65432-export-data-wip`→`4c65432`. They stay **local** (`--tags` is never pushed, per
+the lead). Loss of this machine costs the history, not the code — the content is in master.
+
+### 21.7 RETRACTED: there is no formatter, and I should not have said there was
+
+I told the lead "a formatter kept reverting my writes". **That was false, and I retract it.**
+Checked for the actual mechanism before accepting it:
+
+| candidate | result |
+|---|---|
+| `.pre-commit-config.yaml` | absent |
+| `.git/hooks` non-sample hooks | none |
+| `core.hooksPath` | unset |
+| direnv / `.envrc` | absent |
+| `flake.nix` devShell `shellHook` | present, but only `echo`s, exports `PYTHONPATH`, and runs two import checks — **rewrites nothing** |
+| `black`/`ruff`/`isort`/`treefmt`/`nixfmt` in the dev shell | not installed |
+| opencode `plugin`/`plugins` | `[]` (only a stale `.backup` names ensemble) |
+| any script referencing `audit_checks` | none |
+
+There is no such tool in this repo, so there was nothing to name, no hook to document, and
+nothing to add to a `tools/README` — which does not exist either. The honest description of
+what happened is duller and worse: **I broke that file's indentation with my own edits, twice,
+and restored it from git myself.** The "reverting" was my own failed writes being reported
+to me as failures I then misattributed to an outside agent — the same shape as §20.4's wrong
+tools: a plausible external cause preferred over the plain one. The fix (a module-level
+`run_suite_gate()` rather than repeated inline edits) stands on its own merits and is
+untouched by this retraction.
+
+**No formatter touches `tools/audit_checks.py`**, before or after. Nothing to guard against,
+and no environment table to extend.

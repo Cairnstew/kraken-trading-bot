@@ -227,7 +227,9 @@ class GapReport:
     first_recorded_at: str | None
     last_recorded_at: str | None
     observed_span_seconds: float
-    holes: tuple[Hole, ...] = ()
+    #: The GAP-classified intervals, verbatim — same objects as ``intervals``.
+    #: Not :class:`Hole` (that dataclass is unused); the annotation said so until now.
+    holes: tuple[Interval, ...] = ()
     intervals: tuple[Interval, ...] = ()
 
     @property
@@ -736,9 +738,25 @@ def format_report(
             else ""
         )
     )
+    # The threshold is printed, not just the count: a bare nonzero counter beside a
+    # VERDICT line reads as an unexplained defect (or, worse, gets dismissed as one).
+    # `SHORT` is an INTERVAL status — any consecutive pair closer together than
+    # expected/gap_factor — and is NOT a count of duplicate records, nor anything to
+    # do with book depth.  Those are three different things a reader confuses.
+    short_threshold = report.expected_interval_seconds / report.gap_factor
     lines.append(
-        f"  SHORT         : {report.n_short_intervals} "
-        f"(re-fire inside an hour — benign, counted separately from gaps)"
+        f"  SHORT         : {report.n_short_intervals} interval(s) "
+        f"closer than {short_threshold:.0f}s "
+        f"(= {report.expected_interval_seconds:.0f}s expected / "
+        f"{report.gap_factor:g} factor)"
+    )
+    lines.append(
+        "                   a sub-hour re-fire, timer catch-up, or two manual pulls "
+        "in quick succession;"
+    )
+    lines.append(
+        "                   counted separately from gaps, and NEITHER a duplicate-record "
+        "count NOR a depth shortfall"
     )
     lines.append(
         f"  GAPS          : {report.n_gaps}   "

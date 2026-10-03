@@ -16,6 +16,9 @@ is what the audit's CHECKPOINT RULE asks for: not "we imagine it would fail".
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -803,4 +806,132 @@ def test_the_feature_seam_is_unchanged_on_disk():
         pytest.skip(f"git unavailable: {proc.stderr.strip()}")
     assert proc.stdout.strip() == "", (
         f"§8.1.4 forbids touching the feature seam; this slice changed it:\n{proc.stdout}"
+    )
+
+
+# ── the double-timer guard ────────────────────────────────────────────────
+# NAMED DEFECT: `nix/module.nix` declares a SYSTEM timer (systemd.services /
+# systemd.timers, behind `ob.enable`) and `just depth-timer` installs a USER
+# timer.  Independent units; neither suppresses the other.  A host that enabled
+# both would snapshot twice an hour, and every depth series would silently
+# double its own cadence — while the gap counter, scanning a log that looks
+# perfectly regular, printed GREEN.  The guard is the recipe refusing.
+#
+# The recipe body is extracted and run against a FAKE `systemctl` rather than the
+# host's real one: the assertion must not depend on this machine's units, and
+# must not touch them.
+
+_RECIPE_NAME = "depth-timer"
+
+
+def _recipe_body(repo: Path) -> str:
+    """The shell body of the `depth-timer` recipe, placeholders already resolved."""
+    lines = (repo / "justfile").read_text(encoding="utf-8").splitlines()
+    start = next(
+        (i for i, l in enumerate(lines) if re.match(rf"^{_RECIPE_NAME}\b", l)), None
+    )
+    assert start is not None, f"justfile has no {_RECIPE_NAME} recipe"
+    # A just recipe body runs until the next line that is neither blank nor indented.
+    # Deliberately NOT `\s{4}`: that assumed an indent width, and depth-timer alone
+    # was mixed (4-space header over a 2-space body) before this normalised it.
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if lines[i].strip() and not lines[i][0].isspace()
+        ),
+        len(lines),
+    )
+    body = "\n".join(l.strip() for l in lines[start + 1 : end] if l.strip())
+    body = body.replace("{{justfile_directory()}}", str(repo))
+    body = re.sub(r"\{\{[^}]*\}\}", "x", body)  # pair/output/count params
+    return body
+
+
+def _run_recipe_with_fake_systemctl(
+    repo: Path, tmp_path: Path, *, system_timer_enabled: bool
+) -> subprocess.CompletedProcess[str]:
+    """Run the recipe with a stub `systemctl` first on PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "systemctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        # Only the system-level query is answered "enabled"; everything else the
+        # recipe calls (`--user daemon-reload`, `enable --now`, `list-timers`) is
+        # a no-op success so the guard is the ONLY thing under test.
+        'if [ "$1" = "is-enabled" ]; then\n'
+        f"  exit {0 if system_timer_enabled else 1}\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    # HOME redirected so the recipe cannot touch the real user unit dir.
+    env["HOME"] = str(tmp_path / "home")
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        ["bash", "-c", _recipe_body(repo)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+def test_depth_timer_refuses_when_the_system_timer_is_enabled(tmp_path: Path) -> None:
+    """The recipe must refuse, not warn: two timers each fire hourly."""
+    repo = Path(__file__).resolve().parents[1]
+    proc = _run_recipe_with_fake_systemctl(repo, tmp_path, system_timer_enabled=True)
+    assert proc.returncode != 0, (
+        "just depth-timer proceeded while the SYSTEM timer was enabled — two "
+        f"timers would each fire hourly.\nstdout:\n{proc.stdout}"
+    )
+    assert "REFUSING" in proc.stderr, (
+        f"expected an explicit REFUSING on stderr, got:\n{proc.stderr}"
+    )
+    assert "ob.enable" in proc.stderr, (
+        "the refusal must name the switch that turns the other path on, so the "
+        f"user can choose rather than guess:\n{proc.stderr}"
+    )
+
+
+def test_depth_timer_proceeds_when_the_system_timer_is_absent(tmp_path: Path) -> None:
+    """The guard must not fire on the ordinary single-timer host (no false block)."""
+    repo = Path(__file__).resolve().parents[1]
+    proc = _run_recipe_with_fake_systemctl(repo, tmp_path, system_timer_enabled=False)
+    assert "REFUSING" not in proc.stderr, (
+        f"guard fired with no system timer present — it would block every host:\n{proc.stderr}"
+    )
+    assert proc.returncode == 0, (
+        f"recipe failed with no system timer enabled:\nstdout:\n{proc.stdout}\n"
+        f"stderr:\n{proc.stderr}"
+    )
+    assert "enabled. Next fire:" in proc.stdout, (
+        f"recipe did not reach its normal success path:\n{proc.stdout}"
+    )
+
+
+def test_the_two_timer_paths_are_both_declared() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    """Both paths must still exist — the guard picks one at runtime, it does not
+    delete the NixOS declaration."""
+    module = (repo / "nix" / "module.nix").read_text(encoding="utf-8")
+    assert 'systemd.services."kraken-trading-bot-order-book"' in module, (
+        "the NixOS system timer is gone; if it was deleted deliberately, drop the "
+        "recipe guard and this test together rather than leaving one behind"
+    )
+    assert 'systemd.timers."kraken-trading-bot-order-book"' in module
+    # Assignment lines only.  The block's own COMMENT names `systemd.user.*` to
+    # explain that it is deliberately not used, so matching the raw text would
+    # fail on the explanation and pass on a real regression.
+    g1 = module.split("G1 order-book depth recorder")[1][:4000]
+    assignments = [
+        l for l in g1.splitlines() if re.match(r"^\s*systemd\.(user|lightdm)\.", l)
+    ]
+    assert not assignments, (
+        "the G1 block must assign under systemd.services/systemd.timers (NixOS), not "
+        f"a home-manager namespace — found: {assignments}"
     )
