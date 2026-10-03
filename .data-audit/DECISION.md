@@ -459,6 +459,49 @@ convention. The defence is the same in both cases: **the red output must carry t
 that would have been wrong**, not merely a failure. A count-only assertion could pass
 against the wrong axis; a set-difference cannot.
 
+### 8.1 Output from a broken run is not evidence — DISCARD AND RE-RUN
+
+The red-run obligation above says a guard must be *shown wrong* before it counts. Its
+mirror is equally load-bearing: **output produced by a run whose environment was broken is
+not evidence of anything, in either direction.** It is discarded and the run repeated. It
+is not reported, not caveated, and not reasoned from.
+
+**The measured case.** A worktree-audit loop in the 2026-10-03 matrix pass broke `PATH`
+mid-iteration, so `git`, `wc`, `grep` and `sed` returned "command not found" for the
+later worktrees. The loop's output still *looked* structured, and it was reported anyway:
+five of six worktrees were described as "fully merged into master" when **five of six
+held commits not in master**, and two were described as "gone" when only their directory
+was absent. Nothing about the failure was visible in the output — the lines were
+well-formed and confidently wrong. Had that not been caught by an independent patch-id
+check before a destructive `team_cleanup` purge, unrecoverable work would have been
+deleted on the strength of a broken shell.
+
+**Why the shape is deceptive.** A broken environment does not crash loudly. It emits
+plausible-looking values, and a loop that keeps going will happily summarise them. The
+tell is not in the output — it is in whether the commands could have run at all.
+
+**The rule.**
+
+1. **Verify the toolchain first in any batch run.** One `command -v git` up front, not
+   per-iteration.
+2. **A non-zero exit or a "command not found" inside a loop DISCARDS that iteration's
+   output** and the iteration is re-run. It is not passed to the next stage, not
+   summarised, and not reported with a caveat.
+3. **Never let a broken run's output reach a destructive decision.** If a purge, a
+   rebase, a `git clean` or a branch delete is being considered on the strength of a
+   batch report, that report is re-derived from a run whose exit status was checked.
+4. **Cross-check the shape of the claim, not just its existence.** A per-item verdict
+   ("fully merged") gets one independent verification (patch-id, tree diff, or a
+   second method) before it is acted on. One method that silently degrades to a
+   plausible default is not a check.
+5. **A broken run is a finding about the harness, not about the subject**, and is
+   recorded only AFTER the clean re-run exists — otherwise the record repeats the
+   mistake it is describing.
+
+This sits beside the red-run rule deliberately: one says *prove the guard can fail*, the
+other says *prove the run could succeed*. A suite of self-certified greens and a pipeline
+of confidently-wrong batches fail the same way — neither was ever tested against reality.
+
 ---
 
 ## 9. Runner-ups, and the specific evidence that sank each

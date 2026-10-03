@@ -644,3 +644,114 @@ The two defects are a small fix pass, **not a Phase 7 deferral**, and they run i
 with the G1 recorder rather than ahead of it — the recorder is the one with a data-loss
 clock. `audit-closeout` is re-run after that fix pass, and **only then** is READY written.
 Until then the status is: **not READY, three documented reds.**
+
+## 13. Ensemble worktree cleanup — refs, not shas
+
+Six non-main worktrees were registered, left by the previous pass. **A first pass at this
+produced a confidently wrong answer and nearly caused data loss**: a loop broke `PATH`
+mid-run, `git`/`wc`/`grep` returned "command not found" for the later entries, and the
+malformed output was still reported — five of six branches described as "fully merged into
+master" when **five of six held commits not in master**. Caught by an independent patch-id
+check before anything was deleted. That failure is now a standing rule at **DECISION.md
+§8.1** (output from a broken run is discarded and re-run, never reported).
+
+Containment established by **patch-id** (content-based, not subject-based), because
+subject matching gave a false "merged" on a cherry-picked commit whose trees differ:
+
+| branch | commits | patch-id verdict |
+|---|---|---|
+| `…audit-pipeline-1002c-h7biuo-builder` | `4fba0ab` | CONTAINED |
+| `…data-audit-1002-g08vu1-builder` | `e824f0c` | CONTAINED (as `8569c08`) |
+| `…matrix-harness-pseemi-matrix-verify` | — | 0 ahead |
+| `…audit-pipeline-2-kd5vk5-builder` | `2df5715`, `f6a5761` | BOTH CONTAINED (`f6a5761` trees identical to `a39e184`) |
+| `…audit-pipeline-geu0v0-builder-2` | `6ebe95e`, `52271cb` | **NEITHER contained** |
+| `…matrix-harness-pseemi-harness` | `94d03e2` | **NOT contained** |
+
+### Refs, not shas
+
+A sha in a document is a pointer to an object `git gc` may delete once nothing references
+it, so the three uncontained commits are pinned by **annotated tags**, verified to resolve
+both before and after the worktree removals:
+
+- `archive/52271cb-export-data-wip` → `52271cb`
+- `archive/6ebe95e-fitted-normalization` → `6ebe95e`
+- `archive/94d03e2-matrix-harness` → `94d03e2`
+
+Their branches are also still present. **Nothing was purged**: `team_cleanup`'s archive
+purge was deliberately NOT called, per instruction, and no `team_cleanup` of any kind was
+run in this pass.
+
+### Removed (four), each checked clean first
+
+`git status --porcelain` was empty in both worktrees that still had a directory
+(`matrix-verify`, `ktb-builder-fix`). The other two (`h7biuo`, `g08vu1`) had **no
+directory at all** — `prunable`, git's own marker for it — so there were no working files
+to be dirty; that was confirmed by finding the paths absent rather than inferred from the
+flag. Patch-id containment covers commits; the porcelain check covers the uncommitted files
+patch-id cannot see. Removed with `git worktree remove`, not with a purge.
+
+## 14. Supersession review of the three uncontained commits
+
+### `6ebe95e` — "apply the fitted normalization stats to the observation" · SUPERSEDED
+
+The commit's thesis: the moments must be fitted over the **observation frame**
+(`compute` → `ffill` → `fillna(0)`), not over raw `compute` output, because fitting on raw
+output mixes the NaN warm-up rows into the moments and makes the `z_` columns a *different*
+normalization from the one the policy runs on.
+
+**Every claim verified present in master, by expression rather than by appearance:**
+
+| 6ebe95e route | master's line | expression |
+|---|---|---|
+| `fit` → `observation_frame(compute(df))` | `features.py:642` | `self.compute(df).ffill().fillna(0.0)` |
+| `transform` | `features.py:740` | `self.compute(df).ffill().fillna(0.0)` |
+| `TradingEnvironment._raw_feature_array` | `environment.py:488` | `self._features.ffill().fillna(0.0)` |
+| `PaperTrader._build_observation` | `paper_trade.py:345` | `computed.ffill().fillna(0.0)` |
+| export's feature block | `export.py:192` | `computed.ffill().fillna(0.0)` |
+
+And `observation_frame` is, in full, `return features.ffill().fillna(0.0)`. So the
+abstraction is a one-line wrapper over an expression master writes out at all five sites.
+Master's `fit` docstring (`features.py:612`) states the invariant in prose — "Stats are
+fitted on the **ffilled observation frame**". **Behaviour is equivalent.**
+
+The refactor's real value — one function every observation path must route through, so the
+convention cannot drift — is **not** reproduced in master, which has no `observation_frame`
+symbol. That is a genuine difference, and it is a *maintainability* difference, not a
+behavioural one.
+
+**Where master is arguably ahead:** `features.py:55-70` carries a comment explaining why
+the fill policy is subtle — `signal_observed` (0.0/1.0) and `signal_age_hours` (−1.0 for
+"no reading") are *load-bearing sentinels*, and mapping their values to NaN "is what broke
+three freshness/signal regression tests when this list was first used here". `6ebe95e`
+predates that finding and shares no such guard.
+
+**The five tests `6ebe95e` added are all absent from master by name** —
+`test_environment_observation_is_z_scored_affine_image`,
+`test_environment_builtin_features_unscaled`,
+`test_built_observation_is_z_scored_with_the_saved_stats`,
+`test_prepare_episode_slices_window_and_fits_stats`,
+`test_prepare_episode_fits_stats_on_observation_frame`. Checked individually rather than
+assumed lost: **each invariant is covered in master under a different name**, and master's
+coverage is broader (114 tests in `test_model_matrix.py`, plus
+`test_observation_uses_saved_stats_not_a_refit`, `test_built_observation_is_z_scored_by_saved_stats`,
+`test_normalized_block_equals_environment_observation`,
+`test_all_six_activated_columns_reach_the_observation`,
+`test_ten_zero_variance_columns_normalize_to_zero_not_inf`). **No invariant was lost.**
+
+### `52271cb` — original `export-data` CSV export (WIP) · SUPERSEDED
+
+All 9 touched files exist in master. All three exported symbols present
+(`build_export_frame`, `write_export_csv`, `default_export_path`), `cmd_export_data` wired
+into the CLI, and master's `test_rl_export.py` carries **11 tests against the 10 it
+shipped**. The feature was rebuilt, not merged — hence the differing patch-id.
+
+### `94d03e2` — original model-matrix harness · SUPERSEDED, and the progenitor
+
+All 6 files present. All six key symbols present (`cmd_plan`, `cmd_run`, `cmd_report`,
+`assess_cell`, `dispersion_verdict`, `classify_process_failure`). Master is **larger on
+every axis**: `tools/model_matrix.py` 2917 lines vs 2279 shipped;
+`test_model_matrix.py` **114 tests vs 87** shipped. This is the ancestor of the harness
+this pass has been extending — my own commits modified `model_matrix.py` today.
+
+**Conclusion: all three superseded. No hunk is missing from master.** The tags stay until
+this is approved for dropping.
