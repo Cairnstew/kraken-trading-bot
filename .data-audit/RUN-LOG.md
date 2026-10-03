@@ -1292,3 +1292,156 @@ untouched by this retraction.
 
 **No formatter touches `tools/audit_checks.py`**, before or after. Nothing to guard against,
 and no environment table to extend.
+
+## 22. The lead's second round — provenance of the six records, a softened N, and an off-host copy
+
+### 22.1 Which records are real readings: 2 seeded, 5 unattended fires — and two errors corrected
+
+The file holds **7** records now (the lead's "six" was accurate when written; a sixth
+unattended fire has since landed). Attribution by matching every `recorded_at` against
+**all** the journal's `Starting` lines, not one of them:
+
+| # | `recorded_at` (UTC) | nearest service exec | verdict | counts toward N? |
+|---|---|---|---|---|
+| 1 | 19:10:45.752567 | 1572 s | **MANUAL, and SEEDED** — byte-identical to `/tmp/g1-rescued/` | **NO** |
+| 2 | 19:12:55.755671 | 1442 s | **MANUAL, and SEEDED** — same | **NO** |
+| 3 | 19:37:04.693310 | **7 s** | **TIMER** — `Persistent=true` catch-up on enable | yes |
+| 4 | 19:42:32.145878 | **8 s** | **TIMER** | yes |
+| 5 | 20:41:34.444635 | **7 s** | **TIMER** | yes |
+| 6 | 21:43:30.815136 | **4 s** | **TIMER** | yes |
+| 7 | 22:43:30.255090 | **3 s** | **TIMER** | yes |
+
+**Two of my own earlier claims were wrong**, both from quoting a single journal line instead
+of reading all of them: §20.5 and EVIDENCE §5 named **20:42:24 BST as the first unattended
+fire** — **19:36:58 UTC was earlier** and produced record #3, the `Persistent=true` catch-up
+that fired when `just depth-timer` enabled the unit. And EVIDENCE §3 called records #1–#3
+"a manual start"; **#3 is a timer fire.** Corrected in place in the evidence file.
+
+**The planted-hole RED run used a copy.** It wrote `/tmp/g1-red-hole.jsonl` — 8 records with
+a deliberate 5-hour hole — a separate file. Its timestamps were intersected against the real
+log: **zero appear.** The real log's only writer is `record_once` → `append_record`; there is
+no hand-edit path. So: **no synthetic or hand-edited record is present.**
+
+**Records #1–#2 are real readings but were COPIED IN, not appended here** — byte-identical to
+the rescued worktree file. That is a third category the earlier text did not have, between
+"manual pull" and "timer fire". They are excluded from the depth count: **N = 8,760 starts at
+record #3**, the first unattended fire. The records stay in the file (append-only, real data),
+so anyone counting rows must subtract the seeded pair — recorded in EVIDENCE §6 rather than by
+tagging the records, because tagging would mean rewriting an append-only artifact.
+
+### 22.2 N: the regime claim softened, and the floor's provenance made explicit
+
+§21.3 said 365 days buys "four quarterly splits across four volatility regimes". **That
+asserts something nobody has measured.** Four calendar quarters give four splits; whether they
+are four *different regimes* is a question about realised volatility that can only be
+computed from data that does not exist yet. Corrected to:
+
+> **N = 365 days buys four quarterly splits — regime diversity to be MEASURED, not assumed.**
+> Once the depth series exists, compute realised volatility per quarter and report it. If the
+> four quarters turn out to be one regime, the four splits buy nothing over one and N has to
+> grow; that is a measurement to make, not a property to claim now.
+
+**The 89-day floor's own provenance, which §21.3 also blurred.** The 178-bar seed-noise figure
+was measured on the **price-only policy** — 3 seeds, and within-config spread exceeded the
+between-config effect at that eval width. **Carrying that number over to book features is an
+assumption**, not a measurement: a book-derived feature set has different seed variance, and
+nothing in the corpus measures it. Book features may well need a *wider* eval slice, which
+would push the floor above 89 days. **The first consumer must check this before treating 89
+days as sufficient** — and if book features are noisier, the honest response is a larger
+floor, not a smaller N.
+
+So both numbers now carry their provenance: **89 days = floor, derived from a
+price-only seed-noise measurement, transfer to book features assumed and unverified. 365 days
+= choice, four quarterly splits, regime diversity to be measured.**
+
+### 22.3 The double timer in the OTHER order — cannot be blocked, so it is detected
+
+§21.4's guard fires when `just depth-timer` runs and the **system** unit is already enabled.
+The lead asked the reverse: the user timer is installed and running, and someone later
+enables `ob.enable` and rebuilds the host.
+
+**That cannot be blocked, and I am not going to pretend otherwise.** The recipe is a
+one-shot installer; by the time the system unit appears there is no recipe left to refuse.
+Neither systemd unit is aware of the other, and there is no ordering constraint that could be
+declared between a `systemd.user` unit and a `systemd.services` one — they are different
+managers.
+
+What a double fire looks like: **two records per hour, roughly 1800 s apart**, which the gap
+counter classifies as **`SHORT`** — and §21.1 already established that `SHORT` outside a
+bring-up burst is not benign. So the status output now says so, and names the two commands
+that settle it:
+
+```
+  SHORT         : 3 interval(s) closer than 2400s (= 3600s expected / 1.5 factor)
+                   a sub-hour re-fire, timer catch-up, or two manual pulls in quick succession;
+                   counted separately from gaps, and NEITHER a duplicate-record count NOR a depth shortfall
+                   >> 3 SHORT interval(s) AFTER the first record is not benign: if these are not your own manual
+                      pulls, CHECK FOR A SECOND TIMER — `systemctl is-enabled kraken-trading-bot-order-book.timer`
+                      (system) vs `systemctl --user is-active kraken-trading-bot-order-book.timer` (user). Both fire hourly.
+```
+
+The guard prevents the reachable order; this line detects the unreachable one. A consumer must
+also treat `dedup-on-read` (§22.4) as mandatory rather than optional, since a double timer
+produces two records in one floored hour.
+
+### 22.4 `depth-verify`: the read-only check, and what it caught
+
+Written, run against the real log, and **non-vacuous by mutation** — full output and the
+ten-of-ten matrix in EVIDENCE §7. `VERDICT: PASS`, 7 records, 0 short of depth, dedup
+`7 rows -> 4`, and **the file's hash is identical before and after** (`a7b540d1…`), which is
+the part that matters: a verification pass must not be able to damage an unrecoverable
+artifact. No sidecar either.
+
+The dedup line answers the same-hour problem without touching the producer: **7 rows → 4**,
+the 3 collapsed rows being exactly the 3 `SHORT` rows. Last-wins per floored hour, in the
+consumer, never in the recorder.
+
+**It caught a real schema fact on first run, and the fact was that I was wrong.** I asserted
+`best_bid`/`best_ask`/`mid`/`spread` were JSON numbers; all 7 records store **decimal
+strings**. Reading `depth_recorder.py:537-544` showed that is deliberate — Kraken's raw price
+string kept, `spread`/`mid` formatted to 10 dp — consistent with the `Decimal`-for-money
+convention used throughout this codebase. **My assertion described a schema the recorder does
+not use.** Rewritten to parse decimals and check much more than a type: `best_bid`/`best_ask`
+must equal the touch of `bids[0]`/`asks[0]`; `spread == ask - bid`; `mid == (bid + ask)/2`;
+each side monotone **as a Decimal**, because as strings `"9.9" > "10.0"` would invert the book
+and pass an ascending book as descending; `hour == floor(recorded_at)`.
+
+The assertion that matters for the lead's depth question, isolated on a copy:
+
+```
+  short book (40<100), truncated=false   RED     40/100 short of requested 100 but truncated is false
+  short book (40<100), truncated=true    GREEN   the honest version of the same book passes
+```
+
+That pair is the whole point: it separates a **silent depth reduction** from an honestly
+flagged short book, which is what §8.1.4 needs.
+
+### 22.5 Off-host copy: mechanism built, destination still owed
+
+`just depth-backup dest` (`dest` **required, no default**) and `just depth-verify-restore
+src`. Three refusals, each a way a backup could look finished while not being one: no
+default destination (a default would resolve locally and solve nothing); refuses a
+destination on the **same filesystem** as the source (`df --output=source` — a second copy on
+one disk is not off-host); refuses an uncreatable or unwritable destination, naming the
+unmounted-network-mount case. Every copy is timestamped and then **verified byte-identical
+with `cmp`** before success is reported, and `depth-verify-restore` reads a copy back and
+parses it.
+
+**No destination is reachable from this host**: 0 Tailscale peers online, no named SSH host,
+no NFS/CIFS/sshfs mount, no rclone. So the mechanism is in place and refusing by default, but
+**the first verified restore is still owed** — it cannot be done until the lead names a
+destination. Recorded as open rather than glossed: an off-host copy that has never been read
+back is a hope, not a backup, and this one has not yet left the machine.
+
+### 22.6 `Hole` removed, `§8.1` extended
+
+`GapReport.holes` is annotated `tuple[Interval, ...]` (21.2). `class Hole` was referenced by
+**nothing** — the only other hit is the phrase "Hole threshold multiplier" in a `cli.py`
+help string, which is prose about gaps, not the class. Removed, in the same pass that fixed
+the annotation, as the lead asked.
+
+**`DECISION.md` §8.1 now opens with the attribution rule**, because the failure was in
+explaining a failure rather than in producing one: *a claim that attributes a failure to
+tooling — a formatter, a hook, the environment — is checked for the mechanism before it is
+reported.* Name the tool, the hook or config, and whether it still applies; or state that no
+such mechanism exists. The 2026-10-03 case is recorded there as the measured instance.

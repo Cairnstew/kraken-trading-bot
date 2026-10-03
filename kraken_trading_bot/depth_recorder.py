@@ -162,28 +162,6 @@ def parse_timestamp(value: Any) -> datetime | None:
 
 
 @dataclass(frozen=True, slots=True)
-class Hole:
-    """One interval in which the recorder did not fire."""
-
-    after: str
-    before: str
-    delta_seconds: float
-    expected_seconds: float
-    factor: float
-    missing_snapshots: int
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "after": self.after,
-            "before": self.before,
-            "delta_seconds": round(self.delta_seconds, 3),
-            "expected_seconds": self.expected_seconds,
-            "factor": round(self.factor, 3),
-            "missing_snapshots": self.missing_snapshots,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class Interval:
     """One consecutive pair of records, classified against the expectation."""
 
@@ -758,6 +736,25 @@ def format_report(
         "                   counted separately from gaps, and NEITHER a duplicate-record "
         "count NOR a depth shortfall"
     )
+    if report.n_short_intervals:
+        # A SHORT interval is benign exactly once in a bring-up burst and is a
+        # SYMPTOM afterwards: two independent timers (the NixOS system unit and
+        # the `just depth-timer` user unit) each firing hourly, or one timer
+        # misfiring, both show up ONLY here.  The recipe guard stops the second
+        # timer being installed after the first; it cannot stop the reverse
+        # order, so this line is the detection for that case.
+        lines.append(
+            f"                   >> {report.n_short_intervals} SHORT interval(s) AFTER "
+            "the first record is not benign: if these are not your own manual"
+        )
+        lines.append(
+            "                      pulls, CHECK FOR A SECOND TIMER — `systemctl "
+            "is-enabled kraken-trading-bot-order-book.timer`"
+        )
+        lines.append(
+            "                      (system) vs `systemctl --user is-active "
+            "kraken-trading-bot-order-book.timer` (user). Both fire hourly."
+        )
     lines.append(
         f"  GAPS          : {report.n_gaps}   "
         f"missing snapshots: {report.n_missing_snapshots}   "

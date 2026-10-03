@@ -543,6 +543,23 @@ against the wrong axis; a set-difference cannot.
 
 ### 8.1 Output from a broken run is not evidence — DISCARD AND RE-RUN
 
+**A claim that attributes a failure to tooling is checked for the mechanism before it is
+reported.** "A formatter reverted my edits", "a pre-commit hook rewrote the file", "the
+environment mangled it" — each is an *external agent* explanation, and each is cheap to
+believe and expensive to be wrong about, because believing it stops the search for the
+actual cause. Before such a claim is reported, name the tool, the hook or config, and
+whether it still applies to the file in question — or state that no such mechanism exists.
+**The measured case (2026-10-03, recorder pass):** I reported that "a formatter kept
+reverting my writes" to `tools/audit_checks.py`, twice, and built part of a narrative on it.
+Checked afterwards: no `.pre-commit-config.yaml`, no non-sample `.git/hooks`,
+`core.hooksPath` unset, no direnv, the devShell `shellHook` only echoing, no formatter
+installed in the dev shell, no opencode plugin, no script referencing the file. **There was
+no formatter.** The true cause was my own edits, which broke the file's indentation twice;
+I restored it from git myself. The claim was a plausible external cause preferred over the
+plain one — the same shape as the wrong tools already logged in this audit. Recording the
+rule here because the failure was in *attribution*, which no existing clause covered: §8.1
+governs output from a broken run, and nothing governed a broken *explanation* of one.
+
 The red-run obligation above says a guard must be *shown wrong* before it counts. Its
 mirror is equally load-bearing: **output produced by a run whose environment was broken is
 not evidence of anything, in either direction.** It is discarded and the run repeated. It

@@ -619,3 +619,65 @@ clean:
   find . -name __pycache__ -type d -prune -exec rm -rf {} +
   rm -rf .pytest_cache
   @echo "Cleaned caches. Trained model zips/npz (gitignored) left in place."
+# ── off-host copy of the depth log ───────────────────────────────────────────
+# A year of unrecoverable data on one disk is a single point of failure, and
+# Persistent=true only covers MISSED FIRES, not a LOST FILE.  This copies the
+# log off the machine.
+#
+# `dest` has NO DEFAULT on purpose.  A default would resolve to somewhere local,
+# which would look like the problem is solved while every copy still lives on the
+# same disk.  The destination is a decision, not a detail.
+#
+# The copy is APPEND-ONLY and timestamped, and it is verified by reading it back
+# (see depth-verify-restore): a copy that was never read back is not a backup.
+depth-backup dest output="signals/eth_usd_orderbook.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -z "{{dest}}" ]; then
+    echo "dest is REQUIRED and has no default." >&2
+    echo "  It must be a path OFF this machine. A local path would leave every" >&2
+    echo "  copy on the same disk as the original, which is the failure this" >&2
+    echo "  recipe exists to remove. Examples:" >&2
+    echo "    just depth-backup /mnt/nas/kraken-depth" >&2
+    echo "    just depth-backup 'user@host:/srv/kraken-depth'   # via ssh/rclone" >&2
+    exit 2
+  fi
+  root="{{justfile_directory()}}"
+  src="$root/{{output}}"
+  [ -f "$src" ] || { echo "no such log: $src" >&2; exit 1; }
+  # Refuse a destination that is not writable, before claiming success.
+  mkdir -p "{{dest}}" 2>/dev/null || {
+    echo "cannot create destination '{{dest}}' — is the remote mounted?" >&2
+    echo "  An unmounted network mount would silently accumulate in a local dir." >&2
+    exit 1; }
+  [ -w "{{dest}}" ] || { echo "destination not writable: {{dest}}" >&2; exit 1; }
+  # Refuse a destination on the SAME filesystem as the source: that is not a copy.
+  if [ "$(df --output=source "$src" | tail -1)" = "$(df --output=source "{{dest}}" | tail -1)" ]; then
+    echo "REFUSING: '{{dest}}' is on the SAME filesystem as the log." >&2
+    echo "  That is a second copy on one disk, not an off-host copy." >&2
+    exit 1
+  fi
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  base="$(basename "{{output}}")"
+  out="{{dest}}/${base}.${stamp}"
+  cp "$src" "$out"
+  # Verify what was just written: same bytes, same line count, parses as JSONL.
+  # An unverified copy is a hope, not a backup.
+  if cmp -s "$src" "$out"; then
+    echo "copied -> $out"
+  else
+    echo "COPY MISMATCH: $out differs from $src" >&2
+    exit 1
+  fi
+  n="$(wc -l < "$out")"
+  echo "  records: $n   bytes: $(wc -c < "$out")   verified byte-identical"
+
+# Read a copy back off-host and prove it is COMPLETE and PARSEABLE.  Run this
+# after depth-backup: the first checkpoint is worthless until one restore has
+# actually been read back from the far side.
+depth-verify-restore src:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -z "{{src}}" ]; then echo "src is REQUIRED (the copied file to read back)." >&2; exit 2; fi
+  [ -f "{{src}}" ] || { echo "no such file: {{src}}" >&2; exit 1; }
+  nix run "{{justfile_directory()}}"#kraken-trading-bot -- depth-verify --output "{{src}}"

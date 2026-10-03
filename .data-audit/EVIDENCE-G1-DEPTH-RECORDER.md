@@ -666,6 +666,13 @@ Three distinct timestamps after a manual start against the corrected path:
 #3 2026-10-03T19:37:04.693310+00:00  bid=2681.57000 ask=2681.58000 levels=200
 ```
 
+⚠️ **CORRECTION to the line above, added after the lead's challenge.** It calls all three
+"a manual start". **#3 was not manual** — it is a TIMER fire (see §6). And #1/#2 are not
+simply "manual": they were **copied in**, byte-for-byte, from
+`/tmp/g1-rescued/eth_usd_orderbook.jsonl`. The provenance of every record is tabulated in
+§6, and the short version is: **records #1–#2 are real Kraken readings produced in the
+aborted worktree and seeded into this checkout, not appended here.**
+
 ### 4. Still open: the first UNATTENDED fire
 
 Everything above is manual or planted. §8.1.3 requires the *timer* to have fired with
@@ -732,3 +739,119 @@ timer.
 This is the deliverable the whole audit was waiting on: from 20:42:24 onward, every hour of
 order-book depth accumulates in `~/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl`
 and cannot be recovered if lost.
+
+## 6. Record-by-record provenance — which readings are real, and which count
+
+Added after the lead asked which records are real readings, and whether the file holds
+anything synthetic. Established by matching every record's `recorded_at` (the recorder's own
+clock, UTC) against the service journal's `Starting` lines (BST, converted), not by reading
+the timestamps and assuming.
+
+| # | `recorded_at` (UTC) | nearest service exec | verdict | counts toward N? |
+|---|---|---|---|---|
+| 1 | 19:10:45.752567 | 1572 s away | **MANUAL, and SEEDED** — byte-identical to `/tmp/g1-rescued/`, produced in the aborted worktree, copied into this checkout | **NO** |
+| 2 | 19:12:55.755671 | 1442 s away | **MANUAL, and SEEDED** — same | **NO** |
+| 3 | 19:37:04.693310 | **7 s** | **TIMER** — `Persistent=true` catch-up on enable | yes |
+| 4 | 19:42:32.145878 | **8 s** | **TIMER** | yes |
+| 5 | 20:41:34.444635 | **7 s** | **TIMER** | yes |
+| 6 | 21:43:30.815136 | **4 s** | **TIMER** | yes |
+| 7 | 22:43:30.255090 | **3 s** | **TIMER** | yes |
+
+**Two corrections to earlier text in this file.** §5 named 20:42:24 BST as the first
+unattended fire; **19:36:58 UTC was earlier** and produced record #3 — the
+`Persistent=true` catch-up that fired when `just depth-timer` enabled the timer. §3 called
+#1–#3 "a manual start"; #3 is a timer fire. Both errors came from quoting one journal line
+rather than reading all of them.
+
+**Why #1/#2 are excluded from the depth count.** They are genuine readings — real prices, the
+recorder's own clock, full 100-level books — but they were produced under a bring-up
+sequence, **copied rather than appended by a run in this checkout**, and are not on the
+hourly cadence. A depth count is a claim about *sustained cadence*, so the two seeded records
+are excluded: **the N = 8,760 / 365-day count starts at record #3**, the first unattended fire.
+The file keeps them — the log is append-only and they are real data — so a reader counting
+rows must subtract the seeded pair. This paragraph is that note; the records themselves are
+not tagged, because tagging them would mean rewriting an append-only artifact.
+
+**No synthetic record is present, and the planted hole was on a copy.** The gap-counter RED
+run wrote to **`/tmp/g1-red-hole.jsonl`** (8 records, a deliberately planted 5-hour hole) —
+a separate file. Checked by intersecting its timestamps against the real log: **zero
+appear.** The real log's only writer is `record_once` → `append_record`; no hand-edit path
+exists.
+
+## 7. `depth-verify` — read-only schema check on the real log
+
+Written because a consumer's first question is "is this file what it claims", and answering
+it by hand means re-deriving the schema each time. It opens the log read-only, **writes
+nothing** (not the log, not a sidecar), touches no network, and consumes nothing — §8.1.4's
+no-consume rule is untouched by a check on the artifact.
+
+```
+$ just depth-verify-restore signals/eth_usd_orderbook.jsonl
+  DEPTH LOG VERIFY (read-only) — signals/eth_usd_orderbook.jsonl
+    records          : 7
+    schema           : OK
+    short of depth   : 0 record(s)
+    dedup on read    : 7 rows -> 4 (3 collapsed, last-wins per floored hour)
+    wrote anything   : no
+    VERDICT: PASS
+```
+
+Read-only confirmed by hashing the file across the call — **identical before and after**
+(`a7b540d1…`). **The dedup line is the no-consume-safe answer to the same-hour problem:**
+the producer never dedupes, and the three collapsed rows are exactly the three `SHORT`
+rows from the bring-up burst. A consumer resolves duplicate hours here, last-wins.
+
+**It found a real schema fact on its first run.** The initial version asserted
+`best_bid`/`best_ask`/`mid`/`spread` were JSON numbers; all 7 records store them as
+**decimal strings**. That is deliberate — `book_to_record` keeps Kraken's raw price string
+and formats `spread`/`mid` to 10 dp (`depth_recorder.py:537-544`), matching the codebase's
+`Decimal`-for-money convention — so the assertion was wrong, not the data. Rewritten to
+parse decimals and check far more than a type: `best_bid`/`best_ask` must equal the touch of
+`bids[0]`/`asks[0]`, `spread` must equal `ask - bid`, `mid` must equal `(bid + ask)/2`, each
+side must be monotone **as a Decimal** (as strings, `"9.9" > "10.0"` would invert the book),
+and `hour` must equal `floor(recorded_at)`.
+
+**Non-vacuous by mutation**, each on a *copy* — ten of ten RED, plus the one that matters
+most for the lead's depth-comparability question:
+
+```
+  copy of the real log                         GREEN
+  spread != ask - bid                          RED    spread 999.0 != best_ask - best_bid (0.01000)
+  mid != (bid+ask)/2                           RED    mid 1.0 != (best_bid + best_ask)/2 (2683.52500)
+  bids not descending                          RED
+  asks not ascending                           RED
+  best_ask != asks[0]                          RED
+  depth counts disagree with arrays            RED
+  levels_total != bid+ask                      RED    levels_total=7 != 100+100
+  missing required key                         RED    missing key 'hour'
+  hour != floor(recorded_at)                   RED
+  short book (40<100), truncated=false         RED    40/100 short of 100 but truncated is false
+  short book (40<100), truncated=true          GREEN  <- the honest version of the same book passes
+```
+
+Only the last pair distinguishes a **silent depth reduction** from a honestly-flagged short
+book — which is precisely the distinction §8.1.4 needs, since a requested depth the exchange
+did not honour is invisible without `truncated`.
+
+## 8. Off-host copy of the log
+
+`just depth-backup dest` (dest **required, no default**) and `just depth-verify-restore src`.
+A year of unrecoverable data on one disk is a single point of failure, and `Persistent=true`
+covers missed *fires*, not a *lost file*.
+
+Three refusals, each a way the backup could look done while not being one:
+
+1. **No default destination.** A default would resolve somewhere local and look like the
+   problem was solved with every copy on the same disk.
+2. **Refuses a destination on the same filesystem as the source** (`df --output=source`).
+   A second copy on one disk is not an off-host copy.
+3. **Refuses an uncreatable/unwritable destination**, naming the unmounted-network-mount
+   case — the failure where copies silently accumulate in a local directory.
+
+Each copy is timestamped and then **verified byte-identical with `cmp`** before the recipe
+reports success, and `depth-verify-restore` reads a copy back and parses it. A copy that has
+never been read back is a hope, not a backup.
+
+**No destination is currently reachable from this host** — 0 Tailscale peers online, no named
+SSH host, no NFS/CIFS/sshfs mount, no rclone. The mechanism is built and refusing by default;
+the destination is the lead's choice and the first verified restore is still owed.

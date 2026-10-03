@@ -457,6 +457,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit the report as a single JSON object on stdout.",
     )
 
+    # ── depth-verify command ──────────────────────────────────────────────
+    # READ-ONLY schema + integrity check on an existing log.  It opens the file
+    # for reading only, writes NOTHING (not the log, not a sidecar), touches no
+    # network, and does not consume: it is a check on the artifact, not a step
+    # toward using it.  This is what makes it safe to run against the real
+    # unrecoverable log — a verification pass must not itself be able to damage
+    # the thing it verifies.
+    #
+    # It exists because a consumer's first question is "is this file actually
+    # what it claims", and answering that by hand means re-deriving the schema
+    # from a docstring each time.
+    verify_parser = sub.add_parser(
+        "depth-verify",
+        help=(
+            "Read-only check of a depth log: parse every field, confirm depth "
+            "consistency, and show what dedup-on-read yields. Writes nothing."
+        ),
+    )
+    verify_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="The JSONL log to verify.",
+    )
+    verify_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the verification result as a single JSON object on stdout.",
+    )
+
     return parser
 
 
@@ -546,6 +577,223 @@ def cmd_depth_gaps(args: argparse.Namespace) -> int:
     else:
         print(format_report(report, artifact=output, status_file=status))
     return 0 if report.ok else 1
+
+
+def cmd_depth_verify(args: argparse.Namespace) -> int:
+    """READ-ONLY verification of a depth log.  Writes nothing, consumes nothing.
+
+    Three questions, answered independently so a failure localises:
+
+    1. **Schema** — every record parses as JSON and every documented key is
+       present with the right type.  A missing key is a failure, not a default:
+       the log is unrecoverable, so a silently-defaulted field is a field whose
+       value nobody can vouch for.
+    2. **Depth consistency** — ``levels_total`` equals ``bid_levels +
+       ask_levels``, the level arrays actually have those lengths, and
+       ``truncated`` agrees with the counts.  A record where ``truncated`` is
+       false but fewer levels came back than requested is a silent depth
+       reduction and must not pass.
+    3. **Dedup on read** — what last-wins-per-floored-hour yields, exercised on
+       the real rows.  The producer is append-only and must stay that way, so
+       this is where duplicate hours get resolved; printing it makes the rule
+       checkable rather than documented.
+    """
+    import json as _json
+
+    from decimal import Decimal, InvalidOperation
+    from pathlib import Path as _Path
+
+    from kraken_trading_bot.depth_recorder import floor_hour, parse_timestamp
+
+    output = _Path(args.output)
+    if not output.is_file():
+        print(f"no such log: {output}", file=sys.stderr)
+        return 2
+
+    def as_decimal(value: object) -> Decimal | None:
+        """Prices are DECIMAL STRINGS by schema (exact, no float rounding), so a
+        type assertion here would be asserting a schema the recorder does not
+        use.  Parse instead — and accept a bare number too, so a future
+        SCHEMA_VERSION bump to JSON numbers is caught as arithmetic, not noise.
+        """
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+
+    # Read-only by construction: 'r' cannot truncate, and nothing below opens
+    # the file again.
+    raw = output.read_text(encoding="utf-8").splitlines()
+    problems: list[str] = []
+    records: list[dict] = []
+
+    required = {
+        "recorded_at": str,
+        "hour": str,
+        "pair": str,
+        "source": str,
+        "schema_version": int,
+        "bids": list,
+        "asks": list,
+        "best_bid": (str, int, float),
+        "best_ask": (str, int, float),
+        "mid": (str, int, float),
+        "spread": (str, int, float),
+        "depth": dict,
+    }
+
+    for lineno, line in enumerate(raw, 1):
+        if not line.strip():
+            problems.append(f"line {lineno}: blank line inside the log")
+            continue
+        try:
+            rec = _json.loads(line)
+        except ValueError as exc:
+            problems.append(f"line {lineno}: not valid JSON ({exc})")
+            continue
+        if not isinstance(rec, dict):
+            problems.append(f"line {lineno}: top level is {type(rec).__name__}, not an object")
+            continue
+        records.append(rec)
+        for key, want in required.items():
+            if key not in rec:
+                problems.append(f"line {lineno}: missing key {key!r}")
+            elif not isinstance(rec[key], want) or (
+                want is int and isinstance(rec[key], bool)
+            ):
+                problems.append(
+                    f"line {lineno}: {key!r} is {type(rec[key]).__name__}, "
+                    f"expected {getattr(want, '__name__', want)}"
+                )
+        # Ordering inside the book: a depth snapshot is only usable if each side
+        # is monotone away from the touch.  Compared as Decimal, not as strings —
+        # "9.9" > "10.0" lexicographically, which would invert the book.
+        for side, reverse in (("bids", True), ("asks", False)):
+            parsed: list[Decimal] = []
+            non_numeric = 0
+            for lv in rec.get(side, []):
+                if not (isinstance(lv, list) and lv):
+                    continue
+                price = as_decimal(lv[0])
+                if price is None:
+                    non_numeric += 1
+                else:
+                    parsed.append(price)
+            if non_numeric:
+                problems.append(
+                    f"line {lineno}: {side} has {non_numeric} non-numeric level price(es)"
+                )
+            elif parsed != sorted(parsed, reverse=reverse):
+                problems.append(
+                    f"line {lineno}: {side} not {'descending' if reverse else 'ascending'}"
+                )
+        # best_bid/best_ask must BE the touch of the arrays they summarise.
+        bid_touch = as_decimal(rec["bids"][0][0]) if rec.get("bids") else None
+        ask_touch = as_decimal(rec["asks"][0][0]) if rec.get("asks") else None
+        bb, ba = as_decimal(rec.get("best_bid")), as_decimal(rec.get("best_ask"))
+        if bb is None or ba is None:
+            problems.append(f"line {lineno}: best_bid/best_ask not a decimal")
+        else:
+            if bb >= ba:
+                problems.append(f"line {lineno}: crossed book (bid {bb} >= ask {ba})")
+            if bid_touch is not None and bb != bid_touch:
+                problems.append(f"line {lineno}: best_bid {bb} != bids[0] {bid_touch}")
+            if ask_touch is not None and ba != ask_touch:
+                problems.append(f"line {lineno}: best_ask {ba} != asks[0] {ask_touch}")
+            # Derived fields must agree with the touch they were derived from.
+            sp, mid = as_decimal(rec.get("spread")), as_decimal(rec.get("mid"))
+            if sp is None or mid is None:
+                problems.append(f"line {lineno}: spread/mid not a decimal")
+            else:
+                want_spread, want_mid = ba - bb, (ba + bb) / 2
+                # The recorder formats to 10dp then strips trailing zeros, so
+                # compare at the precision actually recorded rather than exactly.
+                if abs(sp - want_spread) > Decimal("1e-9"):
+                    problems.append(
+                        f"line {lineno}: spread {sp} != best_ask - best_bid ({want_spread})"
+                    )
+                if abs(mid - want_mid) > Decimal("1e-9"):
+                    problems.append(
+                        f"line {lineno}: mid {mid} != (best_bid + best_ask)/2 ({want_mid})"
+                    )
+
+    # ── depth consistency ────────────────────────────────────────────────
+    short_depth = 0
+    for i, rec in enumerate(records, 1):
+        depth = rec.get("depth")
+        if not isinstance(depth, dict):
+            continue
+        nb, na = len(rec.get("bids", [])), len(rec.get("asks", []))
+        for key in ("requested_count", "bid_levels", "ask_levels", "levels_total"):
+            if key not in depth:
+                problems.append(f"record {i}: depth.{key} missing")
+        if depth.get("bid_levels") != nb or depth.get("ask_levels") != na:
+            problems.append(
+                f"record {i}: depth counts {depth.get('bid_levels')}/{depth.get('ask_levels')} "
+                f"disagree with the arrays' {nb}/{na}"
+            )
+        if depth.get("levels_total") != nb + na:
+            problems.append(
+                f"record {i}: depth.levels_total={depth.get('levels_total')} != {nb}+{na}"
+            )
+        req = depth.get("requested_count")
+        if isinstance(req, int):
+            if nb < req or na < req:
+                short_depth += 1
+                if not depth.get("truncated"):
+                    problems.append(
+                        f"record {i}: {nb}/{na} levels is short of requested {req} but "
+                        "truncated is false — a SILENT depth reduction"
+                    )
+        # recorded_at must be at or after the hour it is filed under.
+        ts, hr = parse_timestamp(rec.get("recorded_at")), parse_timestamp(rec.get("hour"))
+        if ts and hr and floor_hour(ts) != hr:
+            problems.append(f"record {i}: hour {rec.get('hour')} != floor(recorded_at)")
+
+    # ── dedup on read ────────────────────────────────────────────────────
+    # Last-wins per floored hour.  The producer never dedupes; this is the only
+    # place it happens, and it is what a consumer must apply.
+    by_hour: dict[object, dict] = {}
+    for rec in records:
+        hr = parse_timestamp(rec.get("hour"))
+        if hr is not None:
+            by_hour[hr] = rec  # last wins, deliberately
+    deduped = len(by_hour)
+    dup_hours = len(records) - deduped
+
+    result = {
+        "artifact": str(output),
+        "records": len(records),
+        "schema_ok": not problems,
+        "depth_short_records": short_depth,
+        "dedup_on_read": {
+            "rows_in": len(records),
+            "rows_out": deduped,
+            "collapsed": dup_hours,
+            "rule": "last-wins per floored hour; the producer is append-only",
+        },
+        "problems": problems,
+        "wrote_anything": False,
+    }
+
+    if args.as_json:
+        print(_json.dumps(result, indent=2, default=str))
+    else:
+        print(f"DEPTH LOG VERIFY (read-only) — {output}")
+        print(f"  records          : {len(records)}")
+        print(f"  schema           : {'OK' if not problems else f'{len(problems)} PROBLEM(S)'}")
+        print(f"  short of depth   : {short_depth} record(s)")
+        print(
+            f"  dedup on read    : {len(records)} rows -> {deduped} "
+            f"({dup_hours} collapsed, last-wins per floored hour)"
+        )
+        print(f"  wrote anything   : no")
+        for p in problems:
+            print(f"    ! {p}")
+        print(f"\n  VERDICT: {'PASS' if not problems else 'FAIL'}")
+    return 0 if not problems else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -969,6 +1217,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "export-data": cmd_export_data,
         "record-depth": cmd_record_depth,
         "depth-gaps": cmd_depth_gaps,
+        "depth-verify": cmd_depth_verify,
     }
 
     if args.command is None:

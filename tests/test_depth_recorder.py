@@ -935,3 +935,177 @@ def test_the_two_timer_paths_are_both_declared() -> None:
         "the G1 block must assign under systemd.services/systemd.timers (NixOS), not "
         f"a home-manager namespace — found: {assignments}"
     )
+
+
+# ── depth-verify: the read-only check on the unrecoverable log ──────────────
+# NAMED DEFECT this guards: a verification pass that can DAMAGE the artifact it
+# verifies.  The log is unrecoverable and append-only, so `depth-verify` must
+# open read-only, write nothing (not the log, not a sidecar), and touch no
+# network.  The first test proves that by hashing the file across the call.
+#
+# The rest exist because a check that has only ever printed OK is
+# indistinguishable from a check that cannot fail (PLAN.md §8.1 item 4): each
+# mutation below is a defect that MUST go red.
+
+def _verify(tmp_path: Path, rows) -> tuple[int, str]:
+    import argparse
+
+    log = tmp_path / "log.jsonl"
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    ns = argparse.Namespace(output=str(log), as_json=False)
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = bot_cli.cmd_depth_verify(ns)
+    return rc, buf.getvalue()
+
+
+def _one_real_record() -> dict:
+    """A minimal but schema-complete record, built the way the recorder does."""
+    return {
+        "schema_version": 1,
+        "source": "kraken.public.Depth",
+        "pair": "ETH/USD",
+        "recorded_at": "2026-10-03T19:00:00+00:00",
+        "hour": "2026-10-03T19:00:00+00:00",
+        "depth": {
+            "requested_count": 2,
+            "bid_levels": 2,
+            "ask_levels": 2,
+            "levels_total": 4,
+            "truncated": False,
+        },
+        "best_bid": "100.0",
+        "best_ask": "101.0",
+        "spread": "1.0",
+        "mid": "100.5",
+        "bids": [["100.0", "1"], ["99.0", "2"]],
+        "asks": [["101.0", "1"], ["102.0", "2"]],
+        "interval": None,
+    }
+
+
+def test_depth_verify_writes_nothing(tmp_path: Path) -> None:
+    """A check that can damage the artifact is worse than no check."""
+    import hashlib
+
+    rows = [_one_real_record()]
+    rc, out = _verify(tmp_path, rows)
+    assert rc == 0, out
+    log = tmp_path / "log.jsonl"
+    before = hashlib.sha256(log.read_bytes()).hexdigest()
+    rc2, _ = _verify(tmp_path, rows)
+    assert rc2 == 0
+    assert hashlib.sha256(log.read_bytes()).hexdigest() == before, (
+        "depth-verify modified the log it was asked to verify"
+    )
+    # No sidecar either — a verification pass must not create state.
+    assert not list(tmp_path.glob("*.status.json")), (
+        f"depth-verify wrote a sidecar: {list(tmp_path.glob('*.status.json'))}"
+    )
+
+
+def test_depth_verify_passes_a_well_formed_record(tmp_path: Path) -> None:
+    rc, out = _verify(tmp_path, [_one_real_record()])
+    assert rc == 0, out
+    assert "VERDICT: PASS" in out
+    assert "wrote anything   : no" in out
+
+
+def test_depth_verify_catches_a_silent_depth_reduction(tmp_path: Path) -> None:
+    """The lead's depth-comparability case: fewer levels than requested, with
+    `truncated` claiming otherwise.  Internally consistent, and still wrong."""
+    r = _one_real_record()
+    r["bids"] = [["100.0", "1"]]  # 1 level, not the 2 requested
+    r["depth"].update(bid_levels=1, levels_total=3, truncated=False)
+    rc, out = _verify(tmp_path, [r])
+    assert rc == 1, "a short book with truncated=false must not pass"
+    assert "SILENT depth reduction" in out
+
+
+def test_depth_verify_accepts_a_short_book_that_says_so(tmp_path: Path) -> None:
+    """The honest version of the same book is fine — only the lie is a defect."""
+    r = _one_real_record()
+    r["bids"] = [["100.0", "1"]]
+    r["depth"].update(bid_levels=1, levels_total=3, truncated=True)
+    rc, out = _verify(tmp_path, [r])
+    assert rc == 0, f"an honestly-flagged short book must pass:\n{out}"
+
+
+@pytest.mark.parametrize(
+    "mutate, expect",
+    [
+        (lambda r: r.__setitem__("spread", "999.0"), "spread 999.0 !="),
+        (lambda r: r.__setitem__("mid", "1.0"), "mid 1.0 !="),
+        (lambda r: r["bids"].reverse(), "bids not descending"),
+        (lambda r: r["asks"].reverse(), "asks not ascending"),
+        (lambda r: r.__setitem__("best_bid", "500.0"), "crossed book"),
+        (lambda r: r["depth"].__setitem__("levels_total", 7), "levels_total=7 !="),
+        (lambda r: r["depth"].__setitem__("bid_levels", 99), "disagree with the arrays"),
+        (lambda r: r.pop("hour"), "missing key 'hour'"),
+        (lambda r: r.__setitem__("hour", "2026-10-03T05:00:00+00:00"), "!= floor(recorded_at)"),
+    ],
+)
+def test_depth_verify_each_mutation_goes_red(tmp_path: Path, mutate, expect) -> None:
+    r = _one_real_record()
+    mutate(r)
+    rc, out = _verify(tmp_path, [r])
+    assert rc == 1, f"mutation survived: {expect}\n{out}"
+    assert expect in out, f"expected {expect!r} in the report, got:\n{out}"
+
+
+def test_depth_verify_orders_levels_as_decimals_not_strings(tmp_path: Path) -> None:
+    """'9.9' > '10.0' as strings.  Compared lexicographically that INVERTS the
+    book and would pass a descending-bids check on an ascending book."""
+    from decimal import Decimal
+
+    def book(top_bid: str, second_bid: str) -> dict:
+        r = _one_real_record()
+        r["bids"] = [[top_bid, "1"], [second_bid, "2"]]
+        # Keep every derived field consistent, so the ONLY thing under test is
+        # the ordering check — otherwise best_bid != bids[0] fires first and
+        # this test would pass without ever reaching the comparison.
+        tb, sa = Decimal(top_bid), Decimal(r["best_ask"])
+        r["best_bid"] = top_bid
+        r["spread"] = str(sa - tb)
+        r["mid"] = str((sa + tb) / 2)
+        return r
+
+    rc, out = _verify(tmp_path, [book("10.0", "9.9")])
+    assert rc == 0, f"10.0 then 9.9 IS descending numerically:\n{out}"
+    rc, out = _verify(tmp_path, [book("9.9", "10.0")])
+    assert rc == 1, f"9.9 then 10.0 is ascending, so bids are NOT descending:\n{out}"
+    assert "bids not descending" in out
+
+
+def test_depth_verify_dedups_on_read_without_touching_the_producer(tmp_path: Path) -> None:
+    """Dedup happens HERE, last-wins per floored hour, and only in the report."""
+    import copy
+
+    r1 = _one_real_record()
+    r2 = copy.deepcopy(r1)
+    r2["recorded_at"] = "2026-10-03T19:30:00+00:00"  # same floored hour
+    r3 = copy.deepcopy(r1)
+    r3["recorded_at"] = "2026-10-03T20:00:00+00:00"
+    r3["hour"] = "2026-10-03T20:00:00+00:00"
+    log = tmp_path / "log.jsonl"
+    log.write_text(
+        "".join(json.dumps(x) + "\n" for x in (r1, r2, r3)), encoding="utf-8"
+    )
+    import argparse
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = bot_cli.cmd_depth_verify(argparse.Namespace(output=str(log), as_json=False))
+    out = buf.getvalue()
+    assert rc == 0, out
+    assert "3 rows -> 2" in out, f"expected 3 rows collapsing to 2 hours:\n{out}"
+    assert "last-wins per floored hour" in out
+    # The producer's file is untouched: all three lines survive.
+    assert len([x for x in log.read_text().splitlines() if x.strip()]) == 3, (
+        "dedup-on-read must not rewrite or truncate the producer's log"
+    )
