@@ -17,6 +17,10 @@
 #   just social-pull       pull StockTwits + Fear & Greed (keyless, --append)
 #   just news-timer        enable the hourly systemd.user news timer (:23)
 #   just social-timer      enable the hourly systemd.user social timer (:29)
+#   just depth-timer       enable the hourly order-book DEPTH recorder timer
+#                           (:41) — G1; the only irreversible-data recipe here
+#   just depth-pull        record one depth snapshot (what the timer runs)
+#   just depth-gaps        scan the depth log for holes (no network)
 #
 # Every recipe that needs the project environment runs **inside the Nix
 # dev shell** automatically via `nix develop --command bash -c ...`, so you
@@ -283,6 +287,85 @@ social-timer ticker="ETH/USD" output="signals/eth_usd_social.jsonl":
   systemctl --user enable --now kraken-trading-bot-social.timer
   echo "enabled. Next fire:"
   systemctl --user list-timers kraken-trading-bot-social.timer --no-pager
+
+# Enable the hourly ORDER-BOOK DEPTH recorder systemd.user timer — the G1
+# recorder (.data-audit/PLAN.md §8.1).
+#
+# THIS IS THE ONLY RECIPE IN THE REPO WHOSE MISSING COST IS IRREVERSIBLE.
+# Kraken's order book is a live snapshot with NO historical endpoint, so an
+# hour this timer does not fire is an hour nothing can ever recover.  If
+# this recipe is the difference between a recorder that exists and one that
+# accumulates, run it.
+#
+# Fires at :41 — a fourth minute, clear of funding :17, news :23 and social
+# :29 so the four hourly timers do not land in the same window.
+#
+# The unit is GENERATED, not symlinked, because ExecStart embeds the repo
+# root, the pair, the output path and the requested depth.  `root` is
+# `justfile_directory()`, so the timer's `nix run <root>#kraken-trading-bot`
+# builds from THIS working tree (src = ./.., no flake-lock entry) and the
+# timer runs the committed tree rather than a pinned revision of it.
+#
+# Re-run it after moving or re-cloning the repo: ExecStart holds an absolute
+# path, so a stale root is a unit that looks enabled and accumulates nothing.
+depth-timer pair="ETH/USD" output="signals/eth_usd_orderbook.jsonl" count="100":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir" "$root/$(dirname {{output}})"
+  sed -e "s|@ROOT@|$root|" -e "s|@PAIR@|{{pair}}|" \
+      -e "s|@OUTPUT@|$root/{{output}}|" -e "s|@COUNT@|{{count}}|" \
+      "$root/systemd/kraken-trading-bot-order-book.service.in" \
+      > "$unit_dir/kraken-trading-bot-order-book.service"
+  ln -sf "$root/systemd/kraken-trading-bot-order-book.timer" \
+      "$unit_dir/kraken-trading-bot-order-book.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-order-book.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-order-book.timer --no-pager
+  echo
+  echo "ENABLED IS NOT RUNNING. Confirm it has actually fired:"
+  echo "  systemctl --user list-timers kraken-trading-bot-order-book.timer"
+  echo "  just depth-gaps"
+  echo "  systemctl --user status kraken-trading-bot-order-book.service"
+
+# Record ONE order-book depth snapshot by hand — the exact command the
+# kraken-trading-bot-order-book.timer runs.  Use it to seed a fresh clone, or
+# to confirm the path works before trusting the timer.
+#
+# Invoked through this repo's OWN flake output by path rather than
+# `python cli.py`, because ExecStart invokes it that way and "it works when I
+# run it by hand" is a different claim from "the timer runs the committed
+# tree" — only the second accumulates data.
+#
+# A path reference to a git checkout only sees TRACKED files, so an
+# uncommitted recorder module makes this fail with ModuleNotFoundError while
+# looking otherwise healthy.  Commit first.
+depth-pull pair="ETH/USD" output="signals/eth_usd_orderbook.jsonl" count="100":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  mkdir -p "$(dirname "$dest")"
+  nix run "$root"#kraken-trading-bot -- \
+    record-depth --pair {{pair}} --output "$dest" --count {{count}}
+
+# Re-scan the depth log for holes.  No network.  Exits 1 when any interval
+# exceeded the expected cadence, so it is usable as a health gate.
+#
+# Run this after every reboot, after any laptop suspend, and before quoting
+# the log's coverage: F-6's lesson is that a producer that stopped for a week
+# and appended happily afterwards looks identical to one that never stopped
+# unless somebody counts.
+depth-gaps output="signals/eth_usd_orderbook.jsonl" *ARGS="":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  nix run "$root"#kraken-trading-bot -- depth-gaps --output "$dest" {{ARGS}}
 
 # Fill funding HISTORY from Kraken's own /historical-funding-rates, into the
 # SAME file `funding-pull` writes (--append).  This is the difference between

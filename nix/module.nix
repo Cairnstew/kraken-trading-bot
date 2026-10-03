@@ -173,6 +173,97 @@ in
         description = "Extra KRAKEN_* environment variables (NAME = value).";
       };
     };
+
+    # ── Recorders ─────────────────────────────────────────────────────────
+    # Unattended data collection.  Separate from `settings` because these are
+    # SYSTEM units that read no credential and write a file, not app
+    # configuration.
+    recorders = {
+      orderBook = {
+        enable = lib.mkEnableOption ''
+          the hourly Kraken order-book DEPTH recorder (G1).  Off by default
+          because it writes a file that grows forever.
+
+          Kraken's order book is a LIVE SNAPSHOT WITH NO HISTORICAL ENDPOINT,
+          so this is the only feature here whose absence destroys data
+          permanently rather than merely leaving a column empty.  If you run
+          the bot at all, turn this on.
+        '';
+
+        pair = lib.mkOption {
+          type = lib.types.str;
+          default = "ETH/USD";
+          description = "Spot pair to snapshot (keyless /0/public/Depth).";
+        };
+
+        output = lib.mkOption {
+          type = lib.types.str;
+          default = "/var/lib/kraken-trading-bot/signals/eth_usd_orderbook.jsonl";
+          defaultText = "/var/lib/kraken-trading-bot/signals/eth_usd_orderbook.jsonl";
+          description = ''
+            Append-only JSONL log.  Created if absent; the parent directory is
+            created by `StateDirectory`, so it must live under
+            /var/lib/kraken-trading-bot unless you manage it yourself.
+          '';
+        };
+
+        count = lib.mkOption {
+          type = lib.types.int;
+          default = 100;
+          description = ''
+            Requested book depth per side.  100 is Kraken's served default and
+            the largest depth actually honoured: MEASURED 2026-10-03,
+            `count=1000` is served as 100 levels per side with no error, i.e. a
+            silent depth REDUCTION.  Every record stores the requested depth
+            and the depth actually returned, so a `count` change is visible in
+            the artifact rather than silently making two records incomparable.
+          '';
+        };
+
+        expectedIntervalSeconds = lib.mkOption {
+          type = lib.types.int;
+          default = 3600;
+          description = ''
+            The cadence the gap counter holds the recorder to.  An interval
+            longer than this x `gapFactor` is reported as a hole, in the
+            report and in the status sidecar.
+          '';
+        };
+
+        gapFactor = lib.mkOption {
+          type = lib.types.float;
+          default = 1.5;
+          description = ''
+            Hole threshold multiplier.  1.5 tolerates the timer's
+            `RandomizedDelaySec` jitter (which can legitimately stretch one
+            interval to ~1h4m) while still catching a single missed fire.
+          '';
+        };
+
+        onCalendar = lib.mkOption {
+          type = lib.types.str;
+          default = "*-*-* *:41:00";
+          defaultText = "*-*-* *:41:00";
+          description = ''
+            systemd OnCalendar for the timer.  The default is hourly at :41 —
+            a minute clear of the funding (:17), news (:23) and social (:29)
+            pullers.  Hourly is also the CADENCE FLOOR: the bar interval is
+            `ohlcv_interval_minutes: 60`, so anything finer pays more calls to
+            keep the same usable rows.
+          '';
+        };
+
+        statusOutput = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Path of the gap-report sidecar, rewritten on every fire.  Null
+            means "<output>.status.json".  This is the file that makes a hole
+            visible in the artifact and not only on stdout.
+          '';
+        };
+      };
+    };
   };
 
   # ── Implementation ──────────────────────────────────────────────────────
@@ -208,10 +299,80 @@ in
         ++ lib.concatLists (lib.mapAttrsToList
               (name: value: lib.optional (value != null) (valueLine name value))
               cfg.settings.extra);
+
+      ob = cfg.recorders.orderBook;
     in
     {
       # Make the package available system-wide.
       environment.systemPackages = [ cfg.package ];
+
+      # ── G1 order-book depth recorder ──────────────────────────────────────
+      #
+      # ⚠️ OPTION-NAMESPACE TRAP, and the reason this is a SYSTEM unit.
+      # `nix/module.nix` is a **NixOS** module, so `systemd.user.*` — a
+      # home-manager option — DOES NOT EVALUATE here.  Writing this as a user
+      # timer would fail the host's evaluation outright, which is why the
+      # funding pass had to ship a plain `systemd/user` unit file instead.
+      # So: this module emits a SYSTEM service + timer, and the shipped
+      # `systemd/kraken-trading-bot-order-book.*` files + `just depth-timer`
+      # install the equivalent USER unit for hosts (including this one) that
+      # run the recorder from a checkout rather than from this module.
+      #
+      # Either shape accumulates the same data; they are different install
+      # paths, not different recorders.
+      systemd.services."kraken-trading-bot-order-book" = lib.mkIf ob.enable {
+        description = "Record one Kraken order-book depth snapshot (G1)";
+        # KEYLESS endpoint: deliberately no After=/Requires= on the credential
+        # oneshot.  /0/public/Depth needs no secret, and making it wait for
+        # agenix materialisation would turn a working call into a silent hole.
+        after = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          # Runs the PACKAGE's own console script rather than `nix run <path>`:
+          # this module already has the package built, and a path reference
+          # here would both re-evaluate per fire and depend on a checkout
+          # that a module consumer does not necessarily have.
+          #
+          # A LIST, not one joined string: `systemd.services.<name>.
+          # serviceConfig.ExecStart` is typed `listOf str`, and passing a
+          # string fails evaluation with "expected a list but found a string".
+          # (Caught by evaluating the module, not by reading it.)
+          ExecStart = [
+            "${cfg.package}/bin/kraken-trading-bot"
+            "record-depth"
+            "--pair"
+            ob.pair
+            "--output"
+            ob.output
+            "--count"
+            (toString ob.count)
+            "--expected-interval-seconds"
+            (toString ob.expectedIntervalSeconds)
+            "--gap-factor"
+            (toString ob.gapFactor)
+          ] ++ lib.optional (ob.statusOutput != null) "--status-output"
+            ++ lib.optional (ob.statusOutput != null) ob.statusOutput;
+          TimeoutStartSec = 300;
+          # Creates /var/lib/kraken-trading-bot, so `output`'s default
+          # parent exists on a fresh activation.
+          StateDirectory = "kraken-trading-bot";
+        };
+      };
+
+      systemd.timers."kraken-trading-bot-order-book" = lib.mkIf ob.enable {
+        description = "Hourly Kraken order-book depth snapshot (G1)";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = ob.onCalendar;
+          # Catch up after downtime instead of silently skipping hours.
+          # `record-depth` is append-only, so a catch-up cannot damage what is
+          # already there, and the gap counter still sees the hole.
+          Persistent = true;
+          RandomizedDelaySec = 120;
+          Unit = "kraken-trading-bot-order-book.service";
+        };
+      };
 
       # Write a credentials file if individual options are provided.
       # The file is mode 0600 and owned by root, loadable by systemd and

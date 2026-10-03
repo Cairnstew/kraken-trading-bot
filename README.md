@@ -376,6 +376,67 @@ against the live pipeline's columns and refuse to run on a mismatch. A
 model trained before this widening has no `n_features` and no derived
 columns, so it will not silently run column-less — retrain it.
 
+### The order-book depth recorder (G1) — the only unrecoverable data
+
+The three channels above are **backfillable**: funding has
+`/historical-funding-rates`, and news and social are aggregates anyone can
+recompute. The order book is not, and this is why its producer comes before
+every other item on the plan.
+
+**Kraken's order book is a live snapshot with no historical endpoint.**
+Kraken's public archive is OHLCVT-only; Binance Vision's `bookDepth` was
+falsified directly against the S3 bucket (`KeyCount=0` against a klines
+control that returned 2). A `count=100` book at *t* does not encode
+*t−1h*. **Every hour without this recorder is an hour nothing can ever
+recover.**
+
+```bash
+just depth-timer     # generate + enable the hourly user timer (:41)
+just depth-pull      # record ONE snapshot by hand — what the timer runs
+just depth-gaps      # scan the log for holes (no network; exit 1 on a hole)
+```
+
+`depth-pull` and the timer's `ExecStart` are the same command, and it is
+`nix run <the checked-out tree>#kraken-trading-bot`, not a pinned flake input
+— so the timer runs the tree it is pointed at and an edit is live with no lock
+bump. `signals/eth_usd_orderbook.jsonl` holds one JSON object per fire;
+`signals/eth_usd_orderbook.jsonl.status.json` is the gap report, rewritten
+each fire.
+
+**Four things the records carry that a book snapshot does not.**
+
+| Field | Why |
+|---|---|
+| `recorded_at` | A book has **no timestamp of its own**: each level's `ts` is that *order's* placement time. The recorder stamps its own UTC clock. |
+| `hour` | Floored, so a `Persistent=true` catch-up re-fire is de-duplicable by a future reader without giving up sub-hour precision in `recorded_at`. |
+| `depth.requested_count` / `bid_levels` / `ask_levels` / `truncated` | Depth is **not comparable across a `count` change**, and the exchange does not tell you when it changed it: measured 2026-10-03, `count=1000` is served as **100** levels per side, with no error. `truncated` is what stops that reading as a depth-1000 book. |
+| `interval` | The expected-vs-actual interval this record closed, with `status` ∈ `FIRST`/`OK`/`SHORT`/`GAP`. |
+
+**The gap counter, and why the hole is in the artifact.** F-6's lesson was
+that a producer can stop for a week and append happily afterwards, leaving a
+hole indistinguishable from a run that never stopped. Every record therefore
+carries the interval that produced it, and each fire rewrites a status
+sidecar with `n_gaps`, `n_missing_snapshots`, `coverage_ratio` and the hole
+list. `SHORT` (two fires inside one hour) is counted **separately from**
+`GAP`, so a benign catch-up cannot cry wolf and a real hole cannot hide among
+the duplicates. `just depth-gaps` exits **1** on a hole, so this is gateable
+rather than decorative.
+
+Two honest limits. **Nothing reads this file yet** — no `_SIGNAL_COLUMNS`
+entry, no observation-width change, no merge into the observation. That is
+deliberate: a consumer would create a reason to change the schema the first
+time an awkward column appeared, and the history already written would become
+incompatible with itself. And **one record is not a verdict** — a first-run
+log reports `first-run state, not a green verdict`, never `GREEN`, because
+there is no interval to compare.
+
+`N` is not "however long this takes". At hourly cadence the gate needs
+train + a disjoint eval slice longer than the seed noise, and the
+recommendation is **365 days = 8,760 snapshots**; see
+`.data-audit/PLAN.md` §8.1.2 for the arithmetic and
+`.data-audit/EVIDENCE-G1-DEPTH-RECORDER.md` for the numbers re-derived at
+build time.
+
 ## NixOS Module
 
 Import in your NixOS configuration:
@@ -397,6 +458,11 @@ Import in your NixOS configuration:
             enable = true;
             credentials.apiKeyFile = "/run/secrets/kraken_api_key";
             credentials.apiSecretFile = "/run/secrets/kraken_api_secret";
+
+            # G1 depth recorder — off by default because the log grows forever.
+            # On a host that runs the bot at all, turn it on: this is the only
+            # producer here whose absence destroys data permanently.
+            recorders.orderBook.enable = true;
           };
         }
       ];
@@ -404,6 +470,22 @@ Import in your NixOS configuration:
   };
 }
 ```
+
+The recorder's unit is a **system** unit (`systemd.services` /
+`systemd.timers`), because `nix/module.nix` is a **NixOS** module and
+`systemd.user.*` — a home-manager option — does not evaluate there. That is
+the same constraint that forced the funding pass to ship a plain
+`systemd/user` unit file instead. Two install paths, one recorder:
+
+| Host style | Install path |
+|---|---|
+| NixOS module consumer | `services.kraken-trading-bot.recorders.orderBook.enable = true` (system unit, runs the package's console script) |
+| Checkout / this host | `just depth-timer` (user unit, runs `nix run <tree>#kraken-trading-bot`) |
+
+Both are hourly and append-only, so they accumulate the same records. Neither
+needs a credential: `/0/public/Depth` is keyless, and the unit deliberately
+has no `After=` on the credentials oneshot so a host whose secret has not been
+materialised still records.
 
 ## Strategies
 

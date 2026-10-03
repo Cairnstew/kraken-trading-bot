@@ -1,0 +1,36 @@
+# Hourly Kraken ORDER-BOOK DEPTH recorder.  This is the G1 timer and the
+# only item in the audit with a DATA-LOSS CLOCK: Kraken's book is a live
+# snapshot with no historical endpoint, so an hour this does not fire is an
+# hour nothing can ever recover.
+#
+# WHY HOURLY, and not finer.  The bar interval is `ohlcv_interval_minutes: 60`
+# (configs/default.yaml), so a snapshot finer than hourly adds rows the bar
+# grid cannot address — 60x the calls to keep the same number of usable
+# samples.  Hourly is therefore also the cadence floor, and it is what
+# `--expected-interval-seconds 3600` in the service means.
+#
+# Minute 41 is deliberately NOT one of the existing pullers' minutes
+# (funding :17, news :23, social :29) so the four hourly timers do not all
+# fire in the same window.
+#
+# FORWARD-ONLY, like every other producer here: one snapshot per hour and
+# nothing backfills.  There is no backfill recipe, because there is no
+# endpoint to backfill from — that is the entire reason this timer exists.
+#
+# Installed/started by `just depth-timer`, or manually:
+#   systemctl --user enable --now kraken-trading-bot-order-book.timer
+[Unit]
+Description=Hourly Kraken order-book depth snapshot for kraken-trading-bot
+
+[Timer]
+OnCalendar=*-*-* *:41:00
+# Catch up after a suspend/lid-close instead of silently skipping hours.
+# The catch-up can fire twice inside one hour; the recorder appends both and
+# the gap counter calls the pair SHORT (benign), counted separately from a
+# hole so the two cannot be confused.
+Persistent=true
+RandomizedDelaySec=120
+Unit=kraken-trading-bot-order-book.service
+
+[Install]
+WantedBy=timers.target

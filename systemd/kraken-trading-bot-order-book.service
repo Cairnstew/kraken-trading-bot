@@ -1,0 +1,41 @@
+# The order-book depth-recorder user unit with the default values filled in —
+# the same unit `just depth-timer` generates from the .in next to it, but
+# pointing at the canonical checkout rather than at whatever tree ran `just`.
+# Re-run `just depth-timer` from the checkout you want the timer to run; it
+# regenerates this file with that path.
+[Unit]
+Description=Record one Kraken order-book depth snapshot into the trading bot's depth log
+Documentation=file:///home/seanc/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl
+# Deliberately NO After=/Requires= on the credential oneshot: /0/public/Depth
+# is KEYLESS, so this must keep working on a host where the secret has not
+# been materialised.  Making it depend on the credentials unit would turn a
+# working keyless call into a silent hole.
+
+[Service]
+Type=oneshot
+# One snapshot per fire, APPENDED.  The log is a log, not state: nothing is
+# rewritten and no earlier record is corrected in place, so a hole stays a
+# hole and stays visible to the gap counter.  A `Persistent=true` catch-up
+# re-fire inside the same hour appends a second line rather than clobbering a
+# good reading; the reader de-duplicates on the `hour` key, the gap counter
+# classifies the pair as SHORT (benign) and counts it separately from a hole.
+#
+# /home/seanc/Projects/kraken-trading-bot is substituted by `just depth-timer` from the justfile's own
+# directory, so ExecStart is `nix run <the checked-out tree>#kraken-trading-bot`
+# -- the SAME shape as the funding unit's `nix run <sibling>#<pkg>`.  Two
+# properties come from naming a path rather than adding a flake input: the
+# package is built from the WORKING TREE (`src = ./..` in nix/default.nix, no
+# lock entry), so an edit is live with no lock bump; and the timer provably
+# runs the tree it is pointed at rather than a pinned revision of it.
+#
+#  *** NIX AND GIT-TRACKED FILES ***
+# A path reference to a git checkout only sees TRACKED files.  An untracked
+# or unstaged recorder module is silently absent from the built package and
+# the unit fails with ModuleNotFoundError -- i.e. the timer looks installed
+# and accumulates nothing.  Commit before trusting a first fire.
+ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-trading-bot#kraken-trading-bot -- record-depth --pair ETH/USD --output /home/seanc/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl --count 100
+TimeoutStartSec=300
+# A failed pull must not be mistaken for a fresh file: leave the previous
+# JSONL alone, let the non-zero exit mark the hour as missed, and let the
+# next fire's gap report name the hole.
+SuccessExitStatus=0

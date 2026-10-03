@@ -8,6 +8,11 @@ import sys
 from typing import Sequence
 
 from . import __version__, setup_logging
+from .depth_recorder import (
+    DEFAULT_COUNT,
+    DEFAULT_EXPECTED_INTERVAL_SECONDS,
+    DEFAULT_GAP_FACTOR,
+)
 from .engine import TradingEngine
 from .strategies.sma import SMAcrossoverStrategy
 
@@ -342,7 +347,205 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # ── record-depth command ─────────────────────────────────────────────
+    # One keyless /0/public/Depth call, one JSONL line appended.  This is the
+    # production path the kraken-trading-bot-order-book.timer unit runs.
+    record_parser = sub.add_parser(
+        "record-depth",
+        help=(
+            "Record ONE order-book depth snapshot and append it to a JSONL "
+            "log (keyless). Unattended data collection: Kraken's book has no "
+            "historical endpoint, so an hour not recorded cannot be recovered."
+        ),
+    )
+    record_parser.add_argument(
+        "--pair",
+        default="ETH/USD",
+        help="Spot pair, e.g. ETH/USD (default: ETH/USD).",
+    )
+    record_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="Append-only JSONL log to append the snapshot to.",
+    )
+    record_parser.add_argument(
+        "--status-output",
+        default=None,
+        help=(
+            "Path for the gap-report sidecar, rewritten each fire (default: "
+            "<output>.status.json). The sidecar is what makes a hole visible "
+            "in the artifact and not only on stdout."
+        ),
+    )
+    record_parser.add_argument(
+        "--count",
+        type=int,
+        default=DEFAULT_COUNT,
+        help=(
+            f"Requested book depth per side (default: {DEFAULT_COUNT}, "
+            "Kraken's served default). Depth is NOT comparable across a "
+            "count change, and every record carries the depth actually "
+            "returned -- measured 2026-10-03: count=1000 is served as 100 "
+            "with no error."
+        ),
+    )
+    record_parser.add_argument(
+        "--expected-interval-seconds",
+        type=float,
+        default=DEFAULT_EXPECTED_INTERVAL_SECONDS,
+        help=(
+            "The cadence the gap counter holds the recorder to "
+            f"(default: {DEFAULT_EXPECTED_INTERVAL_SECONDS:.0f})."
+        ),
+    )
+    record_parser.add_argument(
+        "--gap-factor",
+        type=float,
+        default=DEFAULT_GAP_FACTOR,
+        help=(
+            "An interval longer than expected x this factor is a hole "
+            f"(default: {DEFAULT_GAP_FACTOR:g})."
+        ),
+    )
+
+    # ── depth-gaps command ───────────────────────────────────────────────
+    # Re-scan an existing log with no network access.  Exits non-zero on a
+    # hole so it can gate a CI step or a cron health check, and so the
+    # counter's RED verdict is observable by a caller and not only by a human
+    # reading the report.
+    gaps_parser = sub.add_parser(
+        "depth-gaps",
+        help=(
+            "Scan a recorded depth log for holes (no network) and refresh "
+            "its status sidecar. Exits 1 if any interval exceeded the "
+            "expected cadence."
+        ),
+    )
+    gaps_parser.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        help="The JSONL log to scan.",
+    )
+    gaps_parser.add_argument(
+        "--status-output",
+        default=None,
+        help="Sidecar to rewrite (default: <output>.status.json).",
+    )
+    gaps_parser.add_argument(
+        "--expected-interval-seconds",
+        type=float,
+        default=DEFAULT_EXPECTED_INTERVAL_SECONDS,
+        help=(
+            "The cadence to hold the log to "
+            f"(default: {DEFAULT_EXPECTED_INTERVAL_SECONDS:.0f})."
+        ),
+    )
+    gaps_parser.add_argument(
+        "--gap-factor",
+        type=float,
+        default=DEFAULT_GAP_FACTOR,
+        help=(
+            f"Hole threshold multiplier (default: {DEFAULT_GAP_FACTOR:g})."
+        ),
+    )
+    gaps_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Emit the report as a single JSON object on stdout.",
+    )
+
     return parser
+
+
+def cmd_record_depth(args: argparse.Namespace) -> int:
+    """Record one depth snapshot, append it, then report the log's gaps."""
+    from pathlib import Path
+
+    from kraken_trading_bot.depth_recorder import (
+        format_report,
+        record_once,
+    )
+
+    output = Path(args.output)
+    status = Path(args.status_output) if args.status_output else Path(
+        str(output) + ".status.json"
+    )
+
+    try:
+        record, report = record_once(
+            pair=args.pair,
+            count=args.count,
+            output=output,
+            status_output=status,
+            expected_interval_seconds=args.expected_interval_seconds,
+            gap_factor=args.gap_factor,
+        )
+    except Exception as e:
+        # A failed pull must not be mistaken for a fresh file: the previous
+        # JSONL is left exactly as it was, and the unit's non-zero exit is
+        # what marks the hour as missed.  Same contract as the funding unit.
+        _LOGGER.error("Depth recording for %s failed: %s", args.pair, e)
+        print(f"Error recording depth for {args.pair}: {e}", file=sys.stderr)
+        return 1
+
+    depth = record["depth"]
+    print(f"Recorded {record['source']} snapshot for {record['pair']}")
+    print(f"  recorded_at : {record['recorded_at']}  (this process's own clock)")
+    print(f"  hour        : {record['hour']}")
+    print(
+        f"  depth       : requested {depth['requested_count']}, "
+        f"got {depth['bid_levels']} bids / {depth['ask_levels']} asks"
+        + ("  TRUNCATED" if depth["truncated"] else "")
+    )
+    print(f"  best        : bid {record['best_bid']} / ask {record['best_ask']}")
+    print(f"  spread      : {record['spread']}")
+    print(f"  appended to : {output}")
+    print()
+    print(
+        format_report(
+            report,
+            artifact=output,
+            status_file=status,
+        )
+    )
+
+    # Non-zero when the log has a hole, so an unattended caller can gate on
+    # it.  A hole is a data-loss event, not a cosmetic one.
+    return 0 if report.ok else 1
+
+
+def cmd_depth_gaps(args: argparse.Namespace) -> int:
+    """Re-scan an existing depth log.  No network; refreshes the sidecar."""
+    import json as _json
+
+    from pathlib import Path as _Path
+
+    from kraken_trading_bot.depth_recorder import (
+        format_report,
+        scan_gap_file,
+        write_status,
+    )
+
+    output = _Path(args.output)
+    status = _Path(args.status_output) if args.status_output else _Path(
+        str(output) + ".status.json"
+    )
+
+    report = scan_gap_file(
+        output,
+        expected_interval_seconds=args.expected_interval_seconds,
+        gap_factor=args.gap_factor,
+    )
+    write_status(status, report, artifact=str(output))
+
+    if args.as_json:
+        print(_json.dumps(report.to_dict(), indent=2))
+    else:
+        print(format_report(report, artifact=output, status_file=status))
+    return 0 if report.ok else 1
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -764,6 +967,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "backtest": cmd_backtest,
         "models": cmd_models,
         "export-data": cmd_export_data,
+        "record-depth": cmd_record_depth,
+        "depth-gaps": cmd_depth_gaps,
     }
 
     if args.command is None:

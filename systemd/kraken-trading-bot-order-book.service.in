@@ -1,0 +1,66 @@
+# Template for the order-book depth-recorder user unit.  Installed (with
+# @ROOT@/@PAIR@/@OUTPUT@/@COUNT@ substituted) by `just depth-timer`; the
+# shipped `.service` next to it is the same unit with the default values
+# filled in.
+#
+# WHY THIS UNIT IS TIME-CRITICAL
+# Kraken's order book is a LIVE SNAPSHOT WITH NO HISTORICAL ENDPOINT.  A
+# `count=100` book at t does not encode t-1h, and Kraken's public archive is
+# OHLCVT-only.  Every hour this timer does not fire is an hour of depth that
+# nothing can ever recover — so this unit existing is worth nothing and this
+# unit FIRING is the whole deliverable.  See `.data-audit/PLAN.md` §8.1.
+#
+# It is deliberately NOT the feature.  Nothing reads this file yet: no
+# `_SIGNAL_COLUMNS` entry, no observation-width change, no merge into the
+# observation.  The recorder must run unattended for a long stretch before
+# anything depends on its schema.
+#
+# Install manually if you would rather not use `just`:
+#   mkdir -p ~/.config/systemd/user
+#   sed -e "s|@ROOT@|$HOME/Projects/kraken-trading-bot|" \
+#       -e 's|@PAIR@|ETH/USD|' \
+#       -e "s|@OUTPUT@|$HOME/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl|" \
+#       -e 's|@COUNT@|100|' \
+#       systemd/kraken-trading-bot-order-book.service.in \
+#       > ~/.config/systemd/user/kraken-trading-bot-order-book.service
+#   ln -sf "$PWD/systemd/kraken-trading-bot-order-book.timer" ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kraken-trading-bot-order-book.timer
+#
+# `loginctl enable-linger $USER` makes it fire while logged out.
+[Unit]
+Description=Record one Kraken order-book depth snapshot into the trading bot's depth log
+Documentation=file://@OUTPUT@
+# Deliberately NO After=/Requires= on the credential oneshot: /0/public/Depth
+# is KEYLESS, so this must keep working on a host where the secret has not
+# been materialised.  Making it depend on the credentials unit would turn a
+# working keyless call into a silent hole.
+
+[Service]
+Type=oneshot
+# One snapshot per fire, APPENDED.  The log is a log, not state: nothing is
+# rewritten and no earlier record is corrected in place, so a hole stays a
+# hole and stays visible to the gap counter.  A `Persistent=true` catch-up
+# re-fire inside the same hour appends a second line rather than clobbering a
+# good reading; the reader de-duplicates on the `hour` key, the gap counter
+# classifies the pair as SHORT (benign) and counts it separately from a hole.
+#
+# @ROOT@ is substituted by `just depth-timer` from the justfile's own
+# directory, so ExecStart is `nix run <the checked-out tree>#kraken-trading-bot`
+# -- the SAME shape as the funding unit's `nix run <sibling>#<pkg>`.  Two
+# properties come from naming a path rather than adding a flake input: the
+# package is built from the WORKING TREE (`src = ./..` in nix/default.nix, no
+# lock entry), so an edit is live with no lock bump; and the timer provably
+# runs the tree it is pointed at rather than a pinned revision of it.
+#
+#  *** NIX AND GIT-TRACKED FILES ***
+# A path reference to a git checkout only sees TRACKED files.  An untracked
+# or unstaged recorder module is silently absent from the built package and
+# the unit fails with ModuleNotFoundError -- i.e. the timer looks installed
+# and accumulates nothing.  Commit before trusting a first fire.
+ExecStart=/run/current-system/sw/bin/nix run @ROOT@#kraken-trading-bot -- record-depth --pair @PAIR@ --output @OUTPUT@ --count @COUNT@
+TimeoutStartSec=300
+# A failed pull must not be mistaken for a fresh file: leave the previous
+# JSONL alone, let the non-zero exit mark the hour as missed, and let the
+# next fire's gap report name the hole.
+SuccessExitStatus=0
