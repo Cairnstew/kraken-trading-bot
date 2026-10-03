@@ -198,3 +198,29 @@ arms are **IN-SAMPLE** (shipped default; the bot warns itself) — no predictive
   is still the 721-bar live ceiling.
 - `kraken-funding-rates` has **no remote**. Offer `gh repo create` — not done unilaterally.
 - G3, G5, G6, G7 from `AUDIT.md` remain deferred and unranked against a fresh look.
+
+### Efficiency, measured (never from memory)
+
+From `~/.local/share/opencode/opencode.db`, sessions with
+`directory LIKE '%kraken-trading-bot%'` and `time_created` after 2026-10-02 20:00 —
+**9 sessions (lead + 8 teammates), all attributable this time**: input **11,202,405** /
+output **293,080** / reasoning **113,007** / cache-read **94,696,967**, cost 0.0 (free
+model, not meaningful), **675 tool calls**.
+
+Tool calls per session — lead **122**, then 106 / 104 / 79 / 66 / 65 / 53 / 41 / 40.
+The **lead had the most tool calls of any session**, which is the pattern worth naming:
+most of them were verification, not coordination.
+
+Cache-read is **~8.5x** input, so the run is still cache-bound, but far less extremely than
+the 2026-10-02 pass's 41x — because that pass's `.data-audit/` artifacts (~93KB) were
+uncommitted, whereas committing the artifact dir **after each phase** let every worktree
+teammate `git show` the artifact instead of being handed an absolute path.
+
+Measured avoidable cost: **~10 `just audit-*` invocations, each entering a fresh
+`nix develop` at 17-28 s.** Two of them were re-runs of the same recipe while iterating on
+the `audit-findings` repair, and the per-file post-merge verification
+(`git show <sha>:<path> | diff -q - <path>`) ran as a shell loop after each of 2 merges.
+proposal: the close-out's four checks are already independent subcommands of one script —
+add a `just audit-all` that runs verify → findings → evidence → closeout in ONE
+`nix develop`, and a `just merge-verify <commit>` recipe wrapping the per-file loop, so
+the two repeated shapes stop costing a dev-shell entry each.
