@@ -398,14 +398,47 @@ carry no executable AST guard**, so a doc-only edit is always safe.
 ## 6. Test strategy
 
 **New tests**
-1. `tests/test_gc_producer_append.py` (new file) — AC3, AC4, in each sibling's own test
-   suite, since the write code lives there. Note both siblings already have `tests/`.
+
+1. **AC3 + AC4 — in the SIBLING repos, because that is where the write code
+   lives.** This is a *cross-repo* citation, so it is written in the
+   `repo:path` form `tools/audit_checks.py evidence` resolves, not as a bare
+   basename: a bare one is rglob'd and can land on a same-named file in the
+   wrong repo. The six tests per sibling are:
+
+   - `ticker-news-signals:tests/test_export_append.py`
+   - `kraken-social-signals:tests/test_export_append.py`
+
+   Both hold six tests, and the one that matters most is named here by
+   function because it is the **RG1/RG2 sentinel**:
+   `ticker-news-signals:tests/test_export_append.py#test_two_appends_keep_the_first_file_intact`
+   and `kraken-social-signals:tests/test_export_append.py#test_two_appends_keep_the_first_file_intact`.
+
+   *Why the sentinel by name.* RG1/RG2 (§8) mutate the producer to
+   `path.open("w")` while leaving `--append` accepted — the flag lies. The
+   only assertion that fails on that is the one that checks the first
+   write's **content** survived: a *count* assertion passes, because
+   truncate-and-rewrite to the same length is the exact failure a count
+   cannot see. `test_two_appends_keep_the_first_file_intact` is that
+   assertion, in both siblings, on a marker line (`NEWS_SENTINEL` /
+   `SOC_SENTINEL`). If that test is ever renamed or removed the
+   `#symbol` citations above go red, which is the intent: the sentinel
+   cannot quietly stop existing.
+
+   *Correction of record.* An earlier revision of this section cited
+   ``tests/test_gc_producer_append.py`` as a new file **in this repo**. That
+   file is in no commit, no stash and no worktree here — it never existed.
+   The evidence was real; the repo in the citation was wrong. (It is written
+   in a double-backtick span on purpose: that marks it a quotation of the
+   wrong string, so recording the mistake does not re-raise it as a live
+   citation.)
 2. AC1 + AC2 in `tests/test_rl_data_store.py`, beside the existing merge tests at `:263`
    and `:350`.
 3. AC5 + AC6 as a static parse of `systemd/*.timer` and the generated `.service` — the
    same shape as `tests/test_rl_signal_config_wiring.py:497-551`; no timer needs to fire.
 4. AC7 in `tests/test_rl_data_store.py` (missing-file path).
-5. AC8 as plain string assertions in the same new file.
+5. AC8 as plain string assertions in the same sibling file as (1) — the
+   `--append`-defaulted-off contract belongs beside the append tests, not
+   in a suite that cannot import the producer.
 6. A new AST forwarding guard over all four `read_ohlc_dataframe(` call sites asserting
    the three `*_features_file` keys — the generalization of the guard already at `:545-552`.
 
@@ -434,6 +467,55 @@ timer.
   need `git+https`, not `github:` — avoided entirely by not adding them.
 - **Read-only.** No source modified; no commit; scratch only under `/tmp/opencode/gc/`;
   all Python inside `nix develop`. No `nix flake check`, no live train/backtest.
+
+### 7.7 Finding dispositions — re-derived, 2026-10-03
+
+`just audit-findings` binds every `F<n>` named in `VALIDATION.md` §8 to a
+disposition **in this file**. That table was dropped by the `bbdbe56` rewrite
+(526 insertions / 760 deletions) and is restored here.
+
+**These are not the dispositions the pre-rewrite table carried.** Each row was
+re-derived at HEAD from the file the claim is about, and three of them came out
+*different* from what was recorded — those are marked **[CORRECTED]** and say
+why. Rows marked **[UNSETTLED]** are ones where the record genuinely does not
+show what happened; each names the evidence that would settle it. No row is
+"deferred", because a finding that was not addressed is itself a finding about
+the audit and recording it as a disposition would hide that.
+
+| id | finding | disposition, re-derived at `5eb1776` |
+|---|---|---|
+| **F-1** | `features.py` docstring said the shipped default "composes 52" | **Closed. [CORRECTED — the old row said "Accepted, not fixed here".]** It *was* fixed, in `aba7b9b`, and the fix is in the file: `features.py:506-507` now reads "composes 52; 52 is in fact the *all-null* width, and the shipped default composes 60". |
+| **F-2** | `signal_observed` is a per-channel OR; 4 of 6 columns stay zero-fill | **Accepted and disclosed — done.** The disclosure is in the shipped config, not only in the audit: `configs/default.yaml:171-185` is headed "TWO THINGS TO KNOW BEFORE TRUSTING `signal_observed` ON THIS CHANNEL" and states the OR (`observed = filled.notna()...`) and that it "no longer distinguishes them". Restated at `VALIDATION.md:579` and in `VALIDATION.md` §9.1. Structural to `data.py:724`; not fixable without widening the observation. |
+| **F-3** | Forward-only cold start at a rolling ~366-day cap | **Accepted and bounded; the bound is measured, the *assertion* is narrower than the old row claimed. [CORRECTED — the old row said "bounded, and asserted"; nothing asserts 366.]** Measured at `VALIDATION.md:225-233`: 8,792 records spanning 2025-10-01T08:00:00Z → 2026-10-02T23:00:00Z, and the row itself says the count "must be dated" because the window is recomputed per call. What *is* asserted is the young-log behaviour: `tests/test_rl_signal_config_wiring.py:951` `test_a_funding_file_with_no_overlap_stays_a_warning` pins that a forward-only file with no overlap stays a WARNING and returns the frame. **No test pins a day count, and none should** — it is recomputed. |
+| **F-4** | AUDIT's "12 of 721" was wrong; **13** measured | **Closed, and the correction landed in the artifact — stronger than the old row claimed ("Correction recorded").** The 12 was never literal: at `069a826^`, `AUDIT.md:150-153` said "≈709 of 721 bars read these six columns as their historical `0.0` fill", which *implies* 12. AUDIT.md was rewritten at `f6d9118` and now states it directly — `AUDIT.md:307` "2 distinct values on **13 of 721** bars, std 0.00336". The 709 arithmetic appears in **no** revision from `f6d9118` onward. |
+| **F-5** | `null` vs `0.0` for unrecoverable fields | **Override stands and was measured — but the measurement is GONE. [CORRECTED]** The old row cited "§6.1 shows the observation is byte-identical either way". That §6.1 was a three-row measured table (`null` / `0.0` / today, all `n_features` 57, `spread` nonzero 24, max 3.695e-05, non-finite 0) in the pre-rewrite `DECISION.md`, and `bbdbe56` **deleted it** along with old §6.2. The override is still the shipped behaviour; its justification is no longer in any document. Re-measure before relying on it. |
+| **F-6** | Tighten `signal_max_age_hours` 12 → ~1 | **Override stands, and is now ASSERTED — the old row said only "fix the comment, not the value".** `configs/default.yaml:192` is still `signal_max_age_hours: 12`, and `tests/test_rl_signal_config_wiring.py:1149` `test_the_shipped_funding_key_is_tilde_spelled_and_bounded_at_12h` asserts `== 12` in **both** shipped configs, carrying the measured inter-record gap histogram `{1.0h: 8783, 2.0h: 6, 3.0h: 1}` in its docstring. Independently confirmed by measurement at `VALIDATION.md` §5.4 (baseline max **12.0**), which is what F-10 predicted. |
+| **F-7** | §6.1's hour-dedup direction was **inverted** (file order, not "live wins") | **Corrected and acted on — ON THE CONSUMER, and the producer deliberately does the opposite of what was recorded. [CORRECTED — the old row said "`--append` now skips hours the file already holds". That is false against the code.]** The dedup *direction* was fixed here: `data.py:798-809` exact-duplicate `keep="last"` → **`sort_index(kind="stable")`** → `floor("h")` → `groupby(level=0).last()`, with the comment "a stable sort so 'the most recent pull' is the last row of its floored hour". That sort arrived in `5951f72` (A2). But `ticker-news-signals:ticker_news_signals/export.py:188` is `mode = "a" if append else "w"` — **no hour-skip** — and its own docstring says "The consumer's de-duplication means a duplicate hour is harmless, so ... appending is always safe"; `54c9d24` says the same. So the resolved design is *append unconditionally, dedup on the consumer*, which is defensible and **not** the recorded disposition. |
+| **F-8** | §7.3's width constants (57/49) are **3 low** | **Superseded, and the decision doc now obeys it. [CORRECTED — the old row said "Phase 6 must use 52–60"; the current §3.2 already states "no literal width anywhere" and measures deltas on two axes.]** Measured with the repo's own tool at `VALIDATION.md` §5.3: all three `*_features_file` keys null → **52**; shipped default, funding channel live → **60**. Cause named: the frame lacked the presence-gated trio `vwap_dev` / `volume_per_trade` / `trade_count_zscore_20`. |
+| **F-9** | Non-finite cells: 684 vs 0 | **RESOLVED by measurement — the old row said "Open, reviewer must re-derive and name the frame". [CORRECTED]** `VALIDATION.md` §5.1 re-derived it across five frames: `computed` tradable slice only (697 bars) = **684** baseline / **697** backfilled; `observed` = **0** / **0**. `first_tradable_index = 24`, so `721 − 24 = 697` and `697 − 13 = 684` — arithmetically exact. Also corrects the builder's "identical in baseline and target": 684 vs 697 is not identical. |
+| **F-10** | `signal_age_hours` ≤ 2.0 unachievable | **RESOLVED by measurement. [CORRECTED — the old row said "Restate per shape", a prescription, not a disposition.]** `VALIDATION.md` §5.4: baseline (shipped live-snapshot shape) min **−1.0** / max **12.0** on 720 nonzero bars; backfilled (dense hourly) min **0.0** / max **0.0**. `−1.0` is `_NO_SIGNAL_AGE` (`data.py:136`). The max lands on the bound itself, so C12's "≤ 2.0" is unachievable on the shipped shape. This is what confirms F-6. |
+| **F-11** | `spread` nonzero: 13 vs 24 | **RESOLVED — one arm, two frames. [CORRECTED — the old row said "Open, reviewer re-derives"; two agents had measured different arms.]** `VALIDATION.md` §5.2: `computed` = **13** baseline / **0** backfilled; `observed` = **24** / **0**. Same arm, same file, same frame length; `observed = computed.ffill().fillna(0.0)`. Mechanism: the single record sits at `2026-10-02T00:00Z` and the frame's right edge is `2026-10-02T23:00Z`, so it is **23 bars back** and the 12 h carry reaches forward. The integrator's "byte-identical both arms" is **wrong** — the backfilled arm is 0/721. |
+| **F-12** | Record has 14 keys, §6 says 13 | **Restated as a superset — confirmed with the keys named. [CORRECTED — the old row asserted "the builder's test asserts backfilled ⊇ live"; I could not find that assertion.]** `VALIDATION.md` §4 measures **keys per record = 14** and lists all fourteen: `ask, basis, bid, funding_rate, funding_rate_prediction, index_price, mark_price, open_interest, relative_funding_rate, spot_pair, symbol, ticker, timestamp, vol24h`. `relative_funding_rate` costs **0** observation columns because `data.py` intersects against `_SIGNAL_COLUMNS`. **Not found:** a test asserting the superset relation itself. `tests/test_rl_signal_config_wiring.py:1231` writes `relative_funding_rate: None` in a fixture, which exercises it but does not assert the subset direction. Settling this needs a test that states `live_keys ⊆ backfilled_keys`. |
+| **F-13** | F-1's number was wrong as well as its text | **Closed. [CORRECTED — the old row said "Closed by a docstring-only edit in `aba7b9b`", which is right; it is re-derived here from `aba7b9b`'s own diff, `-S"52 is in fact the *all-null* width"` attributing to that commit, and read back at `features.py:506-507`.]** This is the visible instance of F-1's own disposition working: the edit is docstring-only, so `executable_ast` on `features.py` is unchanged and the D1 gate did not see it. |
+| **F-14** | The two characterisation tests are **vacuous** for this diff | **Accepted, not a defect — and the verdict was measured, not assumed. [CORRECTED — the old row asserted the vacuity; here is the receipt.]** `VALIDATION.md` §7.2, with `data.py`/`features.py` reverted to `069a826` and the tests kept at HEAD: `2 passed, 21 deselected in 0.56s`, alongside `executable_ast 069a826==HEAD -> True` for **both** files. Zero executable change, so no test *could* be non-vacuous. Both tests are still present (`tests/test_rl_signal_config_wiring.py:1239` and `:1316`) and are retained deliberately as future-seam guards. The same rule caught `§7.1`'s producer-hint pin as **genuinely** non-vacuous (`1 failed, 22 deselected`), so the rule discriminates. |
+| **F-15** | `width_check.py` skips `add_derived_ohlcv_features`, so a raw parquet reports 49 | **Accepted, docstring-only.** Already recorded in §3.2 of this file ("omitting it is the F-15 trap"). *Unverified by me:* whether the requested change — a note in `width_check.py`'s **module docstring** — actually landed; `VALIDATION.md` §7.3 records the requested disposition but I did not read `tools/width_check.py`'s docstring against it. The behaviour is unchanged either way (the tool still reports 49 on a raw frame, per `VALIDATION.md` §1.2). |
+| **F-16** | `audit_checks.find_in_repo` **crashed** (`ValueError`) on a legitimate absolute cross-repo citation | **Fixed, and this pass found a second defect in the same function. [CORRECTED]** The `try/except ValueError` degrade is in the file at `tools/audit_checks.py` (inside `find_in_repo`), attributable to `6bef125` by `-S"degrade to the absolute path"`. But the function's *sibling search* was `REPO.parent.glob("kraken-*")`, which is **empty inside a git worktree** — i.e. in every place this audit actually runs. That turned two valid citations (`RUN-LOG.md:628`'s references to kraken-python's `transport.py` and kraken-market-data's `client.py`) into hard errors on every worktree run while the primary checkout reported neither, which is why `audit-evidence` was never green in this chain. Fixed here: the sibling roots are now discovered through `sibling_roots()` (§6 above). |
+
+### 7.8 Findings raised by this pass — recorded, not inherited
+
+These are **not** in `VALIDATION.md` §8 and are not in `FINDINGS_PIN`. They are
+recorded here because they are real and dropping them would repeat the defect
+F-16/F-17 describe.
+
+| id | finding | disposition |
+|---|---|---|
+| **F-17** | `cmd_findings` scanned `\bF(\d+)\b` and looked up `F{n}`, but the repo's convention is hyphenated (`F-1`), so every run reported "no `F<n>` identifiers" and returned 0 — the check had been **passing vacuously**, the R5 defect class inside the check meant to catch it. | **Fixed** in `6bef125` (scan `\bF-?(\d+)\b`, match with a boundary so `F1` cannot match inside `F11`). Still a live hazard in the same family: the current `cmd_findings` reads the finding set *out of the table it polices*, which is why `FINDINGS_PIN` now holds the ids in code. |
+| **F-18** | Funding depth cannot help episode length while the price frame is 721 bars: funding is ~366 days / ~8,800 hourly records deep, but `configs/default.yaml` `ohlcv_interval_minutes: 60` against the 721-bar live REST ceiling bounds the episode at ~30 days. | **Recorded as a standing constraint on candidate ranking, unchanged.** Not a defect to fix in this pass; it is the argument that the *store* leg must land before any further exogenous channel. **Unverified by me:** the 8,792/366-day half now rests on `VALIDATION.md` §4 (dated 2026-10-02), and the 721-bar ceiling has not been re-measured by me. |
+
+Any `F<n>` raised in a later phase that is not in `FINDINGS_PIN` **must be added
+to the pin** and to `VALIDATION.md` §8 in the same commit. Adding it only to
+the table trips `ADDED-WITHOUT-PIN`; adding it only to the pin trips nothing,
+which is the point — the pin is the thing a table rewrite cannot take with it.
 
 ---
 

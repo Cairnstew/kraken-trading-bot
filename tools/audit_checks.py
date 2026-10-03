@@ -245,7 +245,179 @@ def cmd_verify(a: argparse.Namespace) -> int:
 #: /tmp mention in every file produced 34 findings, almost all benign, which
 #: is how a check gets ignored -- so scope to the claim-bearing docs and split
 #: errors from warnings.
-CLAIM_DOCS = ("DECISION.md", "VALIDATION.md", "PLAN.md", "RUN-LOG.md", "AUDIT.md")
+CLAIM_DOCS = (
+    "DECISION.md",
+    "VALIDATION.md",
+    "PLAN.md",
+    "RUN-LOG.md",
+    "AUDIT.md",
+    # FIXPASS.md is evidence for a docs pass, and it cites the same
+    # things the decision cites. An evidence file that is exempt from
+    # the evidence check is a hole shaped exactly like the one this
+    # check exists to close.
+    "FIXPASS.md",
+)
+
+#: A cross-repo citation is ``repo:path`` or ``repo:path#symbol``, backticked.
+#:
+#: WHY THE FORM EXISTS. This audit's decisions routinely turn on code that
+#: lives in a SIBLING checkout -- `ticker-news-signals`, `kraken-social-
+#: signals` -- not here. Before this form, the only way to cite such a file
+#: was to write a bare basename, and ``find_in_repo`` then resolved it by
+#: rglob: if two siblings had same-named files it picked whichever came
+#: first alphabetically, and a file that existed in NO checkout was reported
+#: as an error indistinguishable from one that exists in the wrong place.
+#: That is how ``tests/test_gc_producer_append.py`` came to be cited as
+#: evidence: it never existed in this repo, but the two tests it stood for
+#: are real and live in the siblings. The citation was wrong about the
+#: repo, not about the evidence.
+#:
+#: The repo token is ``[\w-]+`` -- no slashes -- so it can only ever name a
+#: SIBLING DIRECTORY, never a path. A single-token ``foo:bar.py`` in prose
+#: would be read as a cross-repo citation, so docs that need to cite a
+#: local path keep using the plain backticked form.
+CROSS_REPO_CITE = re.compile(
+    r"`(?P<repo>[\w-]+):(?P<path>[\w./-]+\.(?:py|sh))(?:#(?P<symbol>\w+))?`"
+)
+
+#: A Markdown code span holding another code span: ``` ``foo.py`` ```.
+#: Masked out before any citation is collected, because a citation written
+#: that way is a QUOTATION -- a correction note naming the exact string that
+#: was wrong -- and not a claim that the file exists. Without this, writing
+#: down the false citation you are correcting re-raises it as a live finding,
+#: which is the one thing a correction note must not do: it makes the honest
+#: act of recording the mistake unrepresentable, so the alternative is to
+#: stop naming the mistake, and then nobody can check the correction.
+_QUOTED_SPAN = re.compile(r"``.+?``", re.S)
+
+
+def _claims(line: str) -> str:
+    """The part of ``line`` in which a citation is a CLAIM rather than a quote."""
+    return _QUOTED_SPAN.sub(" ", line)
+
+#: Repo token -> directory name to look for. Declared rather than globbed so
+#: a typo in a citation is reported as a typo instead of silently becoming
+#: "sibling absent", which is a non-failing state by design (see
+#: :func:`classify_cross_repo`). ``.`` is this repo, which is legal to cite
+#: but must still resolve.
+CROSS_REPO_DIRS = {
+    "ticker-news-signals": "ticker-news-signals",
+    "kraken-social-signals": "kraken-social-signals",
+    "kraken-python": "kraken-python",
+    "kraken-market-data": "kraken-market-data",
+    "kraken-deep-history": "kraken-deep-history",
+    "kraken-funding-rates": "kraken-funding-rates",
+    "kraken-trading-bot": ".",
+}
+
+#: Reported when a sibling is not on disk. NOT a failure, and that is the
+#: whole point: a checkout that does not carry its siblings is not a broken
+#: audit, it is an audit that cannot reach one file. Failing here would
+#: punish every fresh clone. What must NOT be tolerated is the sibling being
+#: PRESENT and the citation still not resolving -- that is provably a false
+#: citation and stays an error.
+CROSS_REPO_ABSENT = "UNVERIFIED (sibling absent)"
+CROSS_REPO_OK = "VERIFIED (cross-repo)"
+
+
+def sibling_roots() -> list[Path]:
+    """Directories that may hold this repo's sibling checkouts.
+
+    ``REPO.parent`` alone is wrong in exactly the place the audit runs. The
+    primary checkout is ``~/Projects/kraken-trading-bot``, so its parent is
+    ``~/Projects`` and the glob finds every sibling. An Ensemble/git worktree
+    lives at ``~/.local/share/opencode/worktree/<sha>/<name>``, so its
+    parent is the worktree directory and its grandparent is ``<sha>``: the
+    glob finds nothing and every cross-repo citation degrades to ABSENT. A
+    resolver that only worked in the primary checkout would report
+    ``UNVERIFIED (sibling absent)`` for a citation that is perfectly valid,
+    which is the false-negative shape that gets a check switched off.
+    """
+    cands = [REPO.parent, REPO.parent.parent, Path.home() / "Projects"]
+    out: list[Path] = []
+    for c in cands:
+        try:
+            if c.is_dir() and c not in out:
+                out.append(c)
+        except OSError:  # unreadable parent: a broken guess, not an answer
+            continue
+    return out
+
+
+def _defines(path: Path, symbol: str) -> bool:
+    """Does ``path`` define ``symbol`` at module level?
+
+    AST first so a mention inside a docstring or a string cannot satisfy it;
+    a regex fallback because a sibling file that does not parse must not
+    turn the whole check into a traceback (F-16's lesson, applied forward).
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
+        return re.search(rf"^\s*(?:def|class)\s+{re.escape(symbol)}\b", path.read_text(
+            encoding="utf-8", errors="replace"), re.M) is not None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == symbol:
+                return True
+        # a decorated test is still a module-level def, so no recursion into
+        # nested scopes is wanted here: a symbol found only inside another
+        # function is not importable by name and does not count.
+    return False
+
+
+def _sibling_checkouts() -> list[Path]:
+    """Every declared sibling checkout that is actually on disk.
+
+    Derived from :data:`CROSS_REPO_DIRS` rather than a ``kraken-*`` glob so
+    the set the resolver searches and the set the docs are allowed to name
+    cannot drift apart. Cached per process: it is a handful of ``is_dir``
+    calls and both call sites run inside one loop.
+    """
+    global _SIBLINGS
+    if _SIBLINGS is None:
+        names = {n for n in CROSS_REPO_DIRS.values() if n != "."}
+        seen: list[Path] = []
+        for root in sibling_roots():
+            for name in sorted(names):
+                cand = root / name
+                if cand.is_dir() and cand not in seen:
+                    seen.append(cand)
+        _SIBLINGS = seen
+    return _SIBLINGS
+
+
+_SIBLINGS: list[Path] | None = None
+
+
+def classify_cross_repo(repo: str, rel: str, symbol: str | None) -> tuple[str, str]:
+    """``(state, detail)`` for one cross-repo citation.
+
+    Three states, and the middle one is the one that is easy to get wrong:
+
+    ``VERIFIED``            the sibling is here AND the file (and named
+                            symbol) resolved. This is the only green.
+    ``UNVERIFIED``          the sibling is NOT on disk. Non-failing by
+                            design; see ``CROSS_REPO_ABSENT``.
+    ``ERROR``               the sibling IS on disk and the citation still
+                            does not resolve. Provably a false citation.
+    """
+    dirname = CROSS_REPO_DIRS.get(repo)
+    if dirname is None:
+        return "ERROR", f"{repo!r} is not a declared sibling repo (declare it in CROSS_REPO_DIRS)"
+    if dirname == ".":
+        root = REPO
+    else:
+        found = [p for p in _sibling_checkouts() if p.name == dirname]
+        if not found:
+            return CROSS_REPO_ABSENT, f"no checkout of {repo} under {len(sibling_roots())} candidate root(s)"
+        root = found[0]
+    target = root / rel
+    if not target.is_file():
+        return "ERROR", f"{root.name}/{rel} does not exist"
+    if symbol and not _defines(target, symbol):
+        return "ERROR", f"{root.name}/{rel} exists but defines no {symbol!r}"
+    return CROSS_REPO_OK, f"{root.name}/{rel}" + (f"::{symbol}" if symbol else "")
 
 
 def cmd_evidence(a: argparse.Namespace) -> int:
@@ -261,10 +433,20 @@ def cmd_evidence(a: argparse.Namespace) -> int:
     print(f"evidence  scanned {len(files)} claim-bearing file(s) of .data-audit/")
     scripts: dict[str, list[str]] = {}
     tmps: list[tuple[str, str, int]] = []
+    # A cross-repo citation is collected separately and NEVER fed to the
+    # in-repo resolver: `ticker-news-signals:tests/test_export_append.py`
+    # would otherwise be rglob'd by basename and could resolve to some other
+    # repo's same-named file, which is the false-green this form removes.
+    xrepo: dict[tuple[str, str, str | None], list[str]] = {}
     for md in files:
-        for i, line in enumerate(md.read_text().splitlines(), 1):
+        for i, raw in enumerate(md.read_text().splitlines(), 1):
+            line = _claims(raw)
             for m in re.finditer(r"`([\w./-]+\.(?:py|sh))`", line):
                 scripts.setdefault(m.group(1), []).append(f"{md.name}:{i}")
+            for m in CROSS_REPO_CITE.finditer(line):
+                xrepo.setdefault((m.group("repo"), m.group("path"), m.group("symbol")), []).append(
+                    f"{md.name}:{i}"
+                )
             for m in re.finditer(r"/tmp/[A-Za-z0-9_./-]+", line):
                 tmps.append((md.name, m.group(0).rstrip("`.,)"), i))
 
@@ -294,7 +476,14 @@ def cmd_evidence(a: argparse.Namespace) -> int:
         # client.py, kraken-deep-history's seeder.py). Resolving against this
         # repo root alone produced 15 false positives; resolve by basename
         # across the repo and its sibling checkouts.
-        for root in (REPO, *sorted(REPO.parent.glob("kraken-*"))):
+        #
+        # `sibling_roots()` rather than `REPO.parent.glob("kraken-*")`: the
+        # glob is empty inside a git worktree, which is where every audit
+        # run happens, so it turned two valid citations (this audit's
+        # RUN-LOG.md:628 references to kraken-python's transport.py and
+        # kraken-market-data's client.py) into hard errors on every worktree
+        # run while the primary checkout reported neither.
+        for root in (REPO, *_sibling_checkouts()):
             for hit in root.rglob(Path(name).name):
                 rel = hit.relative_to(root)
                 if rel.parts[0] in (".venv", ".git", "node_modules") or "__pycache__" in rel.parts:
@@ -317,12 +506,55 @@ def cmd_evidence(a: argparse.Namespace) -> int:
         where = find_in_repo(path)
         if where:
             print(f"    {path:32s} in repo ({where})  cited {len(cites)}x")
+        elif not _sibling_checkouts():
+            # A bare basename that resolves nowhere, in an environment with
+            # NO sibling checkout to resolve it in, is not a false citation
+            # that has been proven -- it is a citation that cannot be
+            # checked. Same rule as CROSS_REPO_ABSENT: report the distinct
+            # non-failing state rather than failing a bare clone.
+            warnings.append(
+                f"{path} cited {len(cites)}x but no sibling checkout is on "
+                f"disk to resolve a bare basename against (e.g. {cites[0]})"
+            )
+            print(
+                f"    {path:32s} {CROSS_REPO_ABSENT}  bare basename, "
+                f"{len(cites)} cite(s)  e.g. {cites[0]}"
+            )
         else:
             errors.append(
-                f"{path} cited {len(cites)}x as evidence but is NOT in the repo "
+                f"{path} cited {len(cites)}x as evidence but is NOT in this "
+                f"repo or any of {len(_sibling_checkouts())} sibling checkout(s) "
                 f"(e.g. {cites[0]}) -- a reader cannot re-run it"
             )
             print(f"    {path:32s} NOT IN REPO   cited {len(cites)}x  e.g. {cites[0]}")
+
+    # 1b. Cross-repo citations, resolved against the sibling they name.
+    if not xrepo:
+        print("\n  cross-repo citations: (none)")
+    else:
+        n_ok = n_abs = 0
+        print("\n  cross-repo citations (`repo:path`, `repo:path#symbol`):")
+        for (repo, rel, symbol), cites in sorted(
+            xrepo.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or "")
+        ):
+            label = f"{repo}:{rel}" + (f"#{symbol}" if symbol else "")
+            state, detail = classify_cross_repo(repo, rel, symbol)
+            if state == CROSS_REPO_OK:
+                n_ok += 1
+            elif state == CROSS_REPO_ABSENT:
+                n_abs += 1
+                warnings.append(f"{label}: {detail}")
+            else:
+                errors.append(
+                    f"cross-repo citation {label} is FALSE: {detail} "
+                    f"(cited {len(cites)}x, e.g. {cites[0]}) -- the sibling is "
+                    f"on disk, so this is provably a wrong citation"
+                )
+            print(f"    {label:58s} {state}  {detail}  cited {len(cites)}x")
+        print(
+            f"    -> {n_ok} VERIFIED, {n_abs} {CROSS_REPO_ABSENT} "
+            f"(non-failing by design)"
+        )
 
     # 2. /tmp paths in a claim-bearing doc: a warning, not an error. Most are
     #    legitimate ("the store was seeded here"); the ones that matter are
@@ -355,6 +587,67 @@ def cmd_evidence(a: argparse.Namespace) -> int:
 
 
 # ── findings ────────────────────────────────────────────────────────────────
+#: The finding identities ``VALIDATION.md`` §8 is REQUIRED to carry.
+#:
+#: WHY A LITERAL PIN. ``cmd_findings`` reads the finding set *out of the
+#: table it is meant to police*. A rewrite that drops a row therefore deletes
+#: the very evidence the check would have compared against, and the check
+#: reports a clean bill of health for a table that no longer says what it
+#: used to. This is not hypothetical in this repo: ``bbdbe56`` rewrote
+#: ``DECISION.md`` 526 insertions / 760 deletions and took §7.7/§7.8 — the
+#: whole disposition table — with it, and ``just audit-findings`` went red
+#: for the right reason by luck, because the *other* half of the check (does
+#: each VALIDATION id appear in DECISION) reads DECISION for the ids. Had
+#: the rewrite dropped the §8 rows instead, the same rewrite would have
+#: gone green. A count is not the protection either: ``F-2`` and ``F-3``
+#: dropped for ``F-17`` and ``F-18`` added is 17 either way.
+#:
+#: So the identities live HERE, in code, where a change to them is a visible
+#: diff on a file that is not the table. Bumping the pin is deliberate work:
+#: it must be its own commit with a stated reason, which is what makes the
+#: drop reviewable rather than invisible.
+#:
+#: ``pinned_against`` is the tree the pin was read off — the commit whose
+#: §8 index this set was transcribed from, not a commit that "endorses" it.
+FINDINGS_PIN: dict[str, object] = {
+    "pinned_against": "5eb1776",
+    "count": 16,
+    "ids": frozenset(range(1, 17)),
+    # Disposition cells that mean "nothing happened", refused by name. A
+    # bulk "deferred" is not a disposition: it is a finding about the audit,
+    # and recording it as a disposition hides that. These four are the
+    # spellings that would otherwise pass a length check while carrying no
+    # evidence.
+    "vacuous_dispositions": frozenset(
+        {"deferred", "out of scope", "not addressed", "tbd", "todo", "n/a", "-", "—", "— —"}
+    ),
+}
+
+#: A row of the §8 finding-index table: ``| **F-7** | finding | disposition |``
+_FINDING_ROW = re.compile(r"^\|\s*\**\s*F-?(\d+)\s*\**\s*\|(.+)$")
+
+
+def parse_finding_table(text: str) -> dict[int, tuple[int, str, str]]:
+    """``{n: (line, finding_cell, disposition_cell)}`` from VALIDATION.md §8.
+
+    Parsed from the TABLE, not from a free-text scan, because the table is
+    what a rewrite silently loses: a finding mentioned in prose and absent
+    from the table is exactly the drop this check exists to catch.
+    """
+    rows: dict[int, tuple[int, str, str]] = {}
+    for i, line in enumerate(text.splitlines(), 1):
+        m = _FINDING_ROW.match(line.strip())
+        if not m:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        # a header row (`| id | one-line | disposition |`) or a rule
+        # (`|---|---|---|`) has no integer in cell 0, so it never reaches here
+        rows[int(m.group(1))] = (i, cells[1], cells[2])
+    return rows
+
+
 def cmd_findings(a: argparse.Namespace) -> int:
     validation = AUDIT_DIR / "VALIDATION.md"
     decision = AUDIT_DIR / "DECISION.md"
@@ -390,11 +683,74 @@ def cmd_findings(a: argparse.Namespace) -> int:
         loc = f"DECISION.md:{hits[0]}" if hits else "-- NOT RECORDED --"
         print(f"    F-{n:<4d} {'recorded' if recorded else 'MISSING  '}  {loc}")
 
+    # 2. THE PIN. The set of finding identities the §8 table must carry,
+    #    held in FINDINGS_PIN rather than read back out of the table.
+    pin_problems: list[str] = []
+    rows = parse_finding_table(vtext)
+    pinned: frozenset[int] = FINDINGS_PIN["ids"]  # type: ignore[assignment]
+    want_count: int = FINDINGS_PIN["count"]  # type: ignore[assignment]
+    vacuum = FINDINGS_PIN["vacuous_dispositions"]  # type: ignore[assignment]
+
+    dropped = sorted(pinned - set(rows))
+    added = sorted(set(rows) - pinned)
     print(
-        f"\n  RESULT  {'PASS' if not missing else 'MISSING DISPOSITION: ' + ', '.join('F-' + str(n) for n in missing)}"
+        f"\n  findings-table pin  pinned against {FINDINGS_PIN['pinned_against']}: "
+        f"{want_count} ids, {len(pinned)} distinct"
     )
+    if dropped:
+        pin_problems.append(
+            "DROP-FROM-TABLE: " + ", ".join(f"F-{n}" for n in dropped)
+            + f" -- pinned in FINDINGS_PIN but ABSENT from VALIDATION.md §8's "
+            f"table ({len(rows)} row(s)). A findings table that loses rows is "
+            f"not a rewrite, it is a deletion; if the finding is genuinely "
+            f"retired, retire it in FINDINGS_PIN too, in its own commit."
+        )
+    if added:
+        pin_problems.append(
+            "ADDED-WITHOUT-PIN: " + ", ".join(f"F-{n}" for n in added)
+            + " -- present in VALIDATION.md §8's table but not in "
+            "FINDINGS_PIN. A new finding must be added to the pin in the "
+            "same commit, or the next table rewrite silently drops it."
+        )
+    if len(rows) != want_count:
+        pin_problems.append(
+            f"COUNT: table carries {len(rows)} row(s), pin requires "
+            f"{want_count}"
+        )
+    vac: list[int] = []
+    for n in sorted(rows):
+        disp = rows[n][2].strip().strip("*_ ").strip()
+        if disp.lower().rstrip(".") in vacuum or not disp:
+            vac.append(n)
+    if vac:
+        pin_problems.append(
+            "VACUOUS DISPOSITION: " + ", ".join(f"F-{n}" for n in vac)
+            + " -- the disposition cell is empty or a bare 'deferred' / "
+            "'out of scope'. If a finding was not addressed that is itself a "
+            "finding about the audit; write that, and say what evidence "
+            "would settle it."
+        )
+    for p in pin_problems:
+        print(f"    PIN  {p}")
+    if not pin_problems:
+        print(
+            f"    PIN  OK  {len(rows)}/{want_count} rows, all ids pinned, "
+            f"every disposition cell non-vacuous"
+        )
+
+    ok = not missing and not pin_problems
+    if missing:
+        print(
+            f"\n  RESULT  MISSING DISPOSITION: "
+            + ", ".join(f"F-{n}" for n in missing)
+        )
+    elif pin_problems:
+        print(f"\n  RESULT  {len(pin_problems)} PIN PROBLEM(S)")
+    else:
+        print("\n  RESULT  PASS")
     print("  (a finding with no decision-level record is the R5 defect class)")
-    return 0 if not missing else 1
+    print("  (the pin is what stops a REWRITE of the table from deleting a row)")
+    return 0 if ok else 1
 
 
 # ── closeout ────────────────────────────────────────────────────────────────
