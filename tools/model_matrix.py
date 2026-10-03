@@ -66,6 +66,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -1167,6 +1168,27 @@ def classify_process_failure(record: Mapping[str, Any]) -> list[str]:
         f"{key} is set to" in text for key in _SIGNAL_CONFIG_KEYS
     ):
         reasons.append("signal_file_not_found")
+    # SignalTickerMismatchError: the file EXISTS and parses, but every record
+    # in it is tagged for a different pair — the mis-pointed-config case the
+    # seam exists to refuse.  Its real-CLI text carries NO class name (cli.py
+    # prints str(e) only), so it is matched on the message's stable fragments
+    # rather than the spelling: "holds no records for" is the opener of
+    # SignalTickerMismatchError's message and appears in no other refusal,
+    # and the trailing `signal_require_ticker: false` is part of its remedy.
+    #
+    # Why it needs its own code rather than joining signal_file_not_found:
+    # the two send the reader to OPPOSITE fixes.  A missing file means "run
+    # the producer" (just news-pull).  A mismatch means the file is fine and
+    # the *pointing* is wrong — you need that ticker's file, or
+    # signal_require_ticker: false.  Conflating them would have a reader run
+    # a producer that already ran and produce nothing.
+    #
+    # Measured red run before this clause (RED-GRUN §8, RG6 precedent — the
+    # guard must be shown returning the WRONG answer first): a SOL_USD cell
+    # against the ETH-only news file reported `process_failed` alone, with
+    # the real cause visible in the same stderr_tail.
+    if "SignalTickerMismatchError" in text or "holds no records for" in text:
+        reasons.append("signal_ticker_mismatch")
     return reasons
 
 
@@ -1442,6 +1464,73 @@ def _run_json(
 # ── plan ────────────────────────────────────────────────────────────────
 
 
+#: Ticker-field name carried by every signal record shape. Mirrors
+#: ``_TICKER_FIELD`` in ``kraken_trading_bot.rl.data``.
+_SIGNAL_TICKER_FIELD = "ticker"
+
+#: Kraken spells bitcoin ``XBT``; every producer and config folds it to
+#: ``BTC``. Mirrors ``_TICKER_ALIASES`` in the RL data module.
+_SIGNAL_TICKER_ALIASES = {"XBT": "BTC"}
+
+
+def canonical_pair(value: Any) -> str:
+    """Fold a pair/ticker string to a separator-free comparison key.
+
+    ``"ETH/USD"``, ``"ETH_USD"``, ``"eth/usd"`` and ``"ETHUSD"`` all fold
+    to ``"ETHUSD"``, so a signal file's records and a matrix cell's ticker
+    can be compared without either side depending on a spelling.
+
+    Deliberately re-implemented here rather than imported: this harness
+    never imports the RL package, so that it keeps driving the documented
+    CLI contract when the internals move. The folding rule is duplicated
+    on purpose; :func:`_signal_file_tickers` is written to be
+    CONSERVATIVE (see there) so a drift between the two copies downgrades
+    a BLOCKER to a NOTE rather than inventing one.
+    """
+    text = "" if value is None else str(value).strip().upper()
+    if not text:
+        return ""
+    parts = [part for part in re.split(r"[^A-Z0-9]+", text) if part]
+    if not parts:
+        return ""
+    parts[0] = _SIGNAL_TICKER_ALIASES.get(parts[0], parts[0])
+    return "".join(parts)
+
+
+def _signal_file_tickers(path: Path) -> tuple[frozenset[str], bool]:
+    """The canonical tickers a signal file carries, and whether it is tagged.
+
+    Returns ``(tickers, tagged)``. ``tagged`` is False when the file has no
+    usable ``ticker`` field at all, or the field is empty on every record —
+    the two cases the RL seam treats as an explicitly one-ticker file and
+    MERGES anyway, with a WARNING. Those must never produce a BLOCKER here,
+    or this preflight would fail a spec the run itself accepts.
+
+    Only raises on an unreadable/unparseable file, which the caller
+    downgrades: the point of a plan-time preflight is to catch the
+    guaranteed failures cheaply, not to be the authority that decides.
+    """
+    tickers: set[str] = set()
+    tagged = False
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            raw = record.get(_SIGNAL_TICKER_FIELD)
+            key = canonical_pair(raw)
+            if key:
+                tagged = True
+                tickers.add(key)
+    return frozenset(tickers), tagged
+
+
 def build_warnings(spec: MatrixSpec, cells: Sequence[Cell]) -> list[dict[str, str]]:
     """Validity warnings for the design. WARN, never fail."""
     out: list[dict[str, str]] = []
@@ -1528,6 +1617,79 @@ def build_warnings(spec: MatrixSpec, cells: Sequence[Cell]) -> list[dict[str, st
             "'does this generalize across assets?' cannot be answered -- a "
             "result here is one asset's story. Add a second ticker.",
         )
+
+    # 4b. Signal/ticker compatibility -- a cell that CANNOT succeed, named
+    # before the run rather than after it. Measured: a SOL_USD cell against
+    # the ETH-only news file raised SignalTickerMismatchError on the train
+    # leg and reported a bare `process_failed`, and plan had said nothing,
+    # because plan never looked. Silence on a spec that is guaranteed to
+    # fail is the defect; the classifier only improves the message once the
+    # cell has already burned its train+backtest budget.
+    #
+    # A configured (non-null) signal key whose file carries no record for a
+    # cell's ticker is a BLOCKER, because signal_require_ticker defaults
+    # true and the seam raises by name. Every escape hatch the seam itself
+    # honours is honoured here too, so this cannot BLOCK a cell the run
+    # would accept: a null/empty key is OFF; an untagged or empty-tagged
+    # file is a one-ticker file the seam merges with a WARNING; and
+    # signal_require_ticker: false turns the whole thing into a log line.
+    # An unreadable file downgrades to a NOTE — that is a different defect
+    # (signal_file_not_found) and not this check's to assert.
+    base_cfg: dict[str, Any] = {}
+    if spec.base_config is not None and spec.base_config.is_file():
+        try:
+            loaded = yaml.safe_load(spec.base_config.read_text(encoding="utf-8"))
+            if isinstance(loaded, Mapping):
+                base_cfg = dict(loaded)
+        except (OSError, yaml.YAMLError):
+            base_cfg = {}
+    # A cell-level axis may point the key somewhere else entirely; the
+    # effective value is the cell override when present, else the base.
+    require_ticker = base_cfg.get("signal_require_ticker", True)
+    coverage: dict[str, tuple[Path, frozenset[str], bool]] = {}
+    for key in _SIGNAL_CONFIG_KEYS:
+        raw = None
+        for cell in cells:
+            if key in cell.config_overrides:
+                raw = cell.config_overrides[key]
+                break
+        if raw is None:
+            raw = base_cfg.get(key)
+        if not raw:  # null / empty -> the channel is OFF
+            continue
+        path = Path(str(raw)).expanduser()
+        if not path.is_file():
+            continue
+        try:
+            tickers_in_file, tagged = _signal_file_tickers(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+        coverage[key] = (path, tickers_in_file, tagged)
+    if coverage and require_ticker is not False:
+        mismatched: dict[str, set[str]] = {}
+        for cell in cells:
+            wanted = canonical_pair(cell.ticker)
+            if not wanted:
+                continue
+            for key, (path, tickers_in_file, tagged) in coverage.items():
+                # An untagged/empty-tagged file is merged unfiltered by the
+                # seam, so it constrains nothing. Same for a match.
+                if not tagged or wanted in tickers_in_file:
+                    continue
+                mismatched.setdefault(cell.ticker, set()).add(key)
+        for ticker, keys in sorted(mismatched.items()):
+            warn(
+                "signal_ticker_mismatch",
+                "BLOCKER",
+                f"Cell ticker {ticker} has no record in the configured "
+                f"signal file(s) {sorted(keys)}, which carry "
+                f"{sorted(set().union(*[coverage[k][1] for k in keys])) or ['none']}. "
+                "With signal_require_ticker true the seam raises "
+                "SignalTickerMismatchError on the train leg, so every such "
+                "cell fails before it can produce a number. Point those keys "
+                "at this ticker's file, or set signal_require_ticker: false "
+                "to merge unfiltered.",
+            )
 
     # 5. Only PPO exists.
     if not spec.has_axis("algo", "algorithm"):

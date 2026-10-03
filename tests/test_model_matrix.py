@@ -659,6 +659,180 @@ def test_frictionless_matrix_is_a_blocker(tmp_path):
     assert _codes(path)["frictionless"] == "BLOCKER"
 
 
+# ── the signal/ticker PREFLIGHT (plan-time, before any cell runs) ──────────
+#
+# The classifier tests further down cover AFTER a cell has failed. These
+# cover the earlier claim: that a spec guaranteed to fail is REFUSED BEFORE
+# it spends a training budget. Red run first (DECISION.md §8): with this
+# block disabled, `plan --strict` on configs/matrix.example.yaml exited 0
+# while every SOL_USD cell in it raised SignalTickerMismatchError — plan-time
+# silence on a spec that cannot run.
+
+
+def _preflight_spec(tmp_path, tickers, base_config, require_ticker=None):
+    """A spec wired to `base_config`, returning its warning codes."""
+    body = {
+        "name": "x",
+        "run": {
+            "base_config": str(base_config),
+            "results": str(tmp_path / "c.jsonl"),
+        },
+        "axes": {
+            "ticker": tickers,
+            "seed": [1, 2, 3],
+            "friction": [{"fee_rate": 0.0026, "slippage": 0.0005}],
+            ".data_window": [{
+                "since": "2026-09-10T15:00:00Z",
+                "until": "2026-10-01T15:00:00Z",
+                "eval_split": 0.7,
+            }],
+        },
+    }
+    if require_ticker is not None:
+        base_config.write_text(yaml.safe_dump({"signal_require_ticker": require_ticker}))
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump(body))
+    return path
+
+
+def _write_signal(path, tickers):
+    path.write_text(
+        "".join(json.dumps({"ticker": t, "timestamp": "2026-10-02T00:00:00Z"}) + "\n"
+                for t in tickers)
+    )
+    return path
+
+
+def test_a_ticker_absent_from_its_signal_file_is_blocked_at_plan_time(tmp_path):
+    """THE DEFECT, caught before the run.
+
+    A SOL cell against an ETH-only signal file raises on the train leg, so
+    every such cell fails without producing a number. Measured red run: it
+    reported a bare `process_failed` and `plan` had said nothing. This is the
+    assertion that would have failed first.
+    """
+    sig = _write_signal(tmp_path / "eth.jsonl", ["ETH_USD"])
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert _codes(path)["signal_ticker_mismatch"] == "BLOCKER"
+
+
+def test_a_ticker_present_in_its_signal_file_is_not_blocked(tmp_path):
+    """The negative case, so the check is not simply always-on."""
+    sig = _write_signal(tmp_path / "multi.jsonl", ["ETH_USD", "SOL_USD"])
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_require_ticker_false_suppresses_the_preflight(tmp_path):
+    """`signal_require_ticker: false` makes the seam merge unfiltered.
+
+    So a mismatched file is a log line on the run, not a failure — and
+    BLOCKERing it here would refuse a spec the run itself accepts.
+    """
+    sig = _write_signal(tmp_path / "eth.jsonl", ["ETH_USD"])
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": False,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_an_untagged_signal_file_does_not_block(tmp_path):
+    """A file with no `ticker` field is a ONE-TICKER file the seam merges.
+
+    `_filter_ticker` returns it unchanged with a WARNING, so the preflight
+    must treat it as constraining nothing. This is the false-BLOCKER trap:
+    requiring a match here would refuse specs the run happily executes.
+    """
+    sig = tmp_path / "untagged.jsonl"
+    sig.write_text(json.dumps({"sentiment_score": 0.1}) + "\n")
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_a_signal_file_with_an_empty_ticker_field_does_not_block(tmp_path):
+    """Empty `ticker` on every record is the same escape hatch as untagged."""
+    sig = tmp_path / "emptytag.jsonl"
+    sig.write_text(json.dumps({"ticker": "", "x": 1}) + "\n")
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_a_null_signal_key_is_off_and_never_blocks(tmp_path):
+    """A null key means the channel is OFF and says nothing at all."""
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": None,
+        "funding_features_file": None,
+        "social_features_file": None,
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_a_missing_signal_file_is_not_this_checks_assertion(tmp_path):
+    """An absent path is `signal_file_not_found`, a DIFFERENT defect.
+
+    The preflight must stay silent rather than guessing: naming it a
+    mismatch would send the reader to fix the wrong thing (re-point the key
+    rather than run the producer).
+    """
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(tmp_path / "nope.jsonl"),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["ETH_USD", "SOL_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
+def test_the_ticker_fold_matches_the_seams_own_aliasing(tmp_path):
+    """`XBT/USD` and `BTC/USD` are the same asset; Kraken spells it XBT.
+
+    Without the alias a BTC_USD cell would be BLOCKED against a file whose
+    records are tagged `XBT/USD` — a false BLOCKER on a spec that runs.
+    """
+    sig = _write_signal(tmp_path / "xbt.jsonl", ["XBT_USD"])
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "extra_features_file": str(sig),
+        "signal_require_ticker": True,
+    }))
+    path = _preflight_spec(tmp_path, ["BTC_USD"], cfg)
+
+    assert "signal_ticker_mismatch" not in _codes(path)
+
+
 def test_single_seed_and_single_ticker_warn(tmp_path):
     path = tmp_path / "m.yaml"
     path.write_text(
@@ -1114,6 +1288,111 @@ def test_the_capture_fires_the_reason_code_the_real_cell_would_not_have(
     # borrow the OTHER "your path is wrong" reason, which sends the reader
     # to write a YAML file instead of running a producer.
     assert "config_not_found" not in reasons
+
+
+# The SignalTickerMismatchError refusal, captured from a REAL failing run
+# (2026-10-03, SOL_USD cell 524a56a0298b against the ETH-only news file),
+# not written by hand — per the `3f9708e` precedent recorded above, a
+# hand-built tail is correct by construction and would have pinned a reason
+# code no live run can produce. Dates, pid and the cell id are stripped;
+# every word the classifier matches on is kept verbatim.
+_MISMATCH_REFUSAL_TEXT = (
+    "Signal file /home/seanc/Projects/kraken-trading-bot/signals/"
+    "eth_usd_news.jsonl holds no records for SOL/USD (contains: ETHUSD); "
+    "point the signal file config key at a SOL/USD file or set "
+    "signal_require_ticker: false to merge it unfiltered."
+)
+TRAIN_TICKER_MISMATCH_STDERR = [
+    "[INFO] kraken_api.api: catalog.loaded",
+    "[INFO] kraken_api.api: GET /0/public/OHLC",
+    "[ERROR] kraken_trading_bot.cli: Training SOL_USD/<CELL> failed: "
+    + _MISMATCH_REFUSAL_TEXT,
+    "Error training SOL_USD/<CELL>: " + _MISMATCH_REFUSAL_TEXT,
+]
+BACKTEST_AFTER_MISMATCH_STDERR = [
+    "[ERROR] kraken_trading_bot.cli: Backtesting SOL_USD/<CELL> failed: "
+    "No trained model at <MODELS>/SOL_USD/<CELL>/model.zip; train it "
+    "first (RLAgent.train or rl.train_ticker).",
+    "Error backtesting SOL_USD/<CELL>: No trained model at "
+    "<MODELS>/SOL_USD/<CELL>/model.zip; train it first (RLAgent.train or "
+    "rl.train_ticker).",
+]
+
+
+def test_classify_names_a_signal_ticker_mismatch_instead_of_only_process_failed():
+    """A mis-pointed signal file must be DIAGNOSED, not reported as opaque.
+
+    Red run first, per DECISION.md §8 / RG6: before the
+    `signal_ticker_mismatch` clause existed this exact record classified as
+    `['process_failed']` alone, while the real cause sat unparsed in the
+    same `stderr_tail`. `process_failed` is what ANY failure returns, so it
+    carries no information — this test is the guard against regressing to
+    it, and it is why the clause matches the message text rather than the
+    class name (cli.py prints `str(e)` only, so the class never appears).
+    """
+    record = {
+        "status": "error",
+        "returncodes": {"train": 1, "backtest": 1},
+        "stderr_tail": TRAIN_TICKER_MISMATCH_STDERR
+        + BACKTEST_AFTER_MISMATCH_STDERR,
+    }
+    reasons = classify_process_failure(record)
+
+    assert "signal_ticker_mismatch" in reasons
+    assert "process_failed" in reasons  # the generic code still comes along
+
+
+def test_a_ticker_mismatch_borrows_neither_neighbouring_path_code():
+    """The two 'your path is wrong' codes send the reader to OPPOSITE fixes.
+
+    A MISSING file means "run the producer" (`just news-pull`); a file that
+    exists but is tagged for another pair means the pointing is wrong — you
+    need that ticker's file, or `signal_require_ticker: false`. Folding
+    this into `signal_file_not_found` would send a reader to run a producer
+    that already ran, and produce nothing.
+    """
+    record = {
+        "status": "error",
+        "returncodes": {"train": 1, "backtest": 1},
+        "stderr_tail": TRAIN_TICKER_MISMATCH_STDERR,
+    }
+    reasons = classify_process_failure(record)
+
+    assert "signal_file_not_found" not in reasons
+    assert "config_not_found" not in reasons
+
+
+def test_the_mismatch_clause_ignores_a_healthy_cell():
+    """The clause is additive and keyed on a real refusal, not a substring.
+
+    Guards against the opposite failure: a clause loose enough to fire on
+    ordinary output would mark healthy cells invalid and quietly empty the
+    matrix.
+    """
+    assert classify_process_failure(_record()) == []
+
+
+def test_cmd_run_reaches_the_mismatch_code_through_the_real_capture(tmp_path):
+    """End-to-end: the reason code a live run can actually produce.
+
+    The same shape as the `signal_file_not_found` capture test — a fake CLI
+    whose two legs fail the way the measured SOL_USD run did — because the
+    classifier test above proves the classifier and this proves the path
+    that feeds it, which is where `3f9708e`'s code shipped broken.
+    """
+    cli = _fake_cli(
+        tmp_path,
+        _failing_fake_cli(
+            TRAIN_TICKER_MISMATCH_STDERR, BACKTEST_AFTER_MISMATCH_STDERR
+        ),
+    )
+    rc, record = _one_record(tmp_path, cli)
+
+    assert rc == 1
+    assert record["status"] == "error"
+    joined = " ".join(record["stderr_tail"])
+    assert "holds no records for SOL/USD" in joined, record["stderr_tail"]
+    assert "signal_ticker_mismatch" in record["invalid_reasons"]
 
 
 def test_cmd_run_omits_stderr_tail_when_neither_leg_wrote_to_stderr(tmp_path):
