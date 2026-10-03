@@ -235,15 +235,9 @@ def cmd_verify(a: argparse.Namespace) -> int:
     if a.skip_suite:
         print("  suite              SKIP  (--skip-suite)")
     else:
-        p = subprocess.run(
-            ["pytest", "tests/", "-q"], cwd=REPO, capture_output=True, text=True, check=False
-        )
-        tail = (p.stdout or "") + (p.stderr or "")
-        m = re.search(r"(\d+) passed", tail) or re.search(r"(\d+) failed", tail)
-        summary = m.group(0) if m else "NO SUMMARY"
-        passed = bool(re.search(r"\d+ passed", tail)) and p.returncode == 0
-        ok = ok and passed
-        print(f"  suite              {'PASS' if passed else 'FAIL'}  {summary}")
+        suite_ok, suite_line = run_suite_gate()
+        ok = ok and suite_ok
+        print(suite_line)
 
     # 4. width hash
     if a.frame:
@@ -788,6 +782,68 @@ def cmd_findings(a: argparse.Namespace) -> int:
 
 
 # ── closeout ────────────────────────────────────────────────────────────────
+def run_suite_gate() -> tuple[bool, str]:
+    """Run the suite in THIS interpreter and return (ok, report-line).
+
+    Uses ``sys.executable -m pytest`` rather than a bare ``pytest``, for two
+    reasons both learned the hard way:
+
+    * bare ``pytest`` raises :class:`FileNotFoundError` when it is not on
+      PATH, which crashed this gate outright instead of reporting anything;
+    * even where a ``pytest`` *is* on PATH, running it outside the dev shell
+      loses the ``PYTHONPATH`` carrying the ``kraken-python`` sibling, so
+      every import becomes ``ModuleNotFoundError``, the suite prints
+      ``NO SUMMARY``, and a 602-passing run is reported as a failure.
+
+    Driving the checker's own interpreter removes both, and is the environment
+    every other import in this module already resolved under.
+
+    A *collection* error is the caller's environment rather than a repo
+    verdict — no test result exists to report — so it is labelled
+    ``WRONG ENVIRONMENT`` and returns ``ok=False`` without the word FAIL. A
+    gate that cries wolf on a green suite is a gate we learn to ignore; this
+    still refuses to claim green, it just does not blame the repo.
+    """
+    p = subprocess.run(
+        [sys.executable, "-m", "pytest", "tests/", "-q"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    tail = (p.stdout or "") + (p.stderr or "")
+    passed = bool(re.search(r"\d+ passed", tail)) and p.returncode == 0
+    # Prefer the FAILURE half of pytest's summary when the run failed: it prints
+    # "1 failed, 602 passed", and leading with the pass count renders the line
+    # "FAIL 602 passed", which reads like a contradiction and trains the eye to
+    # skim past the verdict.
+    if passed:
+        m = re.search(r"(\d+) passed", tail)
+    else:
+        m = re.search(r"(\d+) failed", tail) or re.search(r"(\d+) error", tail)
+        if m is None:
+            m = re.search(r"(\d+) passed", tail)
+    summary = m.group(0) if m else "NO SUMMARY"
+    env_broken = not passed and bool(
+        re.search(
+            r"No module named pytest"
+            r"|ModuleNotFoundError"
+            r"|ImportError while importing"
+            r"|errors? during collection",
+            tail,
+        )
+    )
+    if env_broken:
+        return (
+            False,
+            f"  suite              WRONG ENVIRONMENT  {summary} — pytest or a"
+            f" sibling dep is not importable in {sys.executable}, so this is NOT a"
+            f" repo verdict. Re-run inside the dev shell: nix develop --command"
+            f" python3 tools/audit_checks.py verify ...",
+        )
+    return passed, f"  suite              {'PASS' if passed else 'FAIL'}  {summary}"
+
+
 def cmd_closeout(a: argparse.Namespace) -> int:
     head = git("rev-parse", "HEAD")
     branch = git("rev-parse", "--abbrev-ref", "HEAD")

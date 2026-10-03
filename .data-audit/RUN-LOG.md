@@ -163,7 +163,11 @@ funding channel. Compared STDs only, never MEANs (the 2026-09-30 lesson).
   the overlap hour. `data.py:758-763` runs `duplicated(keep="last")` **before** the hour-`floor()`
   and the `groupby(level=0).last()`, so the loser's row is discarded by **file order** and `last()`
   never sees it — whoever is **last in the file** wins wholesale. Measured without the fix: 13
-  real `spread` readings → `NaN`, +13 non-finite cells. Fixed by `--append` skipping held hours.
+  real `spread` readings → `NaN`, +13 non-finite cells. Fixed on the CONSUMER, by
+    `sort_index(kind="stable")` before `groupby(level=0).last()` — *not* by `--append`
+    skipping held hours, which this line previously claimed and which is false against
+    the code (`export.py:188` is `mode = "a" if append else "w"`; appending is
+    unconditional and a duplicate hour is deduped on read). See F-7.
 - **The builder's "non-finite identical in both arms" was WRONG** — same slice gives 684 baseline
   vs 697 backfilled. **The integrator's "spread byte-identical both arms" was WRONG** — the
   backfilled arm is 0/721 (the file has no bid/ask anywhere). Both were caught by re-derivation.
@@ -931,3 +935,173 @@ answering a different question than the one being asked:
 | bare `pytest` outside the dev shell | 19 collection errors | artifact: `PYTHONPATH` absent |
 
 Each was caught only by checking a *different* way and demanding the two agree.
+
+## 20. Follow-ups from the §19 closeout, at the lead's direction
+
+### 20.1 The three `opencode/*` commits: tagged before cleanup, and still resolvable
+
+Nothing was purged. `team_cleanup` was run **without** the `purge` option, so no archived
+team record and no preserved branch was deleted. State at `e7d53ba`:
+
+| sha | archive tag (annotated, 2026-10-03) | resolves to | branch |
+|---|---|---|---|
+| `e57056d` | `archive/e57056d-normalization-wiring` | `e57056dd…` ✅ | `…-geu0v0-builder` deleted |
+| `ab44f11` | `archive/ab44f11-extra-features-seam` | `ab44f112…` ✅ | `…-t2huls-integrator` deleted |
+| `4c65432` | `archive/4c65432-export-data-wip` | `4c65432c…` ✅ | (shared the `geu0v0-builder` branch) |
+
+All three tags were created **before** the branches were deleted and before cleanup, and all
+three still peel to the intended commits. Each carries its supersession reason in the tag
+message. **Every sha is recoverable by name**, so nothing depends on reflog survival.
+
+§14 results, all three **SUPERSEDED**:
+
+- **`e57056d`** — 7 files (my brief said 5; the auditor caught that). Of 84 distinct
+  substantive added lines, **83 are present in master verbatim**; the single exception is the
+  fit site, where master is *ahead* (`self.compute(df).ffill().fillna(0.0)` **plus**
+  `_require_finite`, which the branch lacks). Re-verified at the lead by content diff after
+  two wrong tools (line-order diff, set-difference) both reported mass divergence.
+- **`ab44f11`** — 4 mutations, **all RED**: stub → 41 failed, read-path wiring removed → 18,
+  `train.py` kwargs dropped → 4, config → `null` → 6. The anticipated *unprotected seam* does
+  not exist; the finding was the opposite of the hypothesis.
+- **`4c65432`** — the `52271cb` shape: 9/9 files, 5/5 symbols, master's tests exceed the
+  shipped counts on all three files (10→11, 19→21, 14→18).
+
+Still standing, deliberately: `…-g1-recorder-branch-audit-x622s1-recorder` → `e64a2ef`. All
+seven of its files are **byte-identical** in master (patch-id reports 3 uncontained only
+because a squash patch is a *union* — the sixth wrong tool of the day). One `opencode/*`
+branch retained is not a leak; it is the only ref pinning those three commit objects, whose
+content is already merged.
+
+### 20.2 The store-shaped behavioural test landed
+
+`b99bc56`, an ancestor of HEAD. `test_every_observation_route_agrees_where_ffill_and_fillna_differ`
+plus the `_store_shaped_frame` fixture, green. Its measured mutation matrix: dropping
+`.ffill()` goes RED at `features.py:642` (fit), `:740` (transform),
+`environment.py:488` (env) and `export.py:192` (export), and is caught by the tripwire alone
+at `environment.py:525` (builtin, leading-only NaN makes the two fills numerically identical
+there — a documented limit, not an oversight).
+
+### 20.3 F-7: the recorder does NOT assume skip semantics — checked, and it is correct
+
+`kraken_trading_bot/depth_recorder.py` states the contract explicitly and I read the code to
+confirm it:
+
+> **"log, not state"** — The file is only ever appended to; nothing is rewritten, and no
+> prior record is ever corrected in place. A re-fire inside the same hour
+> (`Persistent=true` catch-up after a lid-close) therefore appends a second, harmless line
+> rather than clobbering a good reading.
+
+The read path **tolerates duplicates rather than resolving them**: `stamps` "may be unsorted
+and may contain duplicates: both are real", a duplicate surfaces as a **`SHORT`** interval
+counted separately from `GAPS`, and it is never collapsed into one. That is tested
+(`test_depth_recorder.py:418`, `STATUS_SHORT`).
+
+**FORWARD-LOOKING, since nothing consumes the data yet (§8.1 item 5):** when a consumer is
+written, it must dedupe **on read** — last-wins per floored hour — exactly as
+`merge_extra_features` does for the funding/news/social channels. The producer is append-only
+and must never be given skip semantics; doing so would silently *lose* a reading, which for
+an unrecoverable feed is the one failure that matters.
+
+**Two documents still repeated the false F-7 claim; both corrected in this commit:**
+
+- `.data-audit/VALIDATION.md:600` — the disposition cell of the **pinned** §8 table said
+  "`--append` skips held hours". This is worse than a stale duplicate: it is the table the
+  findings pin polices, so it **contradicted `DECISION.md`'s corrected row** while passing
+  the non-vacuous check. Now states the producer appends unconditionally with no hour-skip,
+  and that the dedup direction was fixed on the consumer (`data.py:798-809`, from `5951f72`).
+- `.data-audit/RUN-LOG.md:166` — "Fixed by `--append` skipping held hours" → now attributes
+  the fix to the consumer's stable sort and records that the old claim was false.
+
+`DECISION.md` and `FIXPASS.md` mention the old wording only to **refute** it, which is correct
+and left alone.
+
+### 20.4 `audit-verify`'s suite gate: no longer cries wolf
+
+The gate shelled out to bare `pytest`. Outside the dev shell that is a `FileNotFoundError`
+crash, or — where a `pytest` *is* on PATH — 19 collection errors (`No module named
+'kraken_api'`) reported as `FAIL NO SUMMARY` on a suite that passes 602. I twice took that
+false FAIL at face value before checking the shell.
+
+Fixed by moving the logic into `run_suite_gate()`, which runs
+`[sys.executable, "-m", "pytest", …]` — the checker's own interpreter — and distinguishes an
+environment problem from a repo verdict:
+
+| case | before | after |
+|---|---|---|
+| inside the dev shell | `PASS 602 passed` | `PASS 602 passed` |
+| outside it | `FAIL NO SUMMARY` (or crash) | `WRONG ENVIRONMENT NO SUMMARY — pytest or a sibling dep is not importable in <exe>, so this is NOT a repo verdict. Re-run inside the dev shell…` |
+| a genuine test failure | `FAIL 602 passed` ← reads like a contradiction | `FAIL 1 failed` |
+
+All three verified by running them, the third with a deliberately failing test that was then
+removed. It still returns `ok=False` in the broken case — it refuses to claim green, it just
+stops blaming the repo for the caller's shell.
+
+### 20.5 Recorder evidence — a firing timer is not the full check
+
+Five snapshots, **five distinct timestamps**, two distinct hours, all `count=100` with 200
+levels returned:
+
+```
+#1 2026-10-03T19:10:45.752567+00:00  bid=2683.52000 ask=2683.53000 levels=200
+#2 2026-10-03T19:12:55.755671+00:00  bid=2683.51000 ask=2683.52000 levels=200
+#3 2026-10-03T19:37:04.693310+00:00  bid=2681.57000 ask=2681.58000 levels=200
+#4 2026-10-03T19:42:32.145878+00:00  bid=2683.28000 ask=2683.29000 levels=200
+#5 2026-10-03T20:41:34.444635+00:00  bid=2686.79000 ask=2686.80000 levels=200   <- 2nd unattended fire
+```
+
+Status line, verbatim: `records: 5  intervals: 4  coverage: 100.0%  SHORT: 3  GAPS: 0
+longest hole: 0s  VERDICT: GREEN`, and from the sidecar **last-snapshot age 45.2 min,
+`n_gaps: 0`, `holes: []`, `ok: True`**. Interval #4→#5 was **3542s against 3600 expected
+(0.98×)** — the hourly cadence holding, not a re-fire.
+
+**The unit is DECLARED, not merely hand-installed.** `nix/module.nix` carries
+`systemd.services."kraken-trading-bot-order-book"` (line 323) and
+`systemd.timers."kraken-trading-bot-order-book"` (line 363), off by default behind
+`ob.enable`, in the **`systemd.services`/`systemd.timers`** namespace — the NixOS one. The
+namespace trap is called out in the file at line 312. Its `ExecStart` contains **0**
+occurrences of `worktree` and targets `/home/seanc/Projects/kraken-trading-bot`.
+
+⚠️ **Two timers can exist, and that is a real double-fire risk worth recording.** The NixOS
+module declares a **system** timer; `just depth-timer` installs a **user** timer. They are
+independent units and neither suppresses the other, so enabling `ob.enable` on a host that
+also runs `just depth-timer` would snapshot **twice an hour**. Today only the user timer
+exists here (`ob.enable` is off). Nothing consumes the data yet, so a duplicate is currently
+benign — a duplicate *hour*, which the recorder tolerates by design — but it must be resolved
+before any consumer lands, or every depth series silently doubles its own cadence.
+
+### 20.6 Minimum depth N, re-derived from the gate (not inherited)
+
+PLAN.md §8.1.2's own instruction is to re-derive `bars_needed` rather than inherit it, since
+its figures are measured values with a date on them. Re-derived:
+
+```
+live REST ceiling                 721 bars @ 60m           data.py:399 ("~721 recent bars")
+warm-up / first_tradable_index     24 bars                 measured this pass: start_index=24
+                                  ───
+tradable                          697 bars                 VALIDATION §1 (usable=697)
+seed-noise eval width             178 bars                 within-config seed spread EXCEEDED
+                                                             the between-config effect at this
+                                                             width, 3 seeds (EVIDENCE §…, PLAN §8.1.2)
+eval must exceed it                712 bars   (178 x 4 margin)
+train                             1424 bars  (2 x eval)
+                                  ───
+bars_needed                       2136 bars
+days = bars_needed / 24           2136 / 24 = 89 days      earliest a first evaluation is POSSIBLE
+recommended N                     365 days = 8760 snapshots  what makes it MEAN something
+```
+
+89 days, not the 90 PLAN.md quotes — the difference is arithmetic, not a disagreement
+(§8.1.2 rounded 2,160 = 1,440 + 720). **N = 365 days = 8,760 snapshots**, chosen because it
+matches the funding channel's existing ~366-day window, so book and funding can be evaluated
+over the same span; at 90 days the book series would be the *shorter* one and the comparison
+silently confounded by coverage. Nothing consumes the data until N is met, so a longer N is
+free — the only cost of under-waiting is a gate that cannot separate signal from noise, which
+this repo has already paid for once.
+
+### 20.7 Closeout stays NOT READY
+
+Unchanged and correct at `e7d53ba`: `HEAD == upstream NO` (21 commits local, the push is the
+user's), the working tree dirty with the notebook exclusion, and `measurement-track CHANGED`
+as the documented expected red. `.gitignore` and `notebooks/` are the user's to land or
+leave — untouched. The checks are re-run **in the pushed state from the dev shell** after the
+push; READY is not written before that.

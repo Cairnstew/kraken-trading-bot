@@ -597,7 +597,7 @@ and **passed vacuously** — the same green-for-the-wrong-reason class §1's
 | **F-4** | AUDIT's "12 of 721" was wrong; **13** measured | **Correction recorded** |
 | **F-5** | `null` vs `0.0` for unrecoverable fields | **Override, measured equivalent** — record honesty only |
 | **F-6** | Tighten `signal_max_age_hours` 12 → ~1 | **Override: fix the comment, not the value** — §10 confirms at max **12.0** |
-| **F-7** | §6.1's hour-dedup direction was **inverted** (file order, not "live wins") | **Corrected and acted on** — `--append` skips held hours |
+| **F-7** | §6.1's hour-dedup direction was **inverted** (file order, not "live wins") | **Corrected and acted on — ON THE CONSUMER.** The producer deliberately does the opposite of what the old row recorded: `ticker-news-signals:ticker_news_signals/export.py:188` is `mode = "a" if append else "w"`, i.e. it appends UNCONDITIONALLY with **no hour-skip**, and its own docstring plus `54c9d24` say a duplicate hour is harmless because the consumer dedupes. The dedup *direction* was fixed on the consumer — `data.py:798-809` exact-dup `keep="last"` → `sort_index(kind="stable")` → `floor("h")` → `groupby(level=0).last()`, from `5951f72`. **The old row's "`--append` skips held hours" was false against the code.** [CORRECTED 2026-10-03] |
 | **F-8** | §7.3's width constants (57/49) are **3 low** | **Superseded** — measure 52/60; assert no literals |
 | **F-9** | Non-finite cells: 684 vs 0 | **RESOLVED — frame mismatch.** `697 − 13 = 684`; `observed` is the frame that matters. Builder's "identical both arms" **wrong** (684 vs 697) |
 | **F-10** | `signal_age_hours` ≤ 2.0 unachievable | **Restated per shape** — 12.0 on the shipped shape; confirms F-6 |
