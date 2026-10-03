@@ -1,0 +1,174 @@
+# Single-ticker cost-aware matrix: is the ETH/USD signal worth trading once
+# costs are real?
+#
+#   just matrix-plan   configs/matrix.eth-single.yaml
+#   just matrix-run    configs/matrix.eth-single.yaml
+#   just matrix-report configs/matrix.eth-single.yaml
+#
+# ── WHY THIS FILE EXISTS ALONGSIDE matrix.example.yaml ────────────────────
+#
+# The worked example carries `ticker: [ETH_USD, SOL_USD]`. That grid cannot
+# run on this checkout: all three signal channels in `configs/default.yaml`
+# point at ETH-only files with `signal_require_ticker: true`, so every
+# SOL_USD cell raises `SignalTickerMismatchError` on the train leg before it
+# can produce a number. Measured, not hypothesised — see the RED-RUN note in
+# `configs/matrix.example.yaml` and the `signal_ticker_mismatch` classifier
+# in `tools/model_matrix.py`.
+#
+# *** THIS IS A DATA LIMITATION, NOT A CLEAN DESIGN CHOICE. ***
+# `matrix-plan` now catches the mismatch up front and BLOCKERs such a spec,
+# which is the right behaviour and also means this file is the shippable
+# half. Giving SOL its own signal files is real data work (three
+# `just *-pull` recipes against SOL-scoped paths) and deliberately does NOT
+# belong in a pass whose subject is cost sensitivity. Until that is done:
+#
+#   * there is NO cross-sectional view here, so nothing in this matrix can
+#     answer "does this generalize across assets?". `plan` says so
+#     (`single_ticker` WARN) and so does this file.
+#   * a one-asset result is one asset's story over one 30-day window.
+#
+# §9A.1 (DECISION.md): a live-vs-store pair inside ONE matrix is structurally
+# uncomparable — the arms replay different bar counts, so the difference is an
+# artefact of the harness rather than a property of the data. This file is the
+# LIVE arm only. The deep-history arm belongs in a SEPARATE matrix against a
+# seeded `market_data_store`; do not add a store axis here to "get more bars".
+#
+# ── The window, and why it is not 2020→2026 ───────────────────────────────
+#
+# `data_window` bounds are a CLIP on the live read, and Kraken's REST ceiling
+# is ~720 candles per pair/interval and does NOT scale with `--pages`
+# (measured: `pages=1` and `pages=3` both return 721 bars). So the live frame
+# is ~30 days: 2026-09-03T15:00Z .. 2026-10-03T15:00Z.
+#
+# A 2020→2026 pin therefore yields ZERO train bars and ZERO eval bars on this
+# arm — `NotEnoughDataError`, not a measurement. The window below is INSIDE
+# the live frame on both ends, so the clip cannot starve it:
+#
+#   span        2026-09-10T15:00Z .. 2026-10-01T15:00Z  = 504 bars
+#   train       leading 70% = 353 bars
+#   eval slice  trailing 30% = 151 bars   <- the denominator the width
+#                                            guard measures against
+#   replayed    ~127 bars after the 24-bar feature warm-up (windows [1,4,24])
+#   min_bar_ratio 0.5 of 151 = 75.5        -> 127 clears it with margin
+#
+# The split is ROUNDED (`round(n*split)` clamped to [1, n-1]), the same rule
+# the RL side uses, so the two cannot disagree by a bar.
+#
+# ── In-sample? NO — and that is the point of the pin ─────────────────────
+#
+# BOTH bounds are set, so `eval_split: 0.7` is NOT inert: training takes the
+# leading 353 bars, the backtest replays only the 151 after the split. The two
+# are disjoint, so this is a genuine out-of-sample segment. `report` will say
+# `OUT-OF-SAMPLE` and exclude in-sample cells from every aggregate.
+#
+# Compare the shipped `configs/default.yaml`, where `since`/`until` are both
+# null: there `eval_split` IS inert, the model is fitted on 100% of the frame
+# and replayed on 100% of it, and the resulting return describes the fit
+# rather than a prediction. Nothing from that path is quoted here.
+#
+# ── SAMPLE SIZE — read before any number below ────────────────────────────
+#
+# One ticker, one 30-day window, 151 eval bars, ~127 replayed after warm-up.
+# Three seeds estimate TRAINING variance only. They do not estimate REGIME
+# variance: three seeds on one 30-day stretch of one crypto market is not
+# evidence the model works in another regime. A wider window needs the store
+# arm, run as its own matrix.
+#
+# `seed: 3` is a FLOOR, NOT A VERDICT. The acceptance instrument is the
+# pre-registered dispersion rule in `tools/model_matrix.py`
+# (`DISPERSION_RATIO_THRESHOLD`, pre-registered in 97a2a52), which compares the
+# between-arm gap against the seed noise pooled WITHIN an arm and reports
+# RESOLVED / NOT SEPARATED / UNDEFINED. NOT SEPARATED is a first-class
+# non-failing finding — it means the gap is smaller than the noise, which is a
+# measurement — so a NOT SEPARATED verdict here is a result to report, not a
+# run to retry. RESEARCH-3 is the reason seed count alone is never quoted as
+# separation.
+name: eth-single-cost-aware
+description: "ETH/USD only: does the signal survive Kraken taker costs, and is the friction gap separated from seed noise?"
+
+run:
+  base_config: configs/default.yaml
+
+  # Scratch space — NEVER commit anything under models/.
+  results: /tmp/ktb-matrix/eth-single/cells.jsonl
+  models_root: /tmp/ktb-matrix/eth-single/models
+
+  min_bar_ratio: 0.5
+  min_trades: 1
+  timeout: 3600
+
+  # Runtime ESTIMATES for `plan`'s projection only — not measurements.
+  train_seconds: 300
+  backtest_seconds: 30
+
+axes:
+  # ── Which market? ───────────────────────────────────────────────────
+  # ONE ticker, and that is a limitation, not a simplification: it makes the
+  # cross-section unanswerable. See the header.
+  ticker: [ETH_USD]
+
+  # ── How many times? ─────────────────────────────────────────────────
+  # Three seeds: the floor for quoting anything. Not sufficient on its own —
+  # the dispersion verdict is what decides, not this count. PPO on an
+  # IDENTICAL config has been measured replaying 576 trades in one run and
+  # 374 in another, a 1.5x swing from the seed alone.
+  seed: [42, 43, 44]
+
+  # ── How much data? ──────────────────────────────────────────────────
+  # pages does NOT buy depth on the live arm: the REST ceiling is ~720
+  # candles and does not scale with it (pages=1 and pages=3 both measured
+  # 721 bars). 3 is kept because it costs nothing over 1 here and leaves the
+  # fetch reaching `until` with room to spare — over-fetch, never under-fetch.
+  pages: [3]
+
+  # ── How long to train? ──────────────────────────────────────────────
+  # One level: this axis contributes nothing until it has two.
+  timesteps: [3000]
+
+  # ── Which action space? ─────────────────────────────────────────────
+  # discrete (buy/hold/sell). One level — this file is about FRICTION, so
+  # adding action_space here would multiply cells without answering the
+  # question. Changing it changes the observation width, so it needs its own
+  # matrix if it is ever varied.
+  action_space: [discrete]
+
+  # ── What does it cost to trade? ─────────────────────────────────────
+  # THE HEADLINE AXIS. The second level is Kraken retail taker 0.26% plus
+  # half a typical spread as 0.05% slippage. EVERY QUOTED NUMBER COMES FROM
+  # THIS LEVEL.
+  #
+  # The frictionless level stays ONLY as a labelled diagnostic ceiling: it
+  # books every fill at the mid, so it measures how good the fills would have
+  # to be, not whether the model trades. `plan` emits `partial_friction`
+  # because of it, by design — read the cost-adjusted row or quote nothing.
+  #
+  # Costs bite in proportion to TURNOVER, so the gap between these two levels
+  # is a statement about this policy's trade frequency, not a general law.
+  friction:
+    - {fee_rate: 0.0026, slippage: 0.0005} # HEADLINE: 26bp + 5bp, Kraken taker
+    - {fee_rate: 0.0, slippage: 0.0}       # diagnostic ceiling only, never quoted
+
+  # ── Which bars? ─────────────────────────────────────────────────────
+  # Both bounds SET — a key present but null counts as UNSET, and without
+  # both the eval_split below is inert and the whole run is in-sample.
+  # Sized to sit inside the ~30-day live frame; see the header for the
+  # span/train/eval/replayed arithmetic.
+  .data_window:
+    - since: "2026-09-10T15:00:00Z"
+      until: "2026-10-01T15:00:00Z"
+      eval_split: 0.7
+
+# ── Derived, not written here ────────────────────────────────────────────
+#
+# cells = 1 ticker x 3 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 2 friction levels x 1 data_window
+#       = 6 cells  (~33 min at the estimates above)
+#
+# 2 per-config groups (the two friction levels), each backed by 3 seeds —
+# that is the resolution the report is read at, and the resolution the
+# dispersion verdict is computed on.
+#
+# NO algo AXIS, and there cannot be one today: `rl/agent.py` is a thin SB3
+# PPO wrapper with no other backend. "Which algorithm is better?" is a
+# documented FUTURE axis — adding it would multiply the cells and return the
+# same answer. `plan` emits `no_algo_axis` on every run for this reason.
