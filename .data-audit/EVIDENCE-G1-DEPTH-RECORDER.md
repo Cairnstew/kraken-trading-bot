@@ -673,3 +673,62 @@ Everything above is manual or planted. §8.1.3 requires the *timer* to have fire
 running timer", and `enabled`/`active`/has-fired are three different claims. The first
 unattended fire after the corrected install is the first real evidence, and it is what
 turns this slice from "a recorder exists" into "depth is accumulating".
+
+### 5. ✅ THE FIRST UNATTENDED FIRE — depth is accumulating
+
+**2026-10-03 20:42:24 BST.** Verbatim `systemctl --user list-timers`:
+
+```
+  NEXT                         LEFT LAST                         PASSED UNIT                                ACTIVATES
+  Sat 2026-10-03 21:41:06 BST 58min Sat 2026-10-03 20:42:24 BST 19s ago kraken-trading-bot-order-book.timer kraken-trading-bot-order-book.service
+```
+
+`LAST` in the past relative to `NOW`, `NEXT` in the future — the §8.1.3 test. And the
+service was started **by the timer**, not by hand:
+
+```
+TriggeredBy=kraken-trading-bot-order-book.timer
+Result=success
+Process: 2026077 ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-trading-bot#kraken-trading-bot
+  -- record-depth --pair ETH/USD --output /home/seanc/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl
+  --count 100  (code=exited, status=0/SUCCESS)
+```
+
+Journal, verbatim — the recorder stamping its OWN clock and writing into the path that
+survives `team_cleanup`:
+
+```
+nix[2026077]: Recorded kraken.public.Depth snapshot for ETH/USD
+nix[2026077]:   recorded_at : 2026-10-03T19:42:32.145878+00:00  (this process's own clock)
+nix[2026077]:   hour        : 2026-10-03T19:00:00+00:00
+nix[2026077]:   depth       : requested 100, got 100 bids / 100 asks
+nix[2026077]:   best        : bid 2683.28000 / ask 2683.29000
+nix[2026077]:   spread      : 0.01
+nix[2026077]:   appended to : /home/seanc/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl
+nix[2026077]:     records       : 4   intervals: 3
+nix[2026077]:     span          : 1906s observed   slots the span covers: 4   records: 4   coverage: 100.0%
+nix[2026077]:     VERDICT: GREEN (no interval exceeded the expectation)
+```
+
+The log now holds four records with four distinct timestamps, 200 levels each:
+
+```
+#1 2026-10-03T19:10:45.752567+00:00  bid=2683.52000 ask=2683.53000 levels=200
+#2 2026-10-03T19:12:55.755671+00:00  bid=2683.51000 ask=2683.52000 levels=200
+#3 2026-10-03T19:37:04.693310+00:00  bid=2681.57000 ask=2681.58000 levels=200
+#4 2026-10-03T19:42:32.145878+00:00  bid=2683.28000 ask=2683.29000 levels=200
+```
+
+**ONE CORRECTION TO THIS RECORD, made because a wrong observation is worse than a late
+one.** At 20:42:24 — the instant `LAST` first appeared — I read the log as still holding
+three records and wrote that no snapshot had landed. It had: the oneshot finished at
+20:42:32, eight seconds later, and `nix run` had not yet written. `NEXT` also showed `-`
+in that same reading; it was mid-fire and is now scheduled for 21:41:06. **Both readings
+were a race, not a defect, and the "no new snapshot landed" conclusion drawn from them was
+wrong.** Discarded per §8.1 and re-read after the process exited. Recorded here because the
+false negative is exactly the shape of mistake that would have had me "fixing" a working
+timer.
+
+This is the deliverable the whole audit was waiting on: from 20:42:24 onward, every hour of
+order-book depth accumulates in `~/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl`
+and cannot be recovered if lost.
