@@ -531,3 +531,32 @@ Stated plainly, and not as a footnote: **this pass recovers 1 of 6
 columns**, 5 columns lose the 13 readings the single live snapshot gave
 them, `signal_observed` no longer distinguishes absence per column (F-2),
 and both arms are **IN-SAMPLE** so no predictive claim is supported.
+
+---
+
+## §8 Finding index — F-1 … F-16
+
+`just audit-findings` binds every `F<n>` named **here** to a disposition in
+`DECISION.md` §7.7/§7.8 (`tools/audit_checks.py:348-381`). An earlier
+revision of this file named none, so the check reported "no F<n> identifiers"
+and **passed vacuously** — the same green-for-the-wrong-reason class §1's
+`SELF-TEST` clause exists to catch. This section restores the binding.
+
+| id | one-line | disposition |
+|---|---|---|
+| **F-1** | `features.py` docstring said the shipped default "composes 52" | **Closed** — 52 is the all-null width; shipped default composes 60 (`aba7b9b`) |
+| **F-2** | `signal_observed` is a per-channel OR; 4 of 6 columns stay zero-fill | **Accepted and disclosed** — `configs/default.yaml` §1/§2, restated in this file |
+| **F-3** | Forward-only cold start at a rolling ~366-day cap | **Accepted, bounded, asserted** |
+| **F-4** | AUDIT's "12 of 721" was wrong; **13** measured | **Correction recorded** |
+| **F-5** | `null` vs `0.0` for unrecoverable fields | **Override, measured equivalent** — record honesty only |
+| **F-6** | Tighten `signal_max_age_hours` 12 → ~1 | **Override: fix the comment, not the value** — §10 confirms at max **12.0** |
+| **F-7** | §6.1's hour-dedup direction was **inverted** (file order, not "live wins") | **Corrected and acted on** — `--append` skips held hours |
+| **F-8** | §7.3's width constants (57/49) are **3 low** | **Superseded** — measure 52/60; assert no literals |
+| **F-9** | Non-finite cells: 684 vs 0 | **RESOLVED — frame mismatch.** `697 − 13 = 684`; `observed` is the frame that matters. Builder's "identical both arms" **wrong** (684 vs 697) |
+| **F-10** | `signal_age_hours` ≤ 2.0 unachievable | **Restated per shape** — 12.0 on the shipped shape; confirms F-6 |
+| **F-11** | `spread` nonzero: 13 vs 24 | **RESOLVED — one arm, two frames.** 13 = `computed`, 24 = `observed`; 13 + 11 ffill = 24. Integrator's "byte-identical both arms" **wrong** (0/721 backfilled) |
+| **F-12** | Record has 14 keys, §6 says 13 | **Restated as a superset** — `relative_funding_rate` costs 0 observation columns |
+| **F-13** | F-1's number was wrong as well as its text | **Closed** (`aba7b9b`) |
+| **F-14** | The two characterisation tests are **vacuous** for this diff | **Accepted, not a defect** — zero executable change, so no test *could* be non-vacuous |
+| **F-15** | `width_check.py` skips `add_derived_ohlcv_features`, so a raw parquet reports 49 | **Accepted — docstring-only**; pre-existing tool trap, do-not-paste receipt |
+| **F-16** | `audit_checks.find_in_repo` **crashed** (`ValueError`) on a legitimate absolute cross-repo citation, making `just audit-evidence` unrunnable | **Fixed** in this pass — degrade to the absolute path; a crash asserts nothing, and `audit_checks.py` is not in `PY_FILES`, so the `executable-ast` guard and the byte-identical `model_matrix.py` are untouched |

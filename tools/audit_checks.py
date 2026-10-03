@@ -278,7 +278,17 @@ def cmd_evidence(a: argparse.Namespace) -> int:
     def find_in_repo(name: str) -> str | None:
         direct = REPO / name
         if direct.exists():
-            return str(direct.relative_to(REPO))
+            # `REPO / name` is the ABSOLUTE path when `name` is absolute, and
+            # this audit legitimately cites a sibling checkout
+            # (kraken-python/kraken_api/transport.py, kraken-market-data's
+            # client.py). `relative_to(REPO)` then raises ValueError and
+            # crashes the whole check on a VALID citation. A crash asserts
+            # nothing, so degrade to the absolute path -- still findable by
+            # the reader, which is the only thing this function decides.
+            try:
+                return str(direct.relative_to(REPO))
+            except ValueError:
+                return str(direct)
         # Prose cites by BASENAME ("features.py:1091"), and the audit also
         # legitimately cites SIBLING-repo scripts (kraken-market-data's
         # client.py, kraken-deep-history's seeder.py). Resolving against this
@@ -355,27 +365,33 @@ def cmd_findings(a: argparse.Namespace) -> int:
     vtext = validation.read_text()
     dtext = decision.read_text() if decision.exists() else ""
 
-    found = sorted({int(m) for m in re.findall(r"\bF(\d+)\b", vtext)})
+    # The repo's finding convention is HYPHENATED -- `F-1`, `F-7` -- in both
+    # DECISION.md and VALIDATION.md. This scan used `\bF(\d+)\b` and the
+    # disposition lookup used the literal token `F{n}`, so neither matched the
+    # convention the artifacts actually use: every check run reported "no
+    # F<n> identifiers" and PASSED VACUOUSLY. Accept both spellings, and
+    # match the disposition with a boundary so `F1` cannot match inside `F11`.
+    found = sorted({int(m) for m in re.findall(r"\bF-?(\d+)\b", vtext)})
     if not found:
         print("findings  no F<n> identifiers in VALIDATION.md")
         return 0
 
     print(f"findings  {len(found)} finding(s) in VALIDATION.md: "
-          f"{', '.join('F' + str(n) for n in found)}")
+          f"{', '.join('F-' + str(n) for n in found)}")
     missing = []
     for n in found:
-        token = f"F{n}"
+        pattern = re.compile(rf"\bF-?{n}\b")
         # A disposition is a mention in DECISION.md that is not merely the
         # finding id inside a quote of the validation text.
-        hits = [i for i, l in enumerate(dtext.splitlines(), 1) if token in l]
+        hits = [i for i, l in enumerate(dtext.splitlines(), 1) if pattern.search(l)]
         recorded = bool(hits)
         if not recorded:
             missing.append(n)
         loc = f"DECISION.md:{hits[0]}" if hits else "-- NOT RECORDED --"
-        print(f"    {token:5s} {'recorded' if recorded else 'MISSING  '}  {loc}")
+        print(f"    F-{n:<4d} {'recorded' if recorded else 'MISSING  '}  {loc}")
 
     print(
-        f"\n  RESULT  {'PASS' if not missing else 'MISSING DISPOSITION: ' + ', '.join('F' + str(n) for n in missing)}"
+        f"\n  RESULT  {'PASS' if not missing else 'MISSING DISPOSITION: ' + ', '.join('F-' + str(n) for n in missing)}"
     )
     print("  (a finding with no decision-level record is the R5 defect class)")
     return 0 if not missing else 1
