@@ -88,7 +88,7 @@ time, update its row.
 | `kraken-python` (foundation wrapper) | https://github.com/Cairnstew/kraken-python | `/home/seanc/Projects/kraken-python` |
 | `ticker-news-signals` (news → sentiment) | https://github.com/Cairnstew/ticker-news-signals (private) | `/home/seanc/Projects/ticker-news-signals` |
 | `kraken-market-data` (OHLC store) | https://github.com/Cairnstew/kraken-market-data (private) | `/home/seanc/Projects/kraken-market-data` |
-| `kraken-funding-rates` (funding/basis) | not pushed yet — no remote set | `/home/seanc/Projects/kraken-funding-rates` |
+| `kraken-funding-rates` (funding/basis) | https://github.com/Cairnstew/kraken-funding-rates (private) | `/home/seanc/Projects/kraken-funding-rates` |
 | `kraken-social-signals` (StockTwits + Fear & Greed) | https://github.com/Cairnstew/kraken-social-signals (private) | `/home/seanc/Projects/kraken-social-signals` |
 | `kraken-deep-history` (deep OHLCV via Binance archive → store seeder) | https://github.com/Cairnstew/kraken-deep-history (private) | `/home/seanc/Projects/kraken-deep-history` |
 
@@ -162,6 +162,31 @@ into `depends_on` to "fill it in later" — a real ID from the same response, or
 **CHECKPOINT:** After the `decision` task completes, stop and show the user DECISION.md. Wait for
 an explicit go before spawning the `scaffold` task. A new repo and new dependencies are a bigger
 commitment than a code edit.
+
+### CHECKPOINT RULE — every new guard recipe records one demonstrated RED run
+
+**Applies at every checkpoint, including the first one of a pass and including Phase 7
+slices.** This is the guard-must-fire-once rule, generalised from the 2026-10-02 pass where a
+regression test was required to be proved non-vacuous before it counted as coverage.
+
+A guard recipe, counter, threshold, or validator added in a pass is **not delivered** until
+someone has made it **go red on purpose** and recorded that red run in the evidence file
+(`.data-audit/VALIDATION.md`, or the pass's `RUN-LOG.md` for a pass with no gate). Concretely,
+the checkpoint must show all three:
+
+1. **The green result** — the guard passes on good input, with the numbers it produced.
+2. **A deliberately broken input** — one specific, named defect, not "we imagine it would fail".
+   For a counter: a skipped interval, a truncated file, a duplicated hour. For a validator: the
+   exact non-finite cell or the reverted line.
+3. **The red output, verbatim** — the counter's actual report of the hole, or the guard's actual
+   exception, pasted rather than paraphrased. A described failure is not a demonstrated one.
+
+Why it is a checkpoint item and not a Phase 6 item: a guard that has never been observed to fire
+is indistinguishable from a guard that cannot fire, and the last pass shipped two of each — a
+regression test that passed with its fix reverted, and an `audit-findings` check that reported
+"nothing found" forever because its regex did not match the repo's own `F-1` convention. Both were
+green for the whole run. Requiring the red run *at the checkpoint* means a guard cannot be
+declared done in the same breath as it is written.
 
 ## Waiting on teammates (important — read before spawning anyone)
 

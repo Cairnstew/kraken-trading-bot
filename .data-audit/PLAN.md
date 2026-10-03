@@ -238,6 +238,29 @@ Deciding it changes what "an effect" can even mean for this bot, so it
 should be settled deliberately, with the store's available depth in hand —
 **after** G4 — rather than picked up opportunistically.
 
+**Status: the lead's decision, to be confirmed at the next checkpoint.
+NOTHING HAS BEEN CHANGED.** The lead's stated lean is to **keep the
+shipped default `null`**, on the grounds that pinning the window without a
+store yields **0 train and 0 eval bars** — i.e. pinning is not a free
+win, it is a way to make the bot refuse to run. Under that lean:
+
+- unpinned runs stay **labelled IN-SAMPLE**, exactly as this pass's arms
+  were (`VALIDATION.md` §2, and the bot's own warning on every run);
+- the **documented OOS path** becomes `configs/deep-history.example.yaml`
+  plus the deep-history `just` recipes — the place where a pinned window is
+  paired with the store that can actually fill it.
+
+Recorded here so the next checkpoint starts from the reasoning rather than
+re-deriving it. The open question that lean leaves, to settle with it: if
+the shipped default stays unpinned, **every out-of-sample number anyone
+quotes requires deliberately choosing the example config**, so the OOS path
+needs to be prominent enough that a reader cannot mistake a default run for
+an OOS one. That is a docs/discoverability obligation attached to the
+decision, not a separate task.
+
+*(Typo to fix if this file is next edited: "VALIDATION.md" above should
+read "VALIDATION.md".)*
+
 ### 8.1 FIRST ACTION — start the G1 recorder, and do it before any feature work
 
 **The depth is unrecoverable by construction.** Kraken's order book is a
@@ -271,11 +294,62 @@ NOT. Do not touch `rl/features.py`, `_SIGNAL_COLUMNS`,
    indistinguishable from a run that never stopped. Report expected-vs-actual
    intervals alongside the data, and make a hole visible in the artifact
    rather than only in stdout.
-4. **Do not consume the recorded data in this pass.** No `_SIGNAL_COLUMNS`
+4. **Prove the gap counter can go RED before calling this slice done.** Feed
+   it a **deliberately skipped interval** and paste the verbatim report of the
+   hole into the evidence file. This is the guard-must-fire-once rule in the
+   command file's *CHECKPOINT RULE* section: a counter that has only ever
+   printed `0 gaps` is indistinguishable from a counter that cannot count.
+   The red run is part of the deliverable, not a follow-up.
+5. **Do not consume the recorded data in this pass.** No `_SIGNAL_COLUMNS`
    change, no observation-width change, no merge into the observation. The
    recorder runs, accumulates, and reports its gap count. Wiring the feature
    is a later slice, once there is history worth wiring — which is also why
    it must not be attempted before the recorder has been running for a while.
+
+#### 8.1.1 ⚠️ IT MUST BE SCHEDULED — a recorder that is not running loses the same data as no recorder
+
+Writing the recorder is not the deliverable. **Depth only accumulates if
+something runs it unattended**, and the unrecoverability above makes a
+recorder that merely *exists* worth exactly nothing — the snapshots it was
+built to capture are gone either way. So the scheduling is in scope for this
+slice, not deferred as "ops follow-up".
+
+- **How it runs: a systemd timer.** The repo already has the pattern to copy —
+  `systemd/kraken-trading-bot-funding.service{,.in}` +
+  `kraken-trading-bot-funding.timer` pulls funding hourly, and
+  `nix/module.nix` installs the unit. The recorder's unit should follow the
+  same shape. **Mind the option-namespace trap**: `nix/module.nix` is a
+  **NixOS** module, so `systemd.user.*` (a home-manager option) will not
+  evaluate there — the funding pass had to ship a plain `systemd/user` unit
+  for exactly this reason. Check which namespace the recorder's timer needs
+  before writing it.
+- **The timer's `ExecStart` is the production path**, so the recorder must be
+  runnable exactly the way the unit invokes it. The funding precedent is
+  `nix run <sibling>#<pkg> -- <args>` — a sibling that is **not** a flake
+  input, so it builds from its working tree (`src = ./.`) and an edit is live
+  with no lock bump. Say explicitly in the brief which of the two shapes the
+  recorder uses, because "it works when I run it by hand" and "the timer runs
+  the committed tree" are different claims and only one of them accumulates
+  data.
+- **First-checkpoint evidence: at least TWO real snapshots with DISTINCT
+  timestamps**, taken from a live call, showing the recorder stamps its own
+  clock (a book snapshot has no timestamp of its own — each level's timestamp
+  is that order's placement time, so two snapshots must differ by the
+  interval, not share one). Also show the unit is *installed and enabled*
+  (`systemctl --user list-timers`), because an enabled-but-never-fired timer
+  is the same failure as no timer.
+- **Cadence floor.** Poll no finer than hourly unless the hour-floor in
+  `data.py:757` changes — otherwise you pay 60× the calls to keep one row per
+  hour. Record the depth used in the data, because depth is not comparable
+  across a `count` change.
+
+#### 8.1.2 What this slice must NOT do
+
+The no-consume constraint is load-bearing, not politeness: the recorder's
+value is that it runs **unattended for weeks before** anything depends on its
+output. Consuming it in the same pass creates a reason to change its schema
+the first time an awkward column shows up, and the history already written
+becomes incompatible with itself. Write data; read nothing.
 
 ### 8.2 Then, in order
 
