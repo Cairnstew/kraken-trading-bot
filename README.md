@@ -339,6 +339,26 @@ key, the value as written, the expanded path and the command that produces
 it. Populate the files with the `*-pull` recipes, or set a key to `null` to
 switch that channel off silently.
 
+**Why the signal keys ship non-null but `market_data_store` ships `null`,
+when both fail the same way on a fresh clone.** The rule is one line: *ship a
+key non-null only if this repo can produce the file.* `signals/*.jsonl` is
+written by `just news-pull`, `just funding-backfill && just funding-pull` and
+`just social-pull` — three commands, the funding one keyless — so a clone can
+populate all three immediately. `~/Projects/kraken-market-data/store` cannot be
+conjured by anything in this repo; it needs a sibling clone and a seed run.
+The failure modes differ too, which is the part that actually decides it: a
+mis-set signal key raises loudly, naming its own remedy, before any artifact
+exists, whereas a mis-set store key computes wrong numbers *silently* — the
+158 missing bars and the 39-hour hole at the seed seam described below are
+exactly that, with `return_1` reporting a 39-hour return as though it were
+1-hour. Only the silent failure has to default to the safe side. All three
+signal keys were already non-null in `configs/default.yaml` before the news
+and social channels were activated (`funding_features_file` since the
+49→55 widening, commit `a39e184`), so the fresh-clone refusal predates them;
+the two `*-pull`/`*-backfill` recipes and the `null` escape hatch above are
+what make it recoverable in three commands. Full argument in
+`configs/default.yaml`, in the block above `market_data_store`.
+
 Two honest caveats, neither of which a schedule fixes: `stt_tilt` is
 permanently `0.0` on the live StockTwits v2 feed (0 of 30 sampled messages
 carry a `sentiment` key), and `novelty_flag` is dead at hourly cadence
