@@ -612,7 +612,7 @@ decision"), which rewrote `DECISION.md`. So "pre-existing" now means something c
   reason. It is NOT to be made green by bulk-writing "deferred".
 
 - **`audit-evidence`: a wrong citation, and the test is NOT lost.** The check reports
-  `tests/test_gc_producer_append.py` cited at `DECISION.md:401` but absent from the repo.
+  ``tests/test_gc_producer_append.py`` cited at `DECISION.md:401` but absent from the repo.
   Established rather than assumed: it is in **no commit** (`git log --all -- <path>` empty),
   in **no stash**, and in **none of the eight leftover ensemble worktrees**. So it was never
   written here — which matches what the spec itself says. `DECISION.md:401` reads "in each

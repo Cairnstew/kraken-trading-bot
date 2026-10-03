@@ -76,6 +76,30 @@ def _blob(ref: str, rel: str) -> str | None:
     return p.stdout if p.returncode == 0 else None
 
 
+def _numstat(ref: str, rel: str) -> tuple[int, int]:
+    """(+added, -deleted) line counts for `rel` between `ref` and the worktree.
+
+    Only used to make a CHANGED verdict self-explaining. A ref that cannot be
+    diffed reports (0, 0) rather than raising, because the caller's verdict is
+    already decided by the byte comparison and a missing diff must not change
+    it — it would turn a reporting problem into a false red.
+    """
+    p = subprocess.run(
+        ["git", "diff", "--numstat", ref, "--", rel],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if p.returncode != 0 or not p.stdout.strip():
+        return (0, 0)
+    parts = p.stdout.split()
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return (0, 0)
+
+
 class _StripDocsAndStrings(ast.NodeTransformer):
     """Blank every docstring AND every other string constant.
 
@@ -162,10 +186,20 @@ def cmd_verify(a: argparse.Namespace) -> int:
     else:
         same = old == cur
         ok = ok and same
-        print(
-            f"  measurement-track  {'MATCH' if same else 'CHANGED'}  "
-            f"{MEASUREMENT_TRACK} byte-identical to prereg {a.prereg}"
-        )
+        # The trailing clause used to read "byte-identical to prereg <ref>"
+        # UNCONDITIONALLY, so a CHANGED verdict still printed a sentence
+        # asserting byte-identity — a tool stating the opposite of its own
+        # result. Report what was actually compared instead, and name the
+        # diff so a CHANGED can be triaged without re-running git by hand.
+        if same:
+            detail = f"byte-identical to prereg {a.prereg}"
+        else:
+            n_add, n_del = _numstat(a.prereg, MEASUREMENT_TRACK)
+            detail = (
+                f"differs from prereg {a.prereg} "
+                f"(+{n_add}/-{n_del} lines) — NOT byte-identical"
+            )
+        print(f"  measurement-track  {'MATCH' if same else 'CHANGED'}  {detail}")
 
     # 2. executable AST identity, with a self-test first
     st = ast_selftest()
