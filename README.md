@@ -47,6 +47,43 @@ export KRAKEN_API_SECRET="your_secret_here"
 
 ## Usage
 
+> ### ⚠️ A default run is NOT an out-of-sample measurement
+>
+> `configs/default.yaml` ships `data_window.since: null` and `until: null`.
+> That is deliberate: pinning a window **without a market-data store** gives
+> **0 train and 0 eval bars**, so a pinned default would make the bot refuse
+> to run rather than measure anything honestly. The cost is that every
+> default run is **IN-SAMPLE** — it describes the fit, not a prediction — and
+> the bot prints that warning itself on every run.
+>
+> So: **do not read a return off a default `train` + `backtest` as
+> evidence of an edge.** With one run per arm and PPO's run-to-run
+> stochasticity unquantified, the spread between two configs routinely
+> exceeds the effect being measured.
+>
+> **The documented out-of-sample path** is the deep-history example config,
+> which pins the window *and* points at a store that can fill it. Seed the
+> store first — the bot only *reads* a store, it cannot backfill years from
+> Kraken (REST caps at ~720 bars):
+>
+> ```bash
+> just store-plan      # zero-network dry run: which monthly ZIPs it would fetch
+> just store-seed      # download + assert store_mode == "market-data"
+> just store-verify    # count missing bars, list gaps, name the seam hole
+>
+> kraken-trading-bot train    --ticker ETH_USD --model ppo_eth_01 \
+>                             --config configs/deep-history.example.yaml
+> kraken-trading-bot backtest --ticker ETH_USD --model ppo_eth_01 \
+>                             --config configs/deep-history.example.yaml
+> ```
+>
+> Read the config's own header before trusting a store-backed number: turning
+> the store on buys depth but also buys **holes**, and features are computed
+> on **bar counts, not wall-clock**, so a multi-hour gap is silently read as
+> a one-bar step. `just store-verify` is what detects it.
+>
+> Until a window is pinned that way, label every number **IN-SAMPLE**.
+
 ### CLI Commands
 
 ```bash

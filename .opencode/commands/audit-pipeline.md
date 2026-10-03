@@ -88,13 +88,30 @@ time, update its row.
 | `kraken-python` (foundation wrapper) | https://github.com/Cairnstew/kraken-python | `/home/seanc/Projects/kraken-python` |
 | `ticker-news-signals` (news → sentiment) | https://github.com/Cairnstew/ticker-news-signals (private) | `/home/seanc/Projects/ticker-news-signals` |
 | `kraken-market-data` (OHLC store) | https://github.com/Cairnstew/kraken-market-data (private) | `/home/seanc/Projects/kraken-market-data` |
-| `kraken-funding-rates` (funding/basis) | https://github.com/Cairnstew/kraken-funding-rates (private) | `/home/seanc/Projects/kraken-funding-rates` |
+| `kraken-funding-rates` (funding/basis) | https://github.com/Cairnstew/kraken-funding-rates (private — see visibility note) | `/home/seanc/Projects/kraken-funding-rates` |
 | `kraken-social-signals` (StockTwits + Fear & Greed) | https://github.com/Cairnstew/kraken-social-signals (private) | `/home/seanc/Projects/kraken-social-signals` |
 | `kraken-deep-history` (deep OHLCV via Binance archive → store seeder) | https://github.com/Cairnstew/kraken-deep-history (private) | `/home/seanc/Projects/kraken-deep-history` |
 
 Related siblings (not data sources): `opencode-ensemble`, `spotify-playlist-manager`,
 `x-python-api`, `steam-mcp`, `nixos-minecraft-modpacks` (all under `https://github.com/Cairnstew/…`,
 check `gh repo list Cairnstew --limit 100` for the full inventory).
+
+**⚑ Visibility is per-repo and changing it is its own decision.** `kraken-funding-rates` is
+**PRIVATE** and stays private unless the lead says otherwise. If it is ever to be made public,
+run this **pre-flight first** — not after the push, because history is the part that cannot be
+un-published:
+
+1. **No secrets.** No API keys, tokens, or `.env` in the tree.
+2. **No `.env`**, and `.gitignore` still covers it.
+3. **No account-specific data** in any tracked file — positions, balances, order history,
+   account ids, or anything captured from an authenticated endpoint.
+4. **All commits scanned for secrets**, not just the working tree — `kraken-funding-rates` has
+   **4 commits** (`69c9c39` scaffold, `c87e8a7` lock, `935dfc0` ticker field, `dc49847` backfill).
+   History is the thing that cannot be un-published, so a clean HEAD says nothing about commits 1-3.
+5. Only then flip visibility, and record the scan output in the pass's evidence file.
+
+A secret found in history is **not** fixed by deleting the file in a later commit; it needs
+rotation, and the credential should be treated as compromised the moment it is pushed.
 
 ---
 

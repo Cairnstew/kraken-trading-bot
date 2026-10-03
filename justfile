@@ -24,6 +24,32 @@
 # `paper-trade` CLI subcommand, so `just paper --dry-run ...` works too.
 # Avoid single quotes inside the extra arguments (they delimit the
 # bash -c script).
+#
+# ── A DEFAULT RUN IS **NOT** AN OUT-OF-SAMPLE MEASUREMENT ─────────────
+# `configs/default.yaml` ships `data_window.since: null` / `until: null` on
+# purpose: pinning a window with no market-data store gives 0 train and 0
+# eval bars, so a pinned default would make the bot refuse to run rather
+# than measure anything honestly. The cost is that `train` + `backtest` on
+# the default config is **IN-SAMPLE** -- it describes the fit, not a
+# prediction -- and the bot prints that warning itself every run.
+#
+# Do NOT read a return off a default run as evidence of an edge. With one
+# run per arm and PPO's run-to-run stochasticity unquantified, the spread
+# between two configs routinely exceeds the effect being measured.
+#
+# THE OOS PATH: seed the store (the bot only READS one; REST caps at ~720
+# bars), then run with the example config that pins the window to match.
+#
+#   just store-plan      # zero-network dry run: which ZIPs it would fetch
+#   just store-seed      # download, and assert store_mode == "market-data"
+#   just store-verify    # count missing bars, list gaps, name the seam hole
+#   just train    --config configs/deep-history.example.yaml ...
+#   just backtest --config configs/deep-history.example.yaml ...
+#
+# Read `configs/deep-history.example.yaml`'s own header before trusting a
+# store-backed number: the store buys depth but also buys HOLES, and
+# features are computed on bar counts, not wall-clock, so a multi-hour gap
+# reads as a one-bar step. `just store-verify` is what detects that.
 dev := "nix develop --command bash -c"
 
 # ── Environment ────────────────────────────────────────────────────────

@@ -238,28 +238,29 @@ Deciding it changes what "an effect" can even mean for this bot, so it
 should be settled deliberately, with the store's available depth in hand —
 **after** G4 — rather than picked up opportunistically.
 
-**Status: the lead's decision, to be confirmed at the next checkpoint.
-NOTHING HAS BEEN CHANGED.** The lead's stated lean is to **keep the
-shipped default `null`**, on the grounds that pinning the window without a
-store yields **0 train and 0 eval bars** — i.e. pinning is not a free
-win, it is a way to make the bot refuse to run. Under that lean:
+**Status: CONFIRMED at the 2026-10-03 close-out. The shipped default stays
+`null`.** The lead's reasoning, which stands: pinning the window without a
+store yields **0 train and 0 eval bars** — pinning is not a free win, it is
+a way to make the bot refuse to run.
 
-- unpinned runs stay **labelled IN-SAMPLE**, exactly as this pass's arms
-  were (`VALIDATION.md` §2, and the bot's own warning on every run);
-- the **documented OOS path** becomes `configs/deep-history.example.yaml`
-  plus the deep-history `just` recipes — the place where a pinned window is
-  paired with the store that can actually fill it.
+- Unpinned runs are **labelled IN-SAMPLE in the output** (the bot already
+  prints this warning itself on every run).
+- The **documented OOS path** is `configs/deep-history.example.yaml` plus the
+  `just store-plan` / `store-seed` / `store-verify` recipes.
+- **Discoverability was the obligation, and it is discharged** (commit
+  `f9a5e2c`): the README's Usage section opens with a "a default run is NOT an
+  out-of-sample measurement" block naming the recipe that *is*, and the
+  `justfile` header carries the same warning so `just --list` and a bare `just`
+  both surface it. Both name `store-plan`/`store-seed`/`store-verify` and
+  point at the example config's own header for the store-holes caveat.
 
-Recorded here so the next checkpoint starts from the reasoning rather than
-re-deriving it. The open question that lean leaves, to settle with it: if
-the shipped default stays unpinned, **every out-of-sample number anyone
-quotes requires deliberately choosing the example config**, so the OOS path
-needs to be prominent enough that a reader cannot mistake a default run for
-an OOS one. That is a docs/discoverability obligation attached to the
-decision, not a separate task.
+**§8.0 is CLOSED.** Not to be reopened past the next checkpoint; a future pass
+that wants a pinned *default* must argue it against the 0-bars failure above,
+not against this closure.
 
-*(Typo to fix if this file is next edited: "VALIDATION.md" above should
-read "VALIDATION.md".)*
+*(Note for whoever next edits this file: the OOS recipe is `store-seed`, not
+`deep-history-seed` — there is no recipe by the latter name. An earlier draft
+of the README named one and it was wrong.)*
 
 ### 8.1 FIRST ACTION — start the G1 recorder, and do it before any feature work
 
@@ -343,7 +344,65 @@ slice, not deferred as "ops follow-up".
   hour. Record the depth used in the data, because depth is not comparable
   across a `count` change.
 
-#### 8.1.2 What this slice must NOT do
+#### 8.1.2 Minimum depth N — stated at the FIRST checkpoint of the next pass
+
+**Pick N from what a Phase 6 gate needs, not from how long the build takes.**
+Until N is reached, **the recorder is the only deliverable and nothing consumes
+the data** (see §8.1.3 for why that constraint is load-bearing). Stating the
+arithmetic is part of the deliverable — a bare "N days" is not acceptable.
+
+**The arithmetic, at hourly cadence (24 snapshots/day):**
+
+```
+days = bars_needed / 24
+```
+
+Where `bars_needed` comes from the gate, not from convenience:
+
+| input | value | where it is measured |
+|---|---|---|
+| live REST ceiling | 721 bars @ 60 m ≈ **30 days** | `data.py:28`; confirmed 697 tradable after `first_tradable_index = 24` |
+| **this pass's gate could not resolve an effect** | 697 tradable bars, one run per arm | `VALIDATION.md` §2 |
+| matrix-harness finding | within-config seed spread **exceeded** the between-config effect at **178-bar** eval slices, 3 seeds | 2026-10-02 matrix-harness entry |
+| so a floor: train + a disjoint eval slice longer than seed noise | ≥ 1,440 train (60 d) + ≥ 720 eval (30 d) = **2,160 bars** | 60/30 split of the above |
+| **recommended N** | **365 days = 8,760 snapshots** | see below |
+
+**N = 365 days**, justified from the gate rather than from build time:
+
+1. It **matches the funding channel's existing depth** (`/historical-funding-rates`
+   serves ~366 days), so the book series and the funding series can be
+   evaluated over the **same** window. At N = 90 the book series would be the
+   *shorter* one and the comparison would silently be confounded by coverage.
+2. The price side is **not** the binding constraint — the store already holds
+   ~76.5k bars — so waiting costs nothing that a deeper price frame would have
+   bought anyway.
+3. Nothing consumes the data until N is met, so **a longer N is free**; the
+   only cost of over-waiting is latency to first evaluation, and the only cost
+   of under-waiting is a gate that cannot separate signal from noise — which is
+   the failure this repo has already paid for once.
+
+So: **2,160 bars (90 d) is the floor at which a first evaluation becomes
+*possible*; 8,760 (365 d) is what it takes for that evaluation to mean
+something.** The checkpoint should state N = 365 and print the arithmetic, and
+should re-derive `bars_needed` rather than inherit these numbers — per the
+re-derive rule, they are measured figures with a date on them.
+
+#### 8.1.3 Proof the timer is RUNNING — enabled is not enough
+
+At the first checkpoint, in addition to the two distinct-timestamp snapshots,
+show **`systemctl --user list-timers` (or the system-scope equivalent the unit
+actually installs) output including the recorder's timer and its `LAST` and
+`NEXT` elapsed times**, pasted verbatim.
+
+An **enabled** timer is not a **running** timer: `enabled`, `active` and
+"has actually fired" are three different claims, and only the third
+accumulates data. `LAST` in the past relative to `NOW` plus a `NEXT` in the
+future is the evidence that it fires unattended. Two snapshots taken by hand
+minutes apart prove the *recorder* works; they prove nothing about the
+*schedule*. This is the same shape as the non-vacuity rule: demonstrate the
+thing that actually matters, not the adjacent thing that is easy to show.
+
+#### 8.1.4 What this slice must NOT do
 
 The no-consume constraint is load-bearing, not politeness: the recorder's
 value is that it runs **unattended for weeks before** anything depends on its
