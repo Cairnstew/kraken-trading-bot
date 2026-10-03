@@ -1,0 +1,51 @@
+# Template for the social-pull user unit.  Installed (with @TICKER@/@OUTPUT@
+# substituted) by `just social-timer`; the shipped `.service` next to it is
+# the same unit with the default values filled in.
+#
+# `nix/module.nix` cannot carry this unit: it is a **NixOS** module and
+# `systemd.user.*` is not in its option namespace.  The working pattern is
+# the justfile, exactly as `just funding-timer` does — see justfile:163.
+#
+# Install manually if you would rather not use `just`:
+#   mkdir -p ~/.config/systemd/user
+#   sed -e 's|@TICKER@|ETH/USD|' \
+#       -e "s|@OUTPUT@|$HOME/Projects/kraken-trading-bot/signals/eth_usd_social.jsonl|" \
+#     systemd/kraken-trading-bot-social.service.in \
+#     > ~/.config/systemd/user/kraken-trading-bot-social.service
+#   ln -sf "$PWD/systemd/kraken-trading-bot-social.timer" ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kraken-trading-bot-social.timer
+#
+# `loginctl enable-linger $USER` makes it fire while logged out.
+[Unit]
+Description=Pull StockTwits + Fear & Greed vectors into the trading bot's signal file
+Documentation=file://@OUTPUT@
+
+[Service]
+Type=oneshot
+# One reading per pull, APPENDED.  Keyless on both legs: StockTwits v2
+# streams (browser-grade User-Agent) and alternative.me Fear & Greed.
+#
+# `--append` is the whole point of this unit and must not be dropped.  The
+# CLI's --lookback-hours defaults to 24 and that window SLIDES, so a pull
+# without `--append` REPLACES the file with the last day on every fire: the
+# file never grows, the loss is silent because the file still parses, and
+# the 721-bar frame ends up annotated by one day of history forever.  (The
+# CLI warns on stderr when it replaces a file that already holds records.)
+#
+# Rate budget, since it constrains the cadence: StockTwits throttles the
+# keyless path and closed developer registrations, so there is no token to
+# buy headroom with.  One pull per hour against a 24h lookback sits inside
+# that budget; re-running this unit by hand in a loop does not.
+#
+# The sibling writes the timestamp hour-floored, so a once-per-hour pull
+# naturally produces one record per hour.  A re-fire inside the same hour
+# (Persistent catch-up after a short suspend) appends a duplicate line,
+# which is harmless and self-limiting: `merge_extra_features` keeps the
+# last record per floored hour.  The file is a log, not state.
+ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/kraken-social-signals#kraken-social-signals -- pull --ticker @TICKER@ --output @OUTPUT@ --append
+TimeoutStartSec=300
+# A failed pull must not be mistaken for a fresh file: leave the previous
+# JSONL alone and let the staleness bound (signal_max_age_hours) mark the
+# bars unobserved.
+SuccessExitStatus=0

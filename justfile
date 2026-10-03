@@ -12,6 +12,11 @@
 #   just funding-backfill   fill the funding channel's file with Kraken's
 #                           own ~366-day hourly history (keyless, idempotent)
 #   just funding-timer      enable the hourly systemd.user funding timer
+#   just news-pull         pull one hour of Google News sentiment (keyless,
+#                           --append)
+#   just social-pull       pull StockTwits + Fear & Greed (keyless, --append)
+#   just news-timer        enable the hourly systemd.user news timer (:23)
+#   just social-timer      enable the hourly systemd.user social timer (:29)
 #
 # Every recipe that needs the project environment runs **inside the Nix
 # dev shell** automatically via `nix develop --command bash -c ...`, so you
@@ -192,6 +197,92 @@ funding-pull pair="ETH/USD" output="signals/eth_usd_funding.jsonl":
   mkdir -p "$(dirname "$dest")"
   nix run ~/Projects/kraken-funding-rates#kraken-funding-rates -- \
     pull --pair {{pair}} --output "$dest" --append
+
+# Pull one hour of Google News sentiment into the news channel's file.
+# This is the command kraken-trading-bot-news.service runs; run it by hand
+# to seed a fresh clone, which the non-null `extra_features_file` key
+# otherwise refuses to read past (SignalFileNotFoundError).
+#
+# `--append` is load-bearing, not decoration.  The sibling's default
+# --lookback-hours is 1, so a pull WITHOUT it replaces the file with a
+# one-hour window — hourly, that is a file one hour deep forever, and the
+# loss is silent because the file still parses.
+#
+# Invoked through the sibling's own flake, not `python .../cli.py`: gnews
+# and vaderSentiment are not on THIS flake's PYTHONPATH, so the repo-root
+# cli.py cannot import them here.  The sibling is named by path and built,
+# not added as a flake input — it is private (`github:` would 404) and a
+# pinned input would freeze every sibling fix into this repo's flake.lock.
+#
+# `output` is repo-relative by default and absolute if it looks absolute,
+# matching `funding-pull`.
+news-pull ticker="ETH/USD" output="signals/eth_usd_news.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  mkdir -p "$(dirname "$dest")"
+  nix run ~/Projects/ticker-news-signals#ticker-news-signals -- \
+    pull --ticker {{ticker}} --output "$dest" --append
+
+# Pull StockTwits + Fear & Greed into the social channel's file.  Same shape
+# as `news-pull`, and the same reason for `--append`: the default
+# --lookback-hours is 24 and that window SLIDES, so replacing means the
+# file is rewritten to the last day on every fire and never accumulates.
+social-pull ticker="ETH/USD" output="signals/eth_usd_social.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  root="{{justfile_directory()}}"
+  dest="{{output}}"
+  case "$dest" in /*) ;; *) dest="$root/$dest" ;; esac
+  mkdir -p "$(dirname "$dest")"
+  nix run ~/Projects/kraken-social-signals#kraken-social-signals -- \
+    pull --ticker {{ticker}} --output "$dest" --append
+
+# Enable the hourly news-snapshot systemd.user timer, so the news file
+# `configs/default.yaml` points at stays current: two keyless Google News
+# requests per hour (one symbol search, one whole-category pull) and one
+# appended line.
+#
+# `ticker` and `output` must match the `extra_features_file` your model
+# config points at; the unit is generated (not symlinked) because ExecStart
+# embeds both.  Fires at :23 — clear of the funding timer's :17 plus its
+# 120s jitter, and clear of the social timer's :29.
+news-timer ticker="ETH/USD" output="signals/eth_usd_news.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir" "$root/$(dirname {{output}})"
+  sed -e "s|@TICKER@|{{ticker}}|" -e "s|@OUTPUT@|$root/{{output}}|" \
+      "$root/systemd/kraken-trading-bot-news.service.in" \
+      > "$unit_dir/kraken-trading-bot-news.service"
+  ln -sf "$root/systemd/kraken-trading-bot-news.timer" \
+      "$unit_dir/kraken-trading-bot-news.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-news.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-news.timer --no-pager
+
+# Enable the hourly social-snapshot systemd.user timer.  Fires at :29, the
+# third of the three non-colliding channel minutes (17 funding, 23 news,
+# 29 social).
+social-timer ticker="ETH/USD" output="signals/eth_usd_social.jsonl":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir" "$root/$(dirname {{output}})"
+  sed -e "s|@TICKER@|{{ticker}}|" -e "s|@OUTPUT@|$root/{{output}}|" \
+      "$root/systemd/kraken-trading-bot-social.service.in" \
+      > "$unit_dir/kraken-trading-bot-social.service"
+  ln -sf "$root/systemd/kraken-trading-bot-social.timer" \
+      "$unit_dir/kraken-trading-bot-social.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-social.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-social.timer --no-pager
 
 # Fill funding HISTORY from Kraken's own /historical-funding-rates, into the
 # SAME file `funding-pull` writes (--append).  This is the difference between

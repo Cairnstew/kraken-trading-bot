@@ -1,0 +1,34 @@
+# The social channel's timer.  Hourly, matching the bar cadence
+# (`configs/default.yaml` ohlcvv_interval_minutes: 60) and matching the
+# other two channel timers, so all three fire once per bar and a re-fire
+# inside the same hour is absorbed by the seam's per-floored-hour
+# de-duplication.
+#
+# MINUTE 29.  The three channel timers are 17 (funding), 23 (news), 29
+# (social) — six minutes apart, which is more than the funding timer's
+# 120s RandomizedDelaySec window and so cannot overlap even under the
+# worst-case jitter.  `tests/test_gc_channel_activation.py::
+# test_the_three_timers_never_share_a_minute` parses all three OnCalendar
+# lines and fails if a fourth channel is ever given a colliding minute.
+#
+# OnCalendar, not OnUnitActiveSec: `Persistent=true` is *silently inert* on
+# a monotonic timer, so an OnUnitActiveSec schedule would skip every hour of
+# a suspend with no diagnostic at all, and it drifts off the UTC bar grid
+# anyway.  OnCalendar + Persistent gives ONE coalesced catch-up, not one per
+# missed interval.  Cron is rejected for the opposite reason: no catch-up at
+# all, so a suspend silently produces a staleness gap.
+#
+# Installed/started by `just social-timer`, or manually:
+#   systemctl --user enable --now kraken-trading-bot-social.timer
+[Unit]
+Description=Hourly StockTwits + Fear & Greed pull for kraken-trading-bot
+
+[Timer]
+OnCalendar=*-*-* *:29:00
+# Catch up after a suspend/lid-close instead of silently skipping hours.
+Persistent=true
+RandomizedDelaySec=120
+Unit=kraken-trading-bot-social.service
+
+[Install]
+WantedBy=timers.target

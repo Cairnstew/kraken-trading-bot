@@ -47,14 +47,41 @@ feature_windows: [1, 4, 24]
 # when no signals are merged.
 feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
 
-# --- Exogenous signals (optional) ---------------------------------------
+# --- Exogenous signals --------------------------------------------------
+# All three keys below are TWO-STATE by design and all three are non-null in
+# this shipped default.  `null` means OFF: the merge does nothing and says
+# nothing.  A non-null value is a DECLARED INTENT to use that channel, which
+# makes an unusable path a configuration error rather than a first-run state.
+#
+#  ⚠ FRESH CLONE CONSEQUENCE: `signals/` is gitignored (.gitignore:65), so a
+#    fresh clone has NO signal files at all and the very first read raises
+#    SignalFileNotFoundError naming the key, the value as written and the
+#    expanded path.  That is deliberate — silently skipping the merge would
+#    drop `signal_observed`/`signal_age_hours` too, so the diagnostic that
+#    would have made the absence auditable *inside the observation* would be
+#    absent as well.  Populate them first (the three `*-pull` recipes) or set
+#    the key to null.  Covered by
+#    tests/test_gc_channel_activation.py::test_non_null_key_without_a_file_refuses.
+#
 # Path to a JSONL file of per-(ticker, hour) signal vectors produced by
-# the sibling `ticker-news-signals` project:
-#   python ~/Projects/ticker-news-signals/cli.py pull --ticker ETH/USD \
-#     --output signals/eth_usd.jsonl
-# When set, a feature-engineering step can left-join these columns onto
-# the OHLCV frame by timestamp. Null/empty disables the feature.
-extra_features_file: null
+# the sibling `ticker-news-signals` project.  There IS a cli.py at that
+# repo's root, but it cannot run in *this* dev shell: gnews and
+# vaderSentiment are not on this flake's PYTHONPATH and the sibling's flake
+# is the only place they exist.  Invoke it through the sibling's own flake
+# (which is what the systemd unit's ExecStart and `just news-pull` run):
+#   nix run ~/Projects/ticker-news-signals#ticker-news-signals -- \
+#     pull --ticker ETH/USD \
+#     --output ~/Projects/kraken-trading-bot/signals/eth_usd_news.jsonl --append
+# (`--append` is REQUIRED, not optional: the default --lookback-hours is 1,
+# so a pull without it replaces the file with a one-hour window and the file
+# never grows past one hour.  The CLI now warns on stderr when it replaces a
+# file that already holds records.)
+#
+# Columns: sentiment_score, article_count, novelty_flag.  Merged first, so
+# the other two channels merge after it.  The path below is the one the
+# systemd.user timer (kraken-trading-bot-news.{service,timer}) populates
+# hourly at :23 — a minute clear of the funding timer's :17.
+extra_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_news.jsonl
 
 # Path to a JSONL file of per-(ticker, hour) funding-rate/basis vectors
 # produced by the sibling `kraken-funding-rates` project.  There is no
@@ -92,12 +119,24 @@ extra_features_file: null
 funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
 
 # Path to a JSONL file of per-(ticker, hour) social/search-trend vectors
-# produced by the sibling `kraken-social-signals` project:
-#   python ~/Projects/kraken-social-signals/cli.py pull --ticker ETH/USD \
-#     --output signals/eth_usd_social.jsonl
-# Columns: stt_mention_count, stt_tilt, fng_index.  Merged after funding
-# signals via the same timestamp-floor left-join.  Null/empty disables it.
-social_features_file: null
+# produced by the sibling `kraken-social-signals` project.  Same shape as
+# the news channel above — invoke it through its own flake, with `--append`:
+#   nix run ~/Projects/kraken-social-signals#kraken-social-signals -- \
+#     pull --ticker ETH/USD \
+#     --output ~/Projects/kraken-trading-bot/signals/eth_usd_social.jsonl --append
+# (`--append` matters even more here: `--lookback-hours` defaults to 24 and
+# the window SLIDES, so replacing means the file is rewritten to the last
+# day on every fire and never accumulates.)
+#
+# Columns: stt_mention_count, stt_tilt, fng_index.  Merged last, after
+# funding signals, via the same timestamp-floor left-join.  The path below
+# is the one kraken-trading-bot-social.{service,timer} populates hourly at
+# :29.  Two honest caveats, neither of which a schedule fixes: `stt_tilt` is
+# permanently 0.0 on the live StockTwits v2 feed (0/30 sampled messages
+# carry a `sentiment` key), and `fng_index` is a DAILY value stamped onto
+# each hour.  Zero-variance columns normalise to exactly 0.0, so neither
+# reaches the observation as NaN.
+social_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_social.jsonl
 
 # How long a merged signal reading may be carried forward, in hours, for
 # ALL three files above.  A reading is forward-filled for at most this many

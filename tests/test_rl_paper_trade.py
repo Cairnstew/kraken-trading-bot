@@ -105,24 +105,38 @@ class OneShotManager:
         return self.candles, 0
 
 
-def _default_config_without_funding(dest: Path) -> Path:
-    """Write a copy of ``configs/default.yaml`` with funding_features_file null.
+def _default_config_without_signal_files(dest: Path) -> Path:
+    """Write a copy of ``configs/default.yaml`` with all three channel keys null.
 
-    The shipped config configures
-    `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl`, and the
-    merge seam now refuses a *configured* path it cannot resolve (naming the
-    key, the raw value and the expanded path).  That refusal is the intended
-    behaviour, but these tests are about the paper-trading loop, not the
-    funding channel, so the module-wide model is trained from the shipped
-    config with that ONE key nulled — ``null`` means off and is silent.  The
-    training config written to ``models/`` carries it forward, so the
-    paper-trade reads below are covered too.
+    The shipped config configures three signal files under
+    `~/Projects/kraken-trading-bot/signals/`, and that directory is
+    gitignored (.gitignore:65), so on any checkout without the timers
+    installed the merge seam refuses a *configured* path it cannot resolve
+    (naming the key, the raw value and the expanded path).  That refusal is
+    the intended behaviour — it is what
+    ``tests/test_gc_channel_activation.py::test_non_null_key_without_a_file_refuses``
+    pins — but these tests are about the paper-trading loop, not about the
+    signal channels, so the module-wide model is trained from the shipped
+    config with those keys nulled.  ``null`` means off and is silent, which
+    is precisely the distinction the non-null branch exists to make.
+
+    The training config written to ``models/`` carries them forward as null,
+    so the paper-trade reads below are covered too.  All three channels are
+    covered for real — fake `HOME`, a `~`-spelled path, and the seam
+    asserted to have *consumed* the file — in
+    ``tests/test_rl_signal_config_wiring.py`` and
+    ``tests/test_rl_data_store.py``.
     """
     repo = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load(
         (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
     )
-    cfg["funding_features_file"] = None
+    for key in (
+        "extra_features_file",
+        "funding_features_file",
+        "social_features_file",
+    ):
+        cfg[key] = None
     dest.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return dest
 
@@ -140,8 +154,8 @@ def trained_model(tmp_path_factory):
         total_timesteps=150,
         seed=7,
         models_root=root,
-        config_path=_default_config_without_funding(
-            root / "default-no-funding.yaml"
+        config_path=_default_config_without_signal_files(
+            root / "default-no-signals.yaml"
         ),
     )
     assert record.is_trained()

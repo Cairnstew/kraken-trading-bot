@@ -1,0 +1,52 @@
+# Template for the news-pull user unit.  Installed (with @TICKER@/@OUTPUT@
+# substituted) by `just news-timer`; the shipped `.service` next to it is
+# the same unit with the default values filled in.
+#
+# `nix/module.nix` cannot carry this unit: it is a **NixOS** module and
+# `systemd.user.*` is not in its option namespace.  The working pattern is
+# the justfile, exactly as `just funding-timer` does — see justfile:163.
+#
+# Install manually if you would rather not use `just`:
+#   mkdir -p ~/.config/systemd/user
+#   sed -e 's|@TICKER@|ETH/USD|' \
+#       -e "s|@OUTPUT@|$HOME/Projects/kraken-trading-bot/signals/eth_usd_news.jsonl|" \
+#     systemd/kraken-trading-bot-news.service.in \
+#     > ~/.config/systemd/user/kraken-trading-bot-news.service
+#   ln -sf "$PWD/systemd/kraken-trading-bot-news.timer" ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kraken-trading-bot-news.timer
+#
+# `loginctl enable-linger $USER` makes it fire while logged out.
+[Unit]
+Description=Pull Google News sentiment vectors into the trading bot's signal file
+Documentation=file://@OUTPUT@
+
+[Service]
+Type=oneshot
+# One reading per pull, APPENDED.  Keyless (Google News RSS via GNews).
+#
+# `--append` is the whole point of this unit and must not be dropped.  The
+# CLI's default --lookback-hours is 1, so a pull without it REPLACES the
+# output file with a one-hour window: hourly, that is a file one hour deep
+# forever, and the loss is silent because the file still parses.  (The CLI
+# now warns on stderr when it replaces a file that already holds records,
+# but a unit that fails on warning is not a fix — pass the flag.)
+#
+# The sibling writes the timestamp hour-floored, so a once-per-hour pull
+# naturally produces one record per hour.  A re-fire inside the same hour
+# (Persistent catch-up after a short suspend) appends a duplicate line,
+# which is harmless and self-limiting: `merge_extra_features` keeps the
+# last record per floored hour, so the extra line is discarded at the read
+# seam.  The file grows by ~1 line per hour, so it is a log, not state.
+#
+# `nix run` on the checked-out sibling avoids re-evaluating a flake per fire
+# while staying hermetic; the first fire builds it, later fires reuse the
+# store path.  The sibling is invoked, never modified.  (It is NOT a flake
+# input here: it is private, so `github:` would 404, and a pinned input
+# would freeze every sibling fix into this repo's flake.lock.)
+ExecStart=/run/current-system/sw/bin/nix run /home/seanc/Projects/ticker-news-signals#ticker-news-signals -- pull --ticker @TICKER@ --output @OUTPUT@ --append
+TimeoutStartSec=300
+# A failed pull must not be mistaken for a fresh file: leave the previous
+# JSONL alone and let the staleness bound (signal_max_age_hours) mark the
+# bars unobserved.
+SuccessExitStatus=0

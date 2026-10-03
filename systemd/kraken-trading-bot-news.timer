@@ -1,0 +1,38 @@
+# The news channel's timer.  Hourly is the right cadence because it is the
+# coarsest cadence that still fills every bar: `configs/default.yaml`
+# ohlcvv_interval_minutes is 60, and duplicates inside one hour are free at
+# the read seam (`merge_extra_features` keeps the last record per floored
+# hour), so there is nothing to gain from firing more often and history to
+# lose from firing less often.
+#
+# MINUTE 23, not 17.  The funding timer fires at 17:00 plus up to 120s of
+# jitter (`RandomizedDelaySec=120`), so it owns the 17:00–17:02 window.  A
+# second timer on :17 would land in that same window and both producers'
+# HTTP requests would contend for the same rate limit.  :23 (news) and :29
+# (social) are clear of it and of each other; `tests/
+# test_gc_channel_activation.py::test_the_three_timers_never_share_a_minute`
+# parses all three OnCalendar lines and fails if that ever stops being true.
+#
+# OnCalendar, not OnUnitActiveSec: `Persistent=true` is *silently inert* on
+# a monotonic timer, so an OnUnitActiveSec schedule would skip every hour of
+# a suspend with no diagnostic at all, and it drifts off the UTC bar grid
+# anyway.  OnCalendar + Persistent gives ONE coalesced catch-up (not one per
+# missed interval), so a week-long suspend is a single pull, not 168.  Cron
+# is rejected for the opposite reason: it has no catch-up at all, so a
+# suspend silently produces a staleness gap bounded only by
+# signal_max_age_hours.
+#
+# Installed/started by `just news-timer`, or manually:
+#   systemctl --user enable --now kraken-trading-bot-news.timer
+[Unit]
+Description=Hourly Google News sentiment pull for kraken-trading-bot
+
+[Timer]
+OnCalendar=*-*-* *:23:00
+# Catch up after a suspend/lid-close instead of silently skipping hours.
+Persistent=true
+RandomizedDelaySec=120
+Unit=kraken-trading-bot-news.service
+
+[Install]
+WantedBy=timers.target

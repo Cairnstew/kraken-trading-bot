@@ -275,8 +275,8 @@ def test_train_ticker_end_to_end(tmp_path):
         "ETH/USD",
         "ppo_train",
         manager=OneShotManager(),
-        config_path=_default_config_without_funding(
-            tmp_path / "default-no-funding.yaml"
+        config_path=_default_config_without_signal_files(
+            tmp_path / "default-no-signals.yaml"
         ),
         pages=2,
         total_timesteps=150,
@@ -358,8 +358,8 @@ def test_backtest_env_applies_loaded_normalization(tmp_path, monkeypatch):
         "ETH/USD",
         "ppo_norm",
         manager=OneShotManager(),
-        config_path=_default_config_without_funding(
-            tmp_path / "default-no-funding.yaml"
+        config_path=_default_config_without_signal_files(
+            tmp_path / "default-no-signals.yaml"
         ),
         pages=2,
         total_timesteps=200,
@@ -436,24 +436,47 @@ def test_load_train_config_empty_when_no_candidate_exists(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# the shipped default's funding channel
+# the shipped default's signal channels
 # ---------------------------------------------------------------------------
-# `configs/default.yaml` configures
-# `~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl`, and the
-# merge seam now refuses a *configured* path it cannot resolve — naming the
-# key, the value as written and the expanded path.  That is the intended
-# behaviour, but these tests are about the training orchestration, not about
-# the funding channel, so they are handed a copy of the shipped config with
-# that ONE key nulled (`null` = off = silent).  The funding channel is covered
-# for real — fake `HOME`, a `~`-spelled path, and the seam asserted to have
-# *consumed* the file — in `tests/test_rl_signal_config_wiring.py`.
-def _default_config_without_funding(dest: Path) -> Path:
-    """Write a copy of ``configs/default.yaml`` with funding_features_file null."""
+# `configs/default.yaml` configures three signal files under
+# `~/Projects/kraken-trading-bot/signals/`, and the merge seam refuses a
+# *configured* path it cannot resolve — naming the key, the value as written
+# and the expanded path.  That is the intended behaviour (and is itself
+# pinned, by `tests/test_gc_channel_activation.py::
+# test_non_null_key_without_a_file_refuses`), but these tests are about the
+# training orchestration, not about the channels, so they are handed a copy of
+# the shipped config with those keys nulled (`null` = off = silent).  The
+# channels are covered for real — fake `HOME`, a `~`-spelled path, and the
+# seam asserted to have *consumed* the file — in
+# `tests/test_rl_signal_config_wiring.py` and `tests/test_rl_data_store.py`.
+def _default_config_without_signal_files(dest: Path) -> Path:
+    """Write a copy of ``configs/default.yaml`` with all three channel keys null.
+
+    The shipped config configures three signal files under
+    `~/Projects/kraken-trading-bot/signals/`, and that directory is
+    gitignored (.gitignore:65), so on any checkout without the timers
+    installed the merge seam refuses a *configured* path it cannot resolve
+    (naming the key, the raw value and the expanded path).  That refusal is
+    the intended behaviour — it is what
+    ``tests/test_gc_channel_activation.py::test_non_null_key_without_a_file_refuses``
+    pins — but these tests are about the training orchestration, not about the signal
+    channels, so they run against the shipped config with those keys nulled.
+    ``null`` means off and is silent, which is precisely the distinction the
+    non-null branch exists to make.  All three channels are covered for real
+    (fake ``HOME``, a ``~``-spelled path, and the seam asserted to have
+    *consumed* the file) in ``tests/test_rl_signal_config_wiring.py`` and
+    ``tests/test_rl_data_store.py``.
+    """
     repo = Path(__file__).resolve().parents[1]
     cfg = yaml.safe_load(
         (repo / "configs" / "default.yaml").read_text(encoding="utf-8")
     )
-    cfg["funding_features_file"] = None
+    for key in (
+        "extra_features_file",
+        "funding_features_file",
+        "social_features_file",
+    ):
+        cfg[key] = None
     dest.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return dest
 
@@ -483,8 +506,8 @@ def test_train_ticker_records_n_features_in_config(tmp_path):
         "ETH/USD",
         "ppo_width",
         manager=OneShotManager(),
-        config_path=_default_config_without_funding(
-            tmp_path / "default-no-funding.yaml"
+        config_path=_default_config_without_signal_files(
+            tmp_path / "default-no-signals.yaml"
         ),
         pages=2,
         total_timesteps=150,
@@ -536,8 +559,8 @@ def test_backtest_refuses_a_stale_width(tmp_path, monkeypatch):
         "ETH/USD",
         "ppo_stale",
         manager=OneShotManager(),
-        config_path=_default_config_without_funding(
-            tmp_path / "default-no-funding.yaml"
+        config_path=_default_config_without_signal_files(
+            tmp_path / "default-no-signals.yaml"
         ),
         pages=2,
         total_timesteps=150,

@@ -16,7 +16,9 @@ or credentials.
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -850,3 +852,406 @@ def test_the_full_precedence_order_is_still_what_the_message_claims():
     assert _resolve("market_data_store", {}, {"market_data_store": "/run/store"}, record, default) == "/run/store"
     assert _resolve("market_data_store", {}, {}, record, default) == "/m/store"
     assert _resolve("market_data_store", {}, {}, {}, default) == "/default/store"
+
+
+# ---------------------------------------------------------------------------
+# G-C activation: the news + social channels are now non-null in
+# configs/default.yaml, so the seam has to carry all six of their columns
+# (AC1), the widening has to be a DELTA and the freshness pair must not
+# stack (AC2), and a fresh clone with no signal file must refuse loudly
+# (AC7).  The merge mechanism itself is already covered above at lines
+# 263/322/350/391/460/472/608 — only the ACTIVATION is new.
+# ---------------------------------------------------------------------------
+
+# The exact column set each channel contributes, and nothing else.  Kept as
+# two literals rather than derived from the producer files so the guard
+# states the contract instead of restating whatever the code happens to do.
+_NEWS_COLUMNS = {"sentiment_score", "article_count", "novelty_flag"}
+_SOCIAL_COLUMNS = {"stt_mention_count", "stt_tilt", "fng_index"}
+_FRESHNESS_COLUMNS = {"signal_observed", "signal_age_hours"}
+
+
+def _signal_jsonl(path, records) -> str:
+    path.write_text(
+        "".join(json.dumps(r, sort_keys=True) + "\n" for r in records),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def _hourly_records(bars: int, start_hour: int = 12) -> list[str]:
+    return [f"2026-08-01T{hour:02d}:00:00Z" for hour in range(start_hour, start_hour + bars)]
+
+
+def _news_file(tmp_path, bars: int = 6, start_hour: int = 12, **overrides) -> str:
+    records = [
+        {
+            "ticker": "ETH/USD",
+            "timestamp": ts,
+            "sentiment_score": 0.1 * i,
+            "article_count": 5 + i,
+            "novelty_flag": bool(i % 2),
+        }
+        for i, ts in enumerate(_hourly_records(bars, start_hour))
+    ]
+    for record in records:
+        record.update(overrides)
+    return _signal_jsonl(tmp_path / "news.jsonl", records)
+
+
+def _social_file(tmp_path, bars: int = 6, start_hour: int = 12, **overrides) -> str:
+    records = [
+        {
+            "ticker": "ETH/USD",
+            "timestamp": ts,
+            "stt_mention_count": 10 + i,
+            "stt_tilt": 0.25,
+            "fng_index": 40 + i,
+        }
+        for i, ts in enumerate(_hourly_records(bars, start_hour))
+    ]
+    for record in records:
+        record.update(overrides)
+    return _signal_jsonl(tmp_path / "social.jsonl", records)
+
+
+def _funding_file(tmp_path, bars: int = 6, start_hour: int = 12) -> str:
+    """The real funding record shape, bid/ask included.
+
+    bid/ask matter: they are `_SIGNAL_COLUMNS` members and the microstructure
+    builder turns them into `spread`, so a funding file WITHOUT them measures a
+    different width than the shipped one does.
+    """
+    records = [
+        {
+            "ticker": "ETH/USD",
+            "timestamp": ts,
+            "funding_rate": 0.0001,
+            "basis": 0.0002,
+            "open_interest": 5000.0,
+            "funding_rate_prediction": 0.0003,
+            "vol24h": 42000.5,
+            "bid": 1000.0,
+            "ask": 1000.4,
+        }
+        for ts in _hourly_records(bars, start_hour)
+    ]
+    return _signal_jsonl(tmp_path / "funding.jsonl", records)
+
+
+# --- AC1: the seam carries all six columns, by name ----------------------
+def test_news_merge_adds_exactly_the_three_news_columns(tmp_path) -> None:
+    """AC1, by set equality: the columns ADDED are exactly these three.
+
+    Not `len(added) == 3` — a rename that kept the count would pass that, and
+    then `sentiment_score` would silently read 0.0 forever at unchanged
+    width, which is the whole failure class this gap was found by.
+    """
+    base = _ohlc_frame(6)
+    merged = merge_extra_features(base.copy(), _news_file(tmp_path), ticker="ETH/USD")
+
+    added = set(merged.columns) - set(base.columns)
+    missing = _NEWS_COLUMNS - added
+    unexpected = added - _NEWS_COLUMNS - _FRESHNESS_COLUMNS
+    assert not missing and not unexpected, (
+        "merge did not add expected columns; "
+        f"missing={missing}, unexpected={unexpected}"
+    )
+    # ...and the freshness pair rides along, because the same seam writes it.
+    assert _FRESHNESS_COLUMNS <= added
+
+
+def test_social_merge_adds_exactly_the_three_social_columns(tmp_path) -> None:
+    """AC1 for the social channel, same set-equality shape."""
+    base = _ohlc_frame(6)
+    merged = merge_extra_features(base.copy(), _social_file(tmp_path), ticker="ETH/USD")
+
+    added = set(merged.columns) - set(base.columns)
+    missing = _SOCIAL_COLUMNS - added
+    unexpected = added - _SOCIAL_COLUMNS - _FRESHNESS_COLUMNS
+    assert not missing and not unexpected, (
+        "merge did not add expected columns; "
+        f"missing={missing}, unexpected={unexpected}"
+    )
+
+
+def test_the_news_producer_key_spelling_is_accepted(tmp_path) -> None:
+    """The live producer writes `ETH_USD`; the config says `ETH/USD`.
+
+    Measured on a real pull, so this is a pinned fact rather than a guess:
+    `_canonical_ticker` is separator-free (`data.py:486-492`), so both
+    spellings are the same ticker.  If that ever changes, the news channel
+    would start raising `SignalTickerMismatchError` on every read, and this
+    is where it should be noticed.
+    """
+    records = [
+        {"ticker": "ETH_USD", "timestamp": ts, "sentiment_score": 0.5}
+        for ts in _hourly_records(6)
+    ]
+    merged = merge_extra_features(
+        _ohlc_frame(6), _signal_jsonl(tmp_path / "underscore.jsonl", records),
+        ticker="ETH/USD",
+    )
+    assert merged["sentiment_score"].iloc[-1] == pytest.approx(0.5)
+
+
+# --- AC2: the widening is a delta, and freshness does not stack -----------
+def _width(frame: pd.DataFrame) -> int:
+    """Observation width for this repo's shipped feature configuration.
+
+    Mirrors `configs/default.yaml` (feature_windows [1,4,24], all five groups)
+    and goes through `add_derived_ohlcv_features` first, because omitting that
+    is the F-15 trap: the derived columns are computed at the read seam and
+    the pipeline gates on their presence.
+    """
+    derived = add_derived_ohlcv_features(frame.copy().reset_index())
+    derived = derived.set_index(derived.columns[0])
+    pipe = FeaturePipeline(windows=[1, 4, 24])
+    return int(pipe.compute(derived).shape[1])
+
+
+def _width_fixture(bars: int = 200) -> pd.DataFrame:
+    """200 synthetic hourly bars with a real vwap and a varying count.
+
+    Flat closes make every technical indicator degenerate and a constant
+    count makes the trade-count z-score identically 0, either of which lets
+    a broken wiring pass unnoticed.
+    """
+    rng = np.random.default_rng(17)
+    closes = 3000.0 * np.exp(np.cumsum(rng.normal(0.0, 0.002, bars)))
+    index = pd.date_range("2026-01-01T00:00:00Z", periods=bars, freq="1h")
+    return pd.DataFrame(
+        {
+            "open": closes * 0.999,
+            "high": closes * 1.004,
+            "low": closes * 0.996,
+            "close": closes,
+            "vwap": closes * 1.0005,
+            "volume": rng.uniform(100.0, 1000.0, bars),
+            "count": rng.integers(50, 200, bars).astype(float),
+        },
+        index=index,
+    )
+
+
+def test_width_delta_equals_the_newly_reachable_signal_columns(tmp_path) -> None:
+    """AC2: delta(funding -> funding+news+social) == newly-reachable count.
+
+    The expected number is COMPUTED from the column sets, never hardcoded,
+    and that is the whole point of this test.  Two different fixtures give
+    two different right answers — 6 with the funding channel already active
+    (the shipped default: funding has already introduced the freshness
+    pair) and 8 without it (each channel costs 3 signal columns plus the
+    freshness pair, and the pair does not stack) — so a literal 6 here would
+    be a test that only passes on the configuration it was written against.
+
+    For the same reason this never asserts an absolute width.  The absolute
+    number is per-configuration (49–66 across everything measured this
+    project) and depends on whether the frame happens to carry native
+    bid/ask, so pinning it would pin a coincidence.
+    """
+    fixture = _width_fixture(200)
+    # Built from the index, not from f"{h:02d}": 200 hourly stamps run past
+    # midnight on day two, and "2026-01-01T24:00:00Z" is not a timestamp.
+    hour = [ts.strftime("%Y-%m-%dT%H:%M:%SZ") for ts in fixture.index]
+
+    def fund_records():
+        return [
+            {"ticker": "ETH/USD", "timestamp": ts, "funding_rate": 0.0001,
+             "basis": 0.0002, "open_interest": 5000.0,
+             "funding_rate_prediction": 0.0003, "vol24h": 42000.5,
+             "bid": 3000.0, "ask": 3000.4}
+            for ts in hour
+        ]
+
+    def news_records():
+        return [
+            {"ticker": "ETH/USD", "timestamp": ts, "sentiment_score": 0.1,
+             "article_count": 5, "novelty_flag": False}
+            for ts in hour
+        ]
+
+    def social_records():
+        return [
+            {"ticker": "ETH/USD", "timestamp": ts, "stt_mention_count": 10,
+             "stt_tilt": 0.25, "fng_index": 40}
+            for ts in hour
+        ]
+
+    funding = _signal_jsonl(tmp_path / "f.jsonl", fund_records())
+    news = _signal_jsonl(tmp_path / "n.jsonl", news_records())
+    social = _signal_jsonl(tmp_path / "s.jsonl", social_records())
+
+    # --- the shipped-default axis: funding already active -----------------
+    with_funding = merge_extra_features(
+        fixture.copy(), funding, ticker="ETH/USD", max_age_hours=12
+    )
+    w_funding = _width(with_funding)
+    all_three = with_funding
+    for path in (news, social):
+        all_three = merge_extra_features(
+            all_three.copy(), path, ticker="ETH/USD", max_age_hours=12
+        )
+    w_all = _width(all_three)
+
+    # Derive the expectation from the column sets, not from a literal.
+    new_signal_columns = _NEWS_COLUMNS | _SOCIAL_COLUMNS
+    already_present = set(with_funding.columns)
+    expected = len(new_signal_columns - already_present) + len(
+        _FRESHNESS_COLUMNS - already_present
+    )
+    delta = w_all - w_funding
+    assert delta == expected, (
+        "funding+news+social delta != number of newly reachable signal "
+        f"columns; delta={delta}, expected={expected} "
+        f"(baseline columns already carrying: "
+        f"{sorted((new_signal_columns | _FRESHNESS_COLUMNS) & already_present)})"
+    )
+
+    # The freshness pair does not stack: three merges, one of each column.
+    assert list(all_three.columns).count("signal_observed") == 1, (
+        "signal_observed stacked across merges: "
+        f"{list(all_three.columns).count('signal_observed')} copies"
+    )
+    assert list(all_three.columns).count("signal_age_hours") == 1, (
+        "signal_age_hours stacked across merges: "
+        f"{list(all_three.columns).count('signal_age_hours')} copies"
+    )
+
+    # --- the no-funding axis, to prove the expectation is really derived ---
+    # Same news+social merge onto a frame with no funding at all: the
+    # freshness pair is new here, so the expected delta is 8, not 6.  If the
+    # test were hardcoding 6, this second half would fail; if the *merge* were
+    # wrong, the first half would.
+    bare = fixture.copy()
+    for path in (news, social):
+        bare = merge_extra_features(
+            bare.copy(), path, ticker="ETH/USD", max_age_hours=12
+        )
+    # The baseline here is the same frame with no signal file at all.
+    bare_delta = _width(bare) - _width(fixture.copy())
+    bare_expected = len(_NEWS_COLUMNS | _SOCIAL_COLUMNS | _FRESHNESS_COLUMNS)
+    assert bare_delta == bare_expected, (
+        "without funding active the two channels cost their own 6 columns "
+        f"PLUS the freshness pair; delta={bare_delta}, expected={bare_expected}"
+    )
+
+
+def test_all_six_signal_columns_are_allow_listed(tmp_path) -> None:
+    """Both channels' columns survive `_SIGNAL_COLUMNS`, and none is a builder input.
+
+    A name absent from the allow-list is dropped by the seam *before* the
+    feature pipeline sees the frame; a name wrongly in
+    `_SIGNAL_BUILDER_INPUT_COLUMNS` reaches the frame but never the
+    observation.  Both are at unchanged width, so neither is visible to
+    `check_feature_width`.
+    """
+    from kraken_trading_bot.rl.features import (
+        _SIGNAL_BUILDER_INPUT_COLUMNS,
+        _SIGNAL_COLUMNS,
+    )
+
+    assert _NEWS_COLUMNS <= set(_SIGNAL_COLUMNS)
+    assert _SOCIAL_COLUMNS <= set(_SIGNAL_COLUMNS)
+    assert _FRESHNESS_COLUMNS <= set(_SIGNAL_COLUMNS)
+    assert not (_NEWS_COLUMNS | _SOCIAL_COLUMNS) & set(_SIGNAL_BUILDER_INPUT_COLUMNS)
+
+
+# --- AC7: a non-null key with no file is a refusal, not a silent skip ----
+def test_non_null_key_without_a_file_refuses(tmp_path) -> None:
+    """AC7.  `signals/` is gitignored (.gitignore:65), so THIS is the fresh clone.
+
+    Asserted as the *specific* class, not "raises": a bare FileNotFoundError
+    from an unrelated open() would satisfy a generic `pytest.raises` while
+    telling the operator nothing about which config key is at fault.  The
+    message has to name the key, the value as written, and the expanded path.
+    """
+    from kraken_trading_bot.rl import SignalFileNotFoundError
+
+    missing = tmp_path / "signals" / "eth_usd_news.jsonl"
+    assert not missing.exists(), "the fixture must start from the fresh-clone state"
+
+    with pytest.raises(SignalFileNotFoundError) as excinfo:
+        merge_extra_features(_ohlc_frame(6), str(missing), ticker="ETH/USD",
+                             config_key="extra_features_file")
+    message = str(excinfo.value)
+    assert "extra_features_file" in message
+    assert str(missing) in message, "the EXPANDED path must be named, not the raw value"
+    assert "--append" in message, (
+        "the refusal should point at the producer command that creates the "
+        f"file, which now carries --append: {message}"
+    )
+
+
+def test_the_shipped_default_declares_all_three_channels_non_null() -> None:
+    """The activation itself: `configs/default.yaml` points at real files.
+
+    Without this, the seam is perfect and nothing feeds it — which is exactly
+    the gap: the merge tests above have always passed while both channels sat
+    at `null` in the shipped config.
+    """
+    import yaml
+
+    repo = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((repo / "configs" / "default.yaml").read_text())
+    for key in ("extra_features_file", "funding_features_file", "social_features_file"):
+        value = config[key]
+        assert isinstance(value, str) and value, (
+            f"{key} is {value!r}: a null key switches the channel off silently, "
+            "which is how this gap stayed invisible"
+        )
+        assert value.endswith(".jsonl"), f"{key} must name a JSONL file, got {value!r}"
+
+
+def test_the_shipped_default_channel_files_agree_with_the_timer_units() -> None:
+    """The config's paths and the units' generated ExecStart are one spelling.
+
+    Drift here is invisible until the timer fires: the unit would append to a
+    file nothing reads, and the read would keep raising SignalFileNotFoundError
+    against a file that is being filled perfectly.
+
+    The unit is generated, so this generates it too — same `sed` the
+    `news-timer` / `social-timer` recipes run, with the same default the
+    recipe declares — rather than string-matching the template, whose
+    `--output @OUTPUT@` says nothing about where the bytes land.
+    """
+    import re
+
+    import yaml
+
+    repo = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((repo / "configs" / "default.yaml").read_text())
+    justfile = (repo / "justfile").read_text(encoding="utf-8")
+
+    pairs = (
+        ("extra_features_file", "news", "systemd/kraken-trading-bot-news.service.in"),
+        (
+            "social_features_file",
+            "social",
+            "systemd/kraken-trading-bot-social.service.in",
+        ),
+        (
+            "funding_features_file",
+            "funding",
+            "systemd/kraken-trading-bot-funding.service.in",
+        ),
+    )
+    for key, recipe, unit in pairs:
+        # The output the *timer* recipe defaults to, i.e. what an operator who
+        # ran `just <recipe>-timer` with no arguments actually gets.
+        default = re.search(rf'^{recipe}-timer\b.*?output="([^"]+)"', justfile, re.M | re.S)
+        assert default, f"justfile has no {recipe}-timer recipe with an output default"
+
+        template = (repo / unit).read_text(encoding="utf-8")
+        generated = template.replace("@TICKER@", "ETH/USD").replace(
+            "@OUTPUT@", str(repo / default.group(1))
+        )
+        written = re.search(r"--output ([^\s]+)", generated)
+        assert written, f"{unit} generates no --output path"
+
+        configured = Path(config[key]).name
+        assert Path(written.group(1)).name == configured, (
+            f"{key} is {configured!r} but `just {recipe}-timer` generates a unit "
+            f"that writes {Path(written.group(1)).name!r} — the timer would fill "
+            "a file nobody reads"
+        )

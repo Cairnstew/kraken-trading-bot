@@ -154,8 +154,13 @@ _TICKER_FIELD = "ticker"
 _SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
     (
         "extra_features_file",
-        "python ~/Projects/ticker-news-signals/cli.py pull --ticker <PAIR> "
-        "--output <path>",
+        # Not `python .../cli.py`: that repo's cli.py imports gnews, which
+        # is not on THIS flake's PYTHONPATH, so the documented invocation
+        # cannot run in this dev shell.  Its own flake can.  `--append`
+        # is required because the default lookback is 1 hour — see
+        # configs/default.yaml and justfile (`just news-pull`).
+        "nix run ~/Projects/ticker-news-signals#ticker-news-signals -- "
+        "pull --ticker <PAIR> --output <path> --append",
     ),
     (
         "funding_features_file",
@@ -171,8 +176,11 @@ _SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
     ),
     (
         "social_features_file",
-        "python ~/Projects/kraken-social-signals/cli.py pull --ticker <PAIR> "
-        "--output <path>",
+        # Same correction as the news channel: `python .../cli.py` needs
+        # this sibling's own flake, and `--append` is what keeps the file a
+        # growing log instead of a sliding 24h window.  `just social-pull`.
+        "nix run ~/Projects/kraken-social-signals#kraken-social-signals -- "
+        "pull --ticker <PAIR> --output <path> --append",
     ),
 )
 
@@ -638,12 +646,19 @@ def merge_extra_features(
        explicitly one-ticker file: it is merged unchanged at WARNING, which
        keeps pre-ticker-tagged files and the documented one-ticker cron
        working.  ``require_ticker=False`` opts out of the filter entirely.
-    2. **De-duplicated hours** — the sibling's documented hourly cron
-       re-appends the current hour on every pull, so the floored index
-       repeats.  Records are de-duplicated on the raw timestamp and then
-       collapsed to one per floored hour (last write wins, i.e. the most
-       recent pull), which is what stops the reindex from raising
-       ``ValueError: cannot reindex on an axis with duplicate labels``.
+    2. **De-duplicated hours** — an hourly pull re-appends the current hour
+       on every fire (the systemd units pass ``--append``; a
+       ``Persistent=true`` catch-up inside one hour appends a second line
+       for it), so the floored index repeats.  Records are de-duplicated on
+       the raw timestamp and then collapsed to one per floored hour (last
+       write wins, i.e. the most recent pull), which is what stops the
+       reindex from raising ``ValueError: cannot reindex on an axis with
+       duplicate labels``.  Note this is also what makes appending safe to
+       *recommend*: a repeated hour is discarded here, so the producers can
+       append unconditionally rather than trying to be clever about which
+       hours they already hold.  (A producer that REPLACES its file instead
+       is a different bug — one that loses history rather than repeating a
+       row — and it is why both siblings take ``--append`` explicitly.)
     3. **Bounded carry + freshness** — a reading is forward-filled for at
        most ``max_age_hours`` (default: one hour, derived from the bar
        interval), never unboundedly, and ``signal_age_hours`` /

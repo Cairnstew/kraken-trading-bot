@@ -227,9 +227,23 @@ failing the pipeline:
 
 | Configuration | Width |
 |---|---|
-| Neither the OHLCV `vwap`/`count` columns nor a funding file | **49** (unchanged) |
-| OHLCV `vwap`/`count` present, no funding file | **52** |
-| Funding file present (the shipped `configs/default.yaml`) | **60** |
+| Neither the OHLCV `vwap`/`count` columns nor any signal file | **49** (unchanged) |
+| OHLCV `vwap`/`count` present, no signal file | **52** |
+| Funding file present | **60** |
+| Funding + news + social — the shipped `configs/default.yaml` | **66** |
+
+Those numbers are for one stated fixture (200 synthetic hourly bars,
+`add_derived_ohlcv_features` applied, i.e. the real read seam), and they are
+a **table, not a contract**: the width depends on the configuration and on
+whether the frame happens to carry native `bid`/`ask`. What is contractual is
+the **delta** — measured against the same fixture with the channels off —
+and `tests/test_rl_data_store.py::
+test_width_delta_equals_the_newly_reachable_signal_columns` asserts that,
+*computing* the expected number from the column sets rather than hardcoding
+it. Two fixtures give two different right answers: **+6** with the funding
+channel already active (the shipped default — funding has already introduced
+the freshness pair) and **+8** without it. A test pinned to `6` would only
+pass on the configuration it was written against.
 
 The jump from 49 to 60 is not all new work: it is six columns derived
 from data the pipeline already carried but that no builder read —
@@ -285,6 +299,55 @@ entirely on how deep the funding file is:
 So on a backfilled file the bound cannot change the observation at all —
 every bar carries its own record. It still earns its keep on a shallow file
 and for any pre-existing model that relies on the carry across missed pulls.
+
+### The news and social channels
+
+`configs/default.yaml` now points `extra_features_file` and
+`social_features_file` at two sibling CLIs' output as well, for a **+6**
+delta over the funding-only width:
+
+| Channel | Columns | Producer |
+|---|---|---|
+| news | `sentiment_score`, `article_count`, `novelty_flag` | `just news-pull` |
+| social | `stt_mention_count`, `stt_tilt`, `fng_index` | `just social-pull` |
+
+```bash
+# Seed both files by hand (keyless on both legs):
+just news-pull      # Google News RSS, VADER-scored
+just social-pull    # StockTwits v2 + alternative.me Fear & Greed
+
+# ...or let the user timers do it: hourly at :23 and :29.
+just news-timer     # links + enables systemd/kraken-trading-bot-news.{service,timer}
+just social-timer   # links + enables systemd/kraken-trading-bot-social.{service,timer}
+```
+
+Three minutes — `:17` funding, `:23` news, `:29` social — so no two producers
+hit the network in the same window; the funding timer carries
+`RandomizedDelaySec=120`, which is why the gap is six and not two.
+
+**`--append` is what makes these files a log.** Each producer *replaces* its
+output file by default, and its default lookback window is one hour (news) or
+a sliding 24 hours (social). An hourly pull without `--append` therefore
+rewrites the whole history to one window every hour, and the loss is silent
+because the file still parses. Both units pass the flag, and both producers
+now warn on stderr when they replace a file that already holds records.
+
+**On a fresh clone all three keys raise.** `signals/` is gitignored, so a
+checkout with no timers installed has no signal files, and a non-null key is a
+*declared intent to use that channel*: `SignalFileNotFoundError` names the
+key, the value as written, the expanded path and the command that produces
+it. Populate the files with the `*-pull` recipes, or set a key to `null` to
+switch that channel off silently.
+
+Two honest caveats, neither of which a schedule fixes: `stt_tilt` is
+permanently `0.0` on the live StockTwits v2 feed (0 of 30 sampled messages
+carry a `sentiment` key), and `novelty_flag` is dead at hourly cadence
+(its window is 15 minutes against a 60-minute sampler). Zero-variance
+columns normalise to exactly `0.0`, so neither reaches the observation as a
+NaN. **+6 width, +4 usable** is the honest headline. News is also
+*market-wide* rather than ticker-specific — the producer merges a symbol
+search with a whole-category crypto pull — so two tickers' news files would
+be near-duplicates.
 
 **The width is guarded.** `train` records `n_features` in each model's
 `config.yaml` (`kraken-trading-bot models --json` surfaces it), and
