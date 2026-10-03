@@ -48,6 +48,43 @@ def _synthetic_ohlcv(n: int = 300, base: float = 2000.0, seed: int = 42) -> pd.D
     )
 
 
+def _store_shaped_frame(
+    n: int = 320, seed: int = 7, zero_volume_at: int = 220
+) -> pd.DataFrame:
+    """OHLCV carrying a ZERO-VOLUME bar mid-series — the store's hole shape.
+
+    The store frame differs from the live one in exactly this way: a bar
+    with no trades. ``data.py`` turns a zero denominator into NaN with
+    ``.replace(0, np.nan)``, so the zero volume becomes an **interior**
+    NaN rather than a leading warm-up one.
+
+    That distinction is load-bearing, and it is the whole reason this
+    fixture exists. On the live frame the warm-up NaNs form one LEADING
+    block with nothing earlier to carry forward from, so ``ffill()`` and
+    ``fillna(0.0)`` are numerically IDENTICAL (measured max abs diff 0.0
+    across all 49 columns) and no behavioural test can tell them apart.
+    Here there IS an earlier value to carry, so the two fills genuinely
+    disagree — measured max abs diff **0.3136** on ``volume_change_1`` at
+    the two rows around the hole.
+
+    ``zero_volume_at`` is an index into ``n`` bars of the FULL frame.
+    ``prepare_episode`` keeps the LAST ``episode_bars``, so the default of
+    220 sits mid-window for the 200-bar episode; 180 would fall outside it
+    and the frame would silently degrade back to leading-only NaN.
+    """
+    rng = np.random.default_rng(seed)
+    close = 2000.0 * np.exp(np.cumsum(rng.normal(0.00005, 0.01, n)))
+    open_ = np.concatenate([[close[0]], close[:-1]])
+    high = np.maximum(open_, close) * (1.0 + rng.uniform(0.0, 0.005, n))
+    low = np.minimum(open_, close) * (1.0 - rng.uniform(0.0, 0.005, n))
+    volume = rng.uniform(50.0, 200.0, n)
+    volume[zero_volume_at] = 0.0  # the hole: a bar with no trades
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close, "volume": volume},
+        index=pd.date_range("2024-01-01", periods=n, freq="h"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # environment basics
 # ---------------------------------------------------------------------------
@@ -756,50 +793,75 @@ def test_presence_gating_survives_the_warmup_fix():
 
 
 
-#: Every file/line that writes out the observation-frame convention by
-#: hand. There is no shared helper; the constant ``ffill().fillna(0.0)``
-#: is repeated at each. Used by the drift guard below.
+#: Every file that writes out the observation-frame convention by hand, with
+#: the expression and how many times it must appear. There is no shared
+#: helper; the constant ``ffill().fillna(0.0)`` is repeated at each. Six
+#: sites, not five — see the note on ``environment.py`` below.
+#:
+#: Counting rather than mere presence is deliberate: a presence check passes
+#: just as happily when a SEVENTH consumer joins the convention, which is
+#: exactly the drift this is here to catch. ``features.py`` legitimately
+#: holds two (fit and transform) and ``environment.py`` two (the pipeline
+#: route and the no-pipeline builtin route), which is why the counts are
+#: per-expression rather than per-file.
 _OBSERVATION_FRAME_SITES = (
-    ("kraken_trading_bot/rl/features.py", "self.compute(df).ffill().fillna(0.0)"),
-    ("kraken_trading_bot/rl/features.py", "self.compute(df).ffill().fillna(0.0)"),
-    ("kraken_trading_bot/rl/environment.py", "self._features.ffill().fillna(0.0)"),
-    ("kraken_trading_bot/rl/paper_trade.py", "computed.ffill().fillna(0.0)"),
-    ("kraken_trading_bot/rl/export.py", "computed.ffill().fillna(0.0)"),
+    # fit() and transform() — the same expression, written out twice.
+    ("kraken_trading_bot/rl/features.py", "self.compute(df).ffill().fillna(0.0)", 2),
+    # _raw_feature_array — the pipeline observation route.
+    ("kraken_trading_bot/rl/environment.py", "self._features.ffill().fillna(0.0)", 1),
+    # _builtin_features — the NO-PIPELINE observation route. Reachable and
+    # live: with feature_pipeline=None this matrix IS self._feature_matrix
+    # and _observe() indexes it directly, and tests/test_rl_validity.py
+    # exercises it (_BUILTIN_WARMUP = 24). An earlier version of this guard
+    # declared five sites and MISSED this one.
+    ("kraken_trading_bot/rl/environment.py", "pd.DataFrame(arr).ffill().fillna(0.0)", 1),
+    ("kraken_trading_bot/rl/paper_trade.py", "computed.ffill().fillna(0.0)", 1),
+    ("kraken_trading_bot/rl/export.py", "computed.ffill().fillna(0.0)", 1),
 )
 
 
 def test_the_observation_frame_expression_is_written_at_every_declared_site():
-    """The drift guard on the CONVENTION: five hand-written sites, one rule.
+    """A DRIFT TRIPWIRE ONLY — a text check, and nothing more.
 
-    The observation frame is ``compute`` then ``ffill`` then ``fillna(0)``,
-    and master writes that expression out at five places with no shared
-    helper. Nothing structurally stops a sixth site appearing, or one of
-    the five being edited to something else — and the pairwise tests would
-    not all notice, because each pins one consumer to ``transform`` rather
-    than pinning the five to EACH OTHER.
+    It asserts that the literal expression appears, with the expected
+    count, in each declared file. That is a statement about what the
+    SOURCE SAYS, not about what the code DOES. It is the same class of
+    check as the docstring script withdrawn from this suite: it can be
+    satisfied by text that is present but dead, and it cannot distinguish
+    a correct fill from a differently-spelled wrong one.
 
-    So this asserts the expression is present in each declared file. It is
-    deliberately a presence check, not a behaviour check: the behavioural
-    half is ``test_all_reachable_observation_routes_agree_row_for_row``
-    below, and ``PaperTrader._build_observation`` is pinned against
-    ``transform`` by ``test_built_observation_is_z_scored_by_saved_stats``
-    in ``tests/test_rl_paper_trade.py``.
+    Its one job is to fail LOUDLY when a new consumer joins the convention
+    or an existing one is edited away, so that a human extends the
+    behavioural guard rather than inheriting a silent gap. The behaviour
+    lives in the two tests below:
 
-    Adding a sixth site means adding a line here — which is the point.
-    The failure message names the file, so a new consumer cannot join the
-    convention without this test being extended to cover it.
+      * ``test_all_reachable_observation_routes_agree_row_for_row`` — the
+        live frame, four routes.
+      * ``test_every_observation_route_agrees_where_ffill_and_fillna_differ``
+        — a store-shaped frame whose interior NaN makes ``ffill`` and
+        ``fillna(0)`` genuinely different numbers, six routes.
+
+    ``PaperTrader._build_observation`` is pinned against ``transform`` by
+    ``tests/test_rl_paper_trade.py::test_built_observation_is_z_scored_by_saved_stats``.
+
+    KNOWN LIMIT, stated rather than hidden: this tripwire is the ONLY guard
+    on the builtin site (``environment.py`` ``_builtin_features``). The
+    builtin frame's NaN is leading-only even on a zero-volume frame, so
+    ``ffill`` and ``fillna(0)`` are numerically identical there and no
+    behavioural test can distinguish them. Presence is all that is
+    available for that one site.
     """
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    missing = []
-    for rel, expr in _OBSERVATION_FRAME_SITES:
-        src = (root / rel).read_text(encoding="utf-8")
-        if expr not in src:
-            missing.append(f"{rel}: {expr!r}")
-    assert not missing, (
-        "the observation-frame convention moved or lost a site: "
-        + "; ".join(sorted(set(missing)))
+    wrong = []
+    for rel, expr, expected in _OBSERVATION_FRAME_SITES:
+        found = (root / rel).read_text(encoding="utf-8").count(expr)
+        if found != expected:
+            wrong.append(f"{rel}: {expr!r} found {found}, expected {expected}")
+    assert not wrong, (
+        "the observation-frame convention moved, was lost, or gained a site: "
+        + "; ".join(sorted(wrong))
     )
 
 
@@ -912,3 +974,177 @@ def test_all_reachable_observation_routes_agree_row_for_row(monkeypatch):
     # And routes 2/3 are genuinely z-scored, not the raw heteroscaled
     # matrix — otherwise route1 == route4 would make this vacuous.
     assert not np.allclose(route3, route4)
+
+
+def test_every_observation_route_agrees_where_ffill_and_fillna_differ(monkeypatch):
+    """The drift guard that is BEHAVIOURAL, on a frame that can tell the fills apart.
+
+    The live-frame test above cannot catch a dropped ``ffill``: its warm-up
+    NaNs form one leading block, so ``ffill()`` and ``fillna(0.0)`` are the
+    same function there (measured max abs diff 0.0 across all 49 columns).
+
+    A store-shaped frame can. A zero-volume bar becomes an INTERIOR NaN via
+    ``.replace(0, np.nan)``, so there IS an earlier value to carry forward
+    and the two fills genuinely disagree — measured max abs diff **0.3136**
+    on ``volume_change_1`` at the two rows around the hole.
+
+    MEASURED MUTATION MATRIX — dropping ``.ffill()`` at each site, this
+    test alone:
+
+    ==========================================  ========
+    site                                        result
+    ==========================================  ========
+    ``features.py:642`` fit                     RED
+    ``features.py:740`` transform               RED
+    ``environment.py:488`` pipeline route       RED
+    ``environment.py:525`` builtin, ffill only  **green**
+    ``export.py:192``                           RED
+    ==========================================  ========
+
+    The one green cell is a real limit, not an oversight, and it is why the
+    text tripwire above is not optional: the builtin frame's NaN is
+    leading-only even here, so on that route ``ffill`` and ``fillna(0)`` are
+    numerically the same function. Removing the builtin site's fill
+    ENTIRELY is caught behaviourally (the finiteness assertion at the end
+    of this test goes red); dropping only the ``ffill`` half is caught by
+    the tripwire alone. See the KNOWN LIMIT note on that test.
+
+    Routes, all driven off ONE episode:
+
+      1. ``FeaturePipeline.fit``'s frame, reconstructed from the fitted stats
+      2. ``FeaturePipeline.transform``
+      3. ``TradingEnvironment._raw_feature_array``
+      4. the CSV export's feature block (PRE-transform frame, as below)
+
+    plus the fit site's MOMENTS pinned separately — route agreement is
+    structurally blind to that site, for the reason given inline.
+
+    ``PaperTrader._build_observation`` is the fifth pipeline site and
+    returns one row for a freshly-fetched window; it is pinned separately by
+    ``tests/test_rl_paper_trade.py::test_built_observation_is_z_scored_by_saved_stats``.
+
+    The no-pipeline builtin route (``environment.py`` ``_builtin_features``)
+    is a DIFFERENT feature set — 13 columns, not 49 — so it cannot be
+    compared row for row against the pipeline routes. It is asserted
+    finite here, which is the property the convention buys.
+    """
+    import kraken_trading_bot.rl.export as export_mod
+    from kraken_trading_bot.rl.export import build_export_frame
+
+    ticker, tid = "ETH/USD", normalize_ticker_id("ETH/USD")
+    pipe = FeaturePipeline(windows=(1, 4, 24))
+    episode = prepare_episode(
+        _store_shaped_frame(), pipe, ticker_id=ticker, episode_bars=200
+    )
+
+    # --- PRECONDITION: the frame must make the two fills DIFFER, or every
+    # comparison below is vacuous. Asserted, not assumed: this is what the
+    # live-frame test could not do.
+    computed = pipe.compute(episode)
+    assert int((episode["volume"] == 0).sum()) == 1, (
+        "the store fixture lost its zero-volume bar — without an interior "
+        "hole this test is vacuous, exactly as the live-frame one is"
+    )
+    hole = np.where((episode["volume"] == 0).to_numpy())[0]
+    assert 0 < hole[0] < len(episode) - 1, "the hole must be interior"
+
+    as_both = computed.ffill().fillna(0.0)
+    divergence = (as_both - computed.fillna(0.0)).abs()
+    differing = divergence.to_numpy() > 1e-9
+    assert differing.any(), (
+        "ffill() and fillna(0.0) agree on this frame, so dropping ffill at "
+        "any site would go unnoticed — the fixture has regressed to the "
+        "leading-only-NaN shape"
+    )
+    affected_cols = [computed.columns[j] for j in sorted(set(np.where(differing)[1]))]
+    assert "volume_change_1" in affected_cols, (
+        f"expected the hole to surface in volume_change_1, got {affected_cols}"
+    )
+
+    # --- Route 1 — what fit() used, reconstructed from the fitted stats.
+    stats = pipe.stats_for(tid)
+    assert stats is not None, "fit did not register stats for the ticker"
+    fitted_frame = as_both
+    route1 = stats.normalize(fitted_frame).to_numpy(dtype=np.float32)
+
+    # --- The FIT site, pinned separately, because route agreement is
+    # STRUCTURALLY BLIND to it. fit() feeds the STATS, and every route
+    # shares those stats, so dropping ffill there changes the stats and all
+    # routes still agree with each other. MEASURED: with ffill dropped from
+    # features.py:642 this whole test still PASSES. The fit site is caught
+    # elsewhere (the NonFiniteFeatureError blast radius, 61 tests red), but
+    # "caught somewhere" is not "caught here", so it gets its own assertion.
+    #
+    # The hole column is the one to use: it is the column the divergence
+    # surfaces in, so its mean moves measurably between the two fills.
+    hole_col = "volume_change_1"
+    mu_fitted = stats.stats[hole_col][0]
+    mu_ffilled = float(as_both[hole_col].mean())
+    mu_zeroed = float(computed.fillna(0.0)[hole_col].mean())
+
+    np.testing.assert_allclose(
+        mu_fitted, mu_ffilled, rtol=1e-6,
+        err_msg=(
+            f"fit() did not fit its moments on the ffilled frame for "
+            f"{hole_col}: got {mu_fitted!r}, ffilled frame means "
+            f"{mu_ffilled!r}"
+        ),
+    )
+    assert not np.isclose(mu_fitted, mu_zeroed, rtol=1e-6), (
+        f"fit()'s {hole_col} moments are indistinguishable from the "
+        f"zero-filled frame, so this assertion cannot tell the two fills "
+        f"apart on this fixture"
+    )
+
+    # --- Route 2 — transform.
+    route2 = pipe.transform(episode, ticker_id=tid)
+
+    # --- Route 3 — the environment's observation matrix.
+    env = TradingEnvironment(ticker, data=episode, feature_pipeline=pipe)
+    route3 = env._raw_feature_array()
+
+    for name, arr in (("transform", route2), ("environment", route3)):
+        assert arr.shape == route1.shape, f"{name} shape {arr.shape} != fit {route1.shape}"
+        np.testing.assert_allclose(
+            arr, route1, rtol=1e-5, atol=1e-6,
+            err_msg=(
+                f"the {name} route disagrees with the fitted observation frame "
+                f"on a store-shaped frame, where ffill and fillna(0) differ — "
+                f"so a dropped ffill is the likely cause"
+            ),
+        )
+
+    # --- Route 4 — the export's feature block is the PRE-transform frame
+    # (export.py writes `observed`, the ffilled matrix; its z_ block is
+    # route 2 by construction), so it compares against the frame itself,
+    # NOT the normalized matrix. Comparing across that boundary is a false
+    # red — measured max abs diff 2428 on `obv` when tried.
+    monkeypatch.setattr(
+        export_mod, "read_ohlc_dataframe", lambda *a, **k: episode.copy()
+    )
+    exported = build_export_frame(
+        "ETH_USD", config_path=None, pages=1, episode_bars=None
+    )
+    feature_cols = [c for c in fitted_frame.columns if c in exported.columns]
+    route4 = exported[feature_cols].to_numpy(dtype=np.float32)
+
+    assert route4.shape == fitted_frame.shape, (
+        f"export feature block {route4.shape} != observation frame "
+        f"{fitted_frame.shape}"
+    )
+    np.testing.assert_allclose(
+        route4, fitted_frame.to_numpy(dtype=np.float32), rtol=1e-5, atol=1e-6,
+        err_msg="the export's feature block disagrees with the observation frame",
+    )
+
+    # Guard against the comparison collapsing into vacuity: routes 2/3 are
+    # genuinely z-scored, not the raw heteroscaled matrix.
+    assert not np.allclose(route3, route4)
+
+    # --- The no-pipeline builtin route: different width, so only finiteness
+    # is assertable. The convention's whole purpose here is "no NaN ever
+    # reaches the observation".
+    builtin = TradingEnvironment(ticker, data=episode, feature_pipeline=None)
+    assert np.isfinite(builtin._feature_matrix).all(), (
+        "the no-pipeline observation route leaked non-finite values"
+    )
