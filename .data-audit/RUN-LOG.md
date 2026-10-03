@@ -755,3 +755,91 @@ this pass has been extending — my own commits modified `model_matrix.py` today
 
 **Conclusion: all three superseded. No hunk is missing from master.** The tags stay until
 this is approved for dropping.
+
+## 15. The three archive tags are dropped — shas recorded as the trail
+
+Per instruction, the three tags and their two branches are deleted. The tip shas are
+recorded here so the trail survives the refs going with them:
+
+| sha | subject | why superseded |
+|---|---|---|
+| `52271cb` | `feat(rl): data-pipeline CSV export (export-data) WIP` | Rebuilt, not merged: all 9 files present in master, all 3 exported symbols (`build_export_frame`, `write_export_csv`, `default_export_path`) present, `cmd_export_data` wired, and master's `test_rl_export.py` carries 11 tests against the 10 it shipped. |
+| `6ebe95e` | `fix(rl): apply the fitted normalization stats to the observation` | Behaviour carried by identical expressions at all five hand-written sites; invariant proven protected by mutation (§16); convention now drift-guarded by two tests. |
+| `94d03e2` | `tools: a benchmark-matrix harness that refuses unvalid comparisons` | The progenitor of master's harness: all 6 files and all 6 key symbols present, master larger on every axis (`model_matrix.py` 2917 vs 2279 lines; tests 114 vs 87). |
+
+`git worktree list` now lists master alone. Suite: **518 passed**.
+
+## 16. Was `6ebe95e`'s invariant actually protected? Two mutations, not a test count
+
+The coverage claim for its five tests rested on "different name, broader coverage" and on
+counts — and **a count is not coverage**. Settled by mutation.
+
+**Mutation 1 — is the invariant guarded at all?** Drop `.ffill().fillna(0.0)` from the
+`fit` site (`features.py:642`) so the moments are fitted on raw `compute(df)`:
+
+```
+61 failed, 438 passed, 17 errors   across 6 files
+```
+
+and that site's own symptom is precisely the NaN-warm-up one the convention exists to
+prevent:
+
+```
+NonFiniteFeatureError: Non-finite feature values (nan) at the fit stage for
+ticker 'ETH_USD': 237 cell(s) across 21 column(s) ['return_1', 'log_return_4',
+'price_ratio_sma_24', 'log_return_24', ...] (+13 more)
+```
+
+The named columns are exactly the rolling-window features that need look-back. **PROTECTED.**
+
+**Mutation 2 — can the convention drift silently?** The expression is hand-written at five
+sites with no shared helper, and no test drove all five off one frame. Two tests added
+(`c8aed16`):
+
+- `test_the_observation_frame_expression_is_written_at_every_declared_site` — mutated
+  (environment site → `fillna(0.0)`, `ffill` dropped) it goes RED:
+  `AssertionError: the observation-frame convention moved or lost a site:
+  kraken_trading_bot/rl/environment.py: 'self._features.ffill().fillna(0.0)'`. The
+  failure names file and expression; a sixth site means a new line here.
+- `test_all_reachable_observation_routes_agree_row_for_row` — drives fit / transform /
+  environment / export off ONE episode and asserts row-for-row equality.
+
+**Two findings recorded in the tests rather than smoothed over:**
+
+1. The export's feature block is the **pre-transform** frame (`export.py:204` writes
+   `observed`, the ffilled matrix; its `z_` block is route 2 by construction), so route 4
+   compares against the frame, not the normalized matrix. Measured max abs diff **2428** on
+   `obv` before that was corrected — comparing across the boundary is a false red.
+
+2. **MEASURED: on this frame `ffill()` and `fillna(0.0)` are numerically IDENTICAL** (max
+   abs diff **0.0** across all 49 columns), because the warm-up NaNs form one LEADING block
+   with nothing earlier to carry forward from. So dropping `ffill` from the *environment*
+   site leaves the behavioural test green — route 1 is rebuilt from `fitted_frame`, not read
+   back out of the environment. **The presence check is what catches that mutation**, plus
+   the 61-test blast radius at the fit site. A test asserting the two fills differ would be
+   asserting something false about this frame, and is deliberately absent.
+
+One stale-worktree run reported `30 deselected`, which was a failed collection rather than a
+passing filter. Discarded and re-run per **§8.1**, added earlier the same day.
+
+## 17. Push state — NOT pushed
+
+`79b2590` and its successors are **local only**. Nothing in this record describes any commit
+from this pass as pushed. The manual push is the user's and had not happened at the time of
+writing; `git rev-list --count origin/master..HEAD` counts local commits ahead, which is
+consistent with an unpushed branch.
+
+## 18. Open: ten stale `opencode/*` branches, NOT touched
+
+Removing the two named branches left **ten** stale ensemble branches registered. By
+patch-id, **seven** hold nothing new (CONTAINED), and **three** are genuinely uncontained:
+
+| sha | subject | assessment |
+|---|---|---|
+| `e57056d` | `fix: wire normalization.npz into the observation path (Candidate 1)` | Same normalisation wiring as `6ebe95d`'s family — master normalizes the observation (`stats.normalize` in `environment.py`) and carries the npz plumbing. **Almost certainly superseded**, but it was not in the approved scope and was not assessed hunk-by-hunk. |
+| `ab44f11` | `feat(rl): add extra_features_file seam for exogenous news signals` | The seam master shipped and then activated under G-C (`default.yaml` has `extra_features_file`; `data.py` has `merge_extra_features`). Almost certainly superseded. |
+| `4c65432` | `feat: export-data CLI + config default path fallback (prior WIP)` | Same family as `52271cb`. Almost certainly superseded. |
+
+**Not deleted.** The instruction named three commits and two branches; these are neither, and
+"almost certainly" is not the standard the rest of this cleanup was held to. They are cheap to
+assess (the §14 method) whenever that is wanted. `team_cleanup` remains uncalled.
