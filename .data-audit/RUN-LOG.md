@@ -578,3 +578,69 @@ would have added a sha without adding a safeguard.
 
 `configs/matrix.eth-single.yaml` (`210cfea`) and the code change (`8b220f6`) are cleanly
 separate, and neither contains any part of the pin decision.
+
+## 11. The other two reds, bisected to a commit — "pre-existing" gets a boundary
+
+Earlier this pass called `audit-findings` and `audit-evidence` "pre-existing", meaning
+only "not mine". That is too weak a word to leave in a record: it hides *when* they broke
+and *who* to ask. Both were re-run at every commit from the last recorded green
+(`06a9d2a`) forward through the six already-ahead commits:
+
+| commit | audit-findings | audit-evidence bad citations |
+|---|---|---|
+| `06a9d2a` | **PASS** | 9 |
+| `5b5ff99` | PASS | 9 |
+| `c6295be` | PASS | 9 |
+| `f6d9118` | PASS | 8 |
+| `7534ace` | PASS | 8 |
+| **`bbdbe56`** | **MISSING DISPOSITION: F-2..F-14, F-16** | **1** |
+| `b112184` | red | 1 |
+| `2f96a92` | red | 1 |
+| `316a55b` | red | 1 |
+
+**BOTH reds were introduced by `bbdbe56`** ("docs: data-pipeline pass 2026-10-03 — Phase 3
+decision"), which rewrote `DECISION.md`. So "pre-existing" now means something checkable:
+*introduced by `bbdbe56`, in the previous pass, not by the four commits here.*
+
+**What `bbdbe56` actually did to each check — the two are not the same kind of red.**
+
+- **`audit-findings`: a genuine regression.** The Phase 3 rewrite of `DECISION.md` carried
+  a fresh findings table (F-1, F-15) and dropped the decision-level disposition for F-2
+  through F-14 and F-16. The findings still exist; their dispositions no longer do. That is
+  the R5 defect class the check exists to catch, and it caught it. **This is a real defect
+  and needs 14 real dispositions** — fixed, deferred with a trigger, or rejected with a
+  reason. It is NOT to be made green by bulk-writing "deferred".
+
+- **`audit-evidence`: a wrong citation, and the test is NOT lost.** The check reports
+  `tests/test_gc_producer_append.py` cited at `DECISION.md:401` but absent from the repo.
+  Established rather than assumed: it is in **no commit** (`git log --all -- <path>` empty),
+  in **no stash**, and in **none of the eight leftover ensemble worktrees**. So it was never
+  written here — which matches what the spec itself says. `DECISION.md:401` reads "in each
+  sibling's own test suite, since the write code lives there", and both siblings do have
+  it: `~/Projects/ticker-news-signals/tests/test_export_append.py` and
+  `~/Projects/kraken-social-signals/tests/test_export_append.py`, six tests each, including
+  the RG1/RG2 sentinel guard (`test_two_appends_keep_the_first_file_intact`). **The guard
+  ran and passed; the citation points at a path in the wrong repo.** The fix is to correct
+  the citation and to record that a decision doc cited a test that was never there.
+
+  Worth stating plainly, because it changes what the number means: **`audit-evidence` was
+  never green in this chain.** At `06a9d2a` it reported 9 bad citations; those were
+  *cross-repo* paths (`client.py`, `kraken-python/kraken_api/transport.py`) that the
+  in-repo checker cannot resolve, not wrong claims. `bbdbe56` fixed 8 of those and traded
+  them for 1 that is genuinely wrong. The error count fell 9 → 1 while the underlying
+  honesty got better, which is exactly why "9 → 1" must not be read as "1 remains to fix".
+
+## 12. Closeout line — NOT READY, three documented reds
+
+**This is not a clean close-out and is not described as one anywhere.** As of `5492895`:
+
+| red | introduced by | kind |
+|---|---|---|
+| `measurement-track CHANGED` | `8b220f6` (this pass) | **EXPECTED** — additive change to `model_matrix.py`; estimator symbols proven unmoved, zero deletions vs `97a2a52` (§5b). Phase 7 item 3 scopes it to the estimator so it goes red only when the estimator moves. |
+| `audit-findings` — 14 missing dispositions | **`bbdbe56`** (previous pass) | **DEFECT** — Phase 3's `DECISION.md` rewrite dropped them. Needs 14 real dispositions. |
+| `audit-evidence` — 1 bad citation | **`bbdbe56`** (previous pass) | **DEFECT** — a citation to a test that was never in this repo; the real tests live in both siblings. |
+
+The two defects are a small fix pass, **not a Phase 7 deferral**, and they run in parallel
+with the G1 recorder rather than ahead of it — the recorder is the one with a data-loss
+clock. `audit-closeout` is re-run after that fix pass, and **only then** is READY written.
+Until then the status is: **not READY, three documented reds.**
