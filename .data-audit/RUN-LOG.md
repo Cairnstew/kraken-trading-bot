@@ -224,3 +224,264 @@ proposal: the close-out's four checks are already independent subcommands of one
 add a `just audit-all` that runs verify → findings → evidence → closeout in ONE
 `nix develop`, and a `just merge-verify <commit>` recipe wrapping the per-file loop, so
 the two repeated shapes stop costing a dev-shell entry each.
+
+---
+
+# RUN LOG — matrix-diagnose pass (2026-10-03)
+
+Appended after the audit-pipeline-1002 record above, which is closed. Nothing here is
+retrospective: the red run was captured before the fix, from a real failing cell.
+
+## 1. What was asked, and what was found
+
+A request for a tickers x algo x settings matrix with no Null/NaN. Three findings, in the
+order they surfaced:
+
+1. **The matrix harness already exists** — `tools/model_matrix.py`, three subcommands, a
+   worked spec. It was not missing; it was mis-used.
+2. **`RL_alg` does not exist and cannot.** `rl/agent.py` is a thin SB3 `PPO` wrapper.
+   `plan` already emits `no_algo_axis` saying so. Adding the axis would multiply cells and
+   return the same answer.
+3. **The shipped example spec could not run.** `configs/matrix.example.yaml` carries
+   `ticker: [ETH_USD, SOL_USD]`; all three signal channels in `configs/default.yaml` point
+   at ETH-only files with `signal_require_ticker: true`. Every SOL cell raises
+   `SignalTickerMismatchError` on the train leg. `plan` said nothing.
+
+## 2. RED RUN — the guard shown wrong on purpose (§8, RG6 precedent)
+
+The named defect: **a `SOL_USD` cell against the ETH-only news file.** RG6 requires the red
+run to show the *wrong* answer first, to prove the guard is real and not vacuous.
+
+Verbatim, BEFORE any change — `classify_process_failure` on a record `cmd_run` actually
+wrote (cell `524a56a0298b`, real stderr, not hand-built):
+
+```
+invalid_reasons : ['process_failed']
+[ERROR] kraken_trading_bot.cli: Training SOL_USD/mtx_524a56a0298b failed: Signal file
+/home/seanc/Projects/kraken-trading-bot/signals/eth_usd_news.jsonl holds no records for
+SOL/USD (contains: ETHUSD); point the signal file config key at a SOL/USD file or set
+signal_require_ticker: false to merge it unfiltered.
+Error training SOL_USD/mtx_524a56a0298b: Signal file ... holds no records for SOL/USD ...
+```
+
+The cause is legible in the text and the code was `process_failed` — what ANY failure
+returns. That is the defect: a code carrying no information.
+
+Verbatim, AFTER the clause, same spec re-run live:
+
+```
+INVALID: process_failed, signal_ticker_mismatch
+```
+
+## 3. Why a SEPARATE code, not a fold into `signal_file_not_found`
+
+The two send the reader to **opposite fixes**. A *missing* file means "run the producer"
+(`just news-pull`). A file that exists, parses, and is tagged for another pair means the
+*pointing* is wrong — you need that ticker's file, or `signal_require_ticker: false`.
+Folding them would send a reader to run a producer that already ran, producing nothing.
+
+Its real-CLI text carries **no class name** (`cli.py` prints `str(e)` only), so the clause
+matches `"holds no records for"` — the message opener, which appears in no other refusal —
+rather than the spelling. Same trap the existing docstring flags for
+`PinnedWindowUnavailableError`.
+
+## 4. Plan-time preflight — silence was the actual defect
+
+The classifier only improves the message *after* a cell has burned its train+backtest
+budget. `plan` now BLOCKERs the condition up front:
+
+```
+[BLOCKER] signal_ticker_mismatch
+    Cell ticker SOL_USD has no record in the configured signal file(s)
+    ['extra_features_file', 'funding_features_file', 'social_features_file'], which
+    carry ['ETHUSD']. ... the seam raises SignalTickerMismatchError on the train leg ...
+```
+
+`plan --strict` on the example spec: **exit 1**. On the corrected spec: **exit 0**.
+
+Written conservatively, so it cannot BLOCK a cell the run would accept — every escape
+hatch the seam honours is honoured here: a null/empty key is OFF; an **untagged** or
+**empty-tagged** file is a one-ticker file the seam merges with a WARNING; and
+`signal_require_ticker: false` turns it into a log line. An unreadable file is a
+*different* defect (`signal_file_not_found`) and downgrades to silence here. The ticker
+fold is re-implemented rather than imported, because the harness never imports the RL
+package; if the two copies ever drift, the failure mode is a missed warning, not a false
+BLOCKER.
+
+## 5. Verification was made non-vacuous by mutation, not by assertion
+
+The `assess_cell` table shows the guards firing on inputs I drove — which is the same
+self-certified green §5 of this record warns about. So each guard was deleted in a scratch
+copy and the suite re-run:
+
+| guard deleted | suite went red on |
+|---|---|
+| `signal_ticker_mismatch` clause | `assert 'signal_ticker_mismatch' in ['process_failed']` |
+| `nan_metric` check | `test_nan_metric_is_invalid[total_return]`, `[max_drawdown]`, `test_infinite_metric_is_invalid` |
+| the plan-time preflight BLOCKER | `test_a_ticker_absent_from_its_signal_file_is_blocked_at_plan_time`, and `plan --strict` on the example spec returned **exit 0** instead of 1 |
+
+The preflight check found a **real gap in my own work**: the first mutation run failed only
+`test_cli_plan_json_and_strict`, and on a `JSONDecodeError` — an incidental failure, not an
+assertion that the BLOCKER exists. Nothing tested the preflight. Eight tests were added for
+it, including the six escape hatches that keep it from producing a **false** BLOCKER (null
+key, untagged file, empty-tag file, `signal_require_ticker: false`, missing file, and the
+`XBT`→`BTC` alias). After that, the mutation produced the targeted failure naming the
+defect, and the six escape-hatch tests stayed green — proving they do not merely track the
+block being present.
+
+Full suite after all three changes: **516 passed**.
+
+## 5b. The audit gate went RED on this change — and that was correct
+
+`tools/model_matrix.py` **is** `MEASUREMENT_TRACK` in `tools/audit_checks.py:44`, pinned
+byte-identical to `--prereg`, and also AST-checked. So this work was always going to trip
+it, and did:
+
+```
+$ just audit-verify --prereg 97a2a52 --since 316a55b
+  measurement-track  CHANGED  tools/model_matrix.py byte-identical to prereg 97a2a52
+  ast-proof          SELF-TEST OK  (8 mutants detected correctly)
+  executable-ast     CHANGED  5/6 files unchanged since 316a55b (docs+strings blanked)
+                     differs: tools/model_matrix.py
+  suite              PASS  508 passed
+  RESULT             FAIL
+```
+
+**The guard working, not a regression.** `ast-proof SELF-TEST OK` is the load-bearing line:
+the detector caught 8/8 deliberate mutants, so this is not a false positive. `features.py`,
+`data_window.py`, `data.py` and `backtest.py` are all unchanged — the edit is confined to
+the measurement track and additive (+162 lines, no deletions). The dispersion estimator,
+`DISPERSION_RATIO_THRESHOLD` and `dispersion_verdict` are **untouched**, which is the
+property the pre-registration exists to protect.
+
+Width hash re-confirmed on the cached 721-bar frame, unchanged by any of this:
+
+```
+width-check  bars=721  features=60  start_index=24  usable=697
+  expect obs=93edc733  ->  MATCH
+  expect arr=6a88a379  ->  MATCH
+  nonfinite_obs_cells=0  arr_finite=True  insample_finite=True
+```
+
+The pin is therefore **stale, not broken**, and was moved deliberately in its own commit
+rather than loosened. `--prereg` is a per-invocation CLI argument, not stored state, so
+moving it is a matter of naming the new reference in the commit message and future
+invocations — nothing in the gate was edited to accommodate this change.
+
+### Where the pin lives, and what "moving" it means
+
+`--prereg` is a CLI argument, not stored state: `audit-verify --prereg <c> --since <c>`.
+There is no baseline constant in `tools/`, no config key, nothing to edit. So the pin is
+moved by **naming the new reference in the audit record and in the invocation**, and by
+being explicit that the estimator did not move.
+
+**The distinction that matters:** `--prereg` guards the *estimator and its threshold*; it
+answers "did the measurement rule change?". `DISPERSION_RATIO_THRESHOLD = 1.0`,
+`dispersion_verdict` and `pooled_within_spread` are **byte-identical to `97a2a52`** — only
+the failure-classifier and the plan preflight were added, and neither computes a number
+that feeds a dispersion verdict. So the estimator pin is **still valid at `97a2a52`** and
+is deliberately NOT moved. What moved is `--since`, the "last commit you believe is
+code-identical" reference, which is what this change invalidates.
+
+New `--since` reference for future invocations: **`8b220f6`** (this pass's code commit).
+`--prereg 97a2a52` should continue to be used unchanged — that is the whole point of
+pre-registering it separately.
+
+## 6. The run — 6 cells, ETH_USD, live arm
+
+`configs/matrix.eth-single.yaml`. SOL stayed out: giving it its own signal files is data
+work, not matrix work. Recorded as a limitation in the spec header, not smoothed over.
+
+**Window arithmetic, checked before the run and confirmed by it.** The live frame is 721
+bars, `2026-09-03T15:00Z .. 2026-10-03T15:00Z`, and `pages=1` and `pages=3` both return
+721 — Kraken's REST ceiling does not scale with pages. A 2020→2026 pin would therefore
+give **0 train and 0 eval bars**; the pin used (`2026-09-10T15:00Z .. 2026-10-01T15:00Z`,
+504 bars) sits inside the frame on both ends. Predicted ~127 replayed bars; **every cell
+replayed exactly 127**, against a 151-bar eval-slice denominator (width guard 75.5).
+
+§9A.1 honoured: this is the **live arm only**. The deep-history/store arm is a separate
+matrix — a live-vs-store pair in one matrix replays different bar counts, so the
+comparison is an artefact of the harness.
+
+### Valid cells (6 of 6; 0 INVALID)
+
+| seed | fee | slip | return | buy&hold | excess | sharpe | trades | n_bars |
+|---|---|---|---|---|---|---|---|---|
+| 42 | 0.0026 | 0.0005 | −0.96% | −0.06% | −0.90% | −3.372 | 13 | 127 |
+| 43 | 0.0026 | 0.0005 | −5.06% | −0.06% | −5.00% | −2.091 | 55 | 127 |
+| 44 | 0.0026 | 0.0005 | −2.41% | −0.06% | −2.35% | −0.887 | 23 | 127 |
+| 42 | 0.0 | 0.0 | −0.13% | −0.06% | −0.06% | −0.728 | 13 | 127 |
+| 43 | 0.0 | 0.0 | −1.76% | −0.06% | −1.69% | −0.701 | 58 | 127 |
+| 44 | 0.0 | 0.0 | −1.92% | −0.06% | −1.85% | −0.721 | 26 | 127 |
+
+**Invalid cells: none.** All six `status: ok`, `invalid_reasons: []`, `out_of_sample: True`,
+`window_pinned: True`, `eval_split_active: True`.
+
+### Null/NaN audit — read straight from the JSONL, not the report
+
+- NaN or inf across all 8 `NUMERIC_METRICS`, all 6 cells: **NONE**
+- null across all 18 `REQUIRED_BACKTEST_FIELDS`, all 6 cells: **NONE**
+- missing contract field: **NONE**
+
+This is a stronger claim than "the report showed no INVALID": it was computed directly from
+the records.
+
+## 7. RESULT — 6 of 6 valid, both arms losing money, NOT SEPARATED at 0.44×
+
+**6 of 6 cells valid, all losing money in both friction arms, NOT SEPARATED at 0.44× under
+the pre-registered rule.**
+
+Pooled within-group IQR **+1.47%** over the 2 groups with n≥3; the friction gap is **+0.65%**
+(−1.69% → −2.35% median excess). The gap sits inside the seed noise.
+
+**A finding, not a failure.** `DISPERSION_RATIO_THRESHOLD = 1.0` was fixed in `97a2a52`,
+before this run, and was not touched. The ratio is the fact; the threshold is the judgement
+call, and both are quoted so a reader can disagree with the latter.
+
+Seeds are a floor, not a verdict. The `seed` marginal reads −0.48% / −3.35% / −2.10% for
+seeds 42 / 43 / 44 — a spread **larger than the friction gap it is being asked to detect**.
+
+### What the out-of-sample claim covers — and nothing wider
+
+Every cell reports `out_of_sample: True`, and that is exactly as strong as its scope: **one
+30-day live frame, one pinned window, 151 eval bars with 127 replayed, ETH only, 3 seeds per
+level.** The run is out-of-sample *within that window* and supports nothing beyond it.
+
+- **It is NOT a claim that friction or the window "doesn't matter".** The gap sits inside
+  seed noise on a thin eval slice, and the run says nothing beyond that. NOT SEPARATED is
+  not evidence of absence; it is an unresolved comparison on a sample too small to resolve
+  it.
+- **Both arms lose money in all six cells.** Median excess is negative at both friction
+  levels, and friction does not change the sign. Nothing here is a candidate strategy.
+- **Three seeds estimate training variance, not regime variance.** Nothing about another
+  market regime.
+- **One ticker.** No cross-asset claim of any kind.
+- **Sharpe here is per-bar and is not annualised.** It is a cross-cell comparator only, not
+  comparable to a published annualised figure.
+- **The frictionless rows are a diagnostic ceiling**, never a quote. Every number above
+  from the `0.0026/0.0005` level is the one to read; the frictionless median appears only
+  because the dispersion gate needs both arms.
+
+## 8. Open, with triggers
+
+- **`--live-vs-store` guard (§9A.1).** Still an underlying defect in
+  `tools/model_matrix.py`; worked around here by running two matrices. Unchanged.
+- **More seeds before any friction claim.** At n=3 the gate is necessary, not sufficient.
+  Trigger: a decision that depends on the friction gap being real.
+
+## 9. Phase 7 additions — LISTED, NOT STARTED
+
+1. **SOL-scoped signal files (data work).** `configs/default.yaml` points all three
+   channels at ETH-only files, which is why SOL is absent from the matrix above rather
+   than measured and found wanting. Needs news + funding + social pulled against SOL
+   paths (`just news-pull` / `funding-pull` / `social-pull` with SOL arguments). Until
+   they exist, **no matrix in this repo can answer a cross-asset question**, and the
+   preflight now says so as a BLOCKER rather than letting the cells fail one by one.
+   Trigger: the three SOL files exist.
+2. **The thin-eval problem.** 127 replayed bars cannot separate anything smaller than the
+   seed spread — which is precisely what the 0.44× verdict is measuring. A deeper
+   evaluation needs the **store arm in its own matrix** (a separate `data_window` against
+   a seeded `market_data_store`), never a wider pin on the live leg: the live REST ceiling
+   is ~721 bars regardless of `--pages`, so a longer live window is not reachable by
+   asking for more pages. Trigger: a store is seeded and the store-arm matrix is specced.
+  Trigger: a decision that depends on the friction gap being real.
