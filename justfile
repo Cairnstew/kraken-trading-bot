@@ -740,6 +740,22 @@ depth-checkpoint dest output="signals/eth_usd_orderbook.jsonl" state=".depth-bac
     echo "  The log is append-only, so an incremental slice must be contiguous." >&2
     exit 1
   fi
+  # The line-count assertion ALONE IS NOT ENOUGH, and this was measured rather
+  # than assumed.  A byte offset that lands INSIDE a record still yields the
+  # right newline count — `wc -l` counts the partial first line — so the count
+  # balances while the slice starts mid-record and the reassembled archive is
+  # corrupt.  So assert the actual PRECONDITION: the byte before the recorded
+  # offset must be a newline (or the offset must be 0).
+  if [ "$prev_bytes" -ne 0 ]; then
+    byte_before="$(tail -c +$prev_bytes "$src" | head -c 1 | od -An -c | tr -d ' \n')"
+    if [ "$byte_before" != "\\n" ]; then
+      echo "OFFSET NOT A LINE BOUNDARY: byte $((prev_bytes - 1)) before the offset is '$byte_before', not a newline" >&2
+      echo "  A slice from here would START MID-RECORD. The line count would still" >&2
+      echo "  balance, so this is the case the count check cannot see." >&2
+      exit 1
+    fi
+    echo "  offset $prev_bytes is on a line boundary"
+  fi
   printf '%s %s\n' "$total_bytes" "$total_lines" > "{{state}}"
   echo "  -> $out"
   echo "  VERIFY IT: just depth-verify-restore $out"
@@ -799,8 +815,14 @@ depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
   # does not accumulate a new full copy per run.
   gzip -9 -c "$src" > "$repo/rolling/depth.jsonl.gz"
   total_bytes=$(wc -c < "$src"); total_lines=$(wc -l < "$src")
-  hours=$(nix run "$root"#kraken-trading-bot -- depth-gaps --output "$src" --json \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["n_hours_covered"])')
+  # `|| true` is REQUIRED, not defensive noise.  `depth-gaps` exits 1 when the
+  # checkpoint is stale — and THIS recipe is what makes it unstale — so without
+  # it a stale checkpoint made the checkpoint recipe itself fail: a deadlock in
+  # which the cure inherits the disease.  Here the exit code is irrelevant; only
+  # the number is read.  Found by having exactly that happen.
+  hours=$(nix run "$root"#kraken-trading-bot -- depth-gaps --output "$src" --json 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["n_hours_covered"])' || true)
+  hours="${hours:-unknown}"
   # Weekly incremental: only the bytes added since the last checkpoint.
   prev_bytes=0; prev_lines=0
   if [ -f "$state" ]; then read -r prev_bytes prev_lines < "$state" || true; fi
@@ -812,10 +834,27 @@ depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
   else
     echo "  no new records since the last checkpoint"
   fi
-  ( cd "$repo" && git add -A && git commit -q -m "depth: rolling + weekly $(date -u +%Y%m%dT%H%M%SZ)" \
+  # `git commit` exits 1 when nothing is staged, and `set -e` would kill the
+  # recipe — so a re-run inside the same minute FAILED instead of being a no-op.
+  # Guard the commit; the push is unconditional so the remote always matches.
+  ( cd "$repo" && git add -A \
+    && if git diff --cached --quiet; then
+         echo "  no change since the last checkpoint (nothing to commit)"
+       else
+         git commit -q -m "depth: rolling + weekly $(date -u +%Y%m%dT%H%M%SZ)"
+       fi \
     && git push -q --force origin HEAD:main )
   echo "  pushed -> {{remote}}"
-  echo "  raw_sha256=$(sha256sum "$src" | cut -d' ' -f1) records=$total_lines hours=$hours bytes=$total_bytes"
+  # Record the checkpoint ONLY now, after the push succeeded.  This is what
+  # `depth-gaps` reads to decide whether the ARCHIVE is healthy — so it must be
+  # written by the thing that actually did the work, never by hand.  It was
+  # missing here, which is why a successful run still reported a 14-day-old
+  # checkpoint: nothing had ever closed the loop.
+  nix run "$root"#kraken-trading-bot -- depth-checkpoint-mark \
+    --output "$src" --dest "{{remote}}" \
+    --sha256 "$(sha256sum "$src" | cut -d' ' -f1)" \
+    --records "$total_lines" --hours "${hours:-0}" | sed 's/^/  /'
+  echo "  MARKER WRITTEN — depth-gaps will now read this age"
 
 # READ BACK the off-machine copy and check it byte-for-byte against the live log.
 # This is what "done" means: not that a push happened, but that the pushed bytes
@@ -848,3 +887,37 @@ depth-verify-restore src:
   if [ -z "{{src}}" ]; then echo "src is REQUIRED (the copied file to read back)." >&2; exit 2; fi
   [ -f "{{src}}" ] || { echo "no such file: {{src}}" >&2; exit 1; }
   nix run "{{justfile_directory()}}"#kraken-trading-bot -- depth-verify --output "{{src}}"
+
+# Install the WEEKLY checkpoint as a real user timer, mirroring `depth-timer`.
+# Declaring it only in nix/module.nix would NOT schedule it on a host that runs
+# this repo from a checkout rather than from the NixOS module — which is exactly
+# this host, where the hourly recorder is likewise a user unit.
+depth-checkpoint-timer output="signals/eth_usd_orderbook.jsonl" remote="https://github.com/Cairnstew/kraken-depth-archive.git":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir"
+  # `just` is NOT at /run/current-system/sw/bin on this host — that path is where
+  # NixOS puts system packages, and an earlier version of this unit pointed there
+  # and failed with EXEC 203.  Resolve the real binary instead of assuming a path.
+  just_bin="$(command -v just)"
+  [ -x "$just_bin" ] || { echo "just not on PATH in this unit" >&2; exit 1; }
+  sed -e "s|@ROOT@|$root|g" \
+      -e "s|@OUTPUT@|{{output}}|g" \
+      -e "s|@REMOTE@|{{remote}}|g" \
+      -e "s|@HOME@|$HOME|g" \
+      -e "s|@JUST@|$just_bin|g" \
+      "$root/systemd/kraken-trading-bot-depth-checkpoint.service.in" \
+      > "$unit_dir/kraken-trading-bot-depth-checkpoint.service"
+  ln -sf "$root/systemd/kraken-trading-bot-depth-checkpoint.timer" \
+      "$unit_dir/kraken-trading-bot-depth-checkpoint.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-depth-checkpoint.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-depth-checkpoint.timer --no-pager
+  echo
+  echo "ENABLED IS NOT RUNNING. Prove it end-to-end once:"
+  echo "  systemctl --user start kraken-trading-bot-depth-checkpoint.service"
+  echo "  just depth-verify-offmachine"
+  echo "  just depth-gaps    # checkpoint age must read 0.00 days, or RED past 10d"

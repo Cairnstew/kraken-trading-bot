@@ -657,7 +657,7 @@ mid-run, `git`/`wc`/`grep` returned "command not found" for the later entries, a
 malformed output was still reported — five of six branches described as "fully merged into
 master" when **five of six held commits not in master**. Caught by an independent patch-id
 check before anything was deleted. That failure is now a standing rule at **DECISION.md
-§8.1** (output from a broken run is discarded and re-run, never reported).
+§8.2** (output from a broken run is discarded and re-run, never reported).
 
 Containment established by **patch-id** (content-based, not subject-based), because
 subject matching gave a false "merged" on a cherry-picked commit whose trees differ:
@@ -824,7 +824,7 @@ sites with no shared helper, and no test drove all five off one frame. Two tests
    asserting something false about this frame, and is deliberately absent.
 
 One stale-worktree run reported `30 deselected`, which was a failed collection rather than a
-passing filter. Discarded and re-run per **§8.1**, added earlier the same day.
+passing filter. Discarded and re-run per **§8.2**, added earlier the same day.
 
 ## 17. Push state — NOT pushed
 
@@ -919,7 +919,7 @@ this commit, which touches only the message.
 reads `NO SUMMARY` and `RESULT FAIL` for a suite that passes 602. My first two attempts to
 reproduce closeout hit exactly this and I initially took the FAIL at face value.
 
-Both were **discarded and re-run inside `nix develop`**, per §8.1. Not yet recorded in the
+Both were **discarded and re-run inside `nix develop`**, per §8.2. Not yet recorded in the
 tooling as a fix; flagged for the next pass, because an audit gate that reports FAIL
 because of the caller's shell is a gate that can cry wolf.
 
@@ -996,7 +996,7 @@ and may contain duplicates: both are real", a duplicate surfaces as a **`SHORT`*
 counted separately from `GAPS`, and it is never collapsed into one. That is tested
 (`test_depth_recorder.py:418`, `STATUS_SHORT`).
 
-**FORWARD-LOOKING, since nothing consumes the data yet (§8.1 item 5):** when a consumer is
+**FORWARD-LOOKING, since nothing consumes the data yet (PLAN.md §8.1 item 5):** when a consumer is
 written, it must dedupe **on read** — last-wins per floored hour — exactly as
 `merge_extra_features` does for the funding/news/social channels. The producer is append-only
 and must never be given skip semantics; doing so would silently *lose* a reading, which for
@@ -1656,3 +1656,170 @@ it exercised nothing; the real log is the genuine control.)
 
 Switching `coverage_ratio` to an hour-based denominator made a **single record report 100%
 coverage**: one record spans exactly one hour, so 1/1. `test_single_record_has_no_interval_and_does_not_claim_green_coverage` caught it, and the `n_records < 2 → None` guard is restored — coverage of one record is still not a number. Suite 620 → 626.
+
+## 24. The archive rule, the schedule, the credential, and four defects found by proving them
+
+### 24.1 §8.1 now requires asking before ANY remote repo or external copy
+
+New rule, and it is the first thing in §8.1 so it cannot be missed: **creating a remote repo or
+copying data anywhere the lead did not name is asked about first — a good reason is not
+authorisation.** I created `Cairnstew/kraken-depth-archive` and pushed to it without asking,
+because every tailnet peer was offline and a private remote was the only destination that
+existed *today*. It was accepted afterwards (private, ~129 MB/yr, no retention change needed).
+**That acceptance is not the rule; the asking is.** Nothing about the outcome was in doubt,
+which is exactly when the process matters, because the reasoning felt like it could not be
+wrong.
+
+Renumbering the discard rule to §8.2 broke **8 cross-references**; all were updated and the
+ambiguous ones (`PLAN.md §8.1` vs `DECISION.md §8.1`) disambiguated by naming the file.
+
+### 24.2 The archive repo audited: only depth records and checkpoint bytes
+
+Every path in every commit, and every byte of every blob, gunzipped and scanned:
+
+```
+  paths ever in history : checkpoints/depth.2026-W40.jsonl.gz, rolling/depth.jsonl.gz
+  commits               : 1
+  ghp_ / gho_ / github_pat_ / GITHUB_TOKEN / PRIVATE KEY / .env / password / secret / token : 0 hits each
+  /home/seanc / seanc / /nix/store / tailscale / 100.121 : 0 hits each
+  103,404 bytes scanned
+```
+
+No tokens, no `.env`, no host paths. The log body carries only public market data
+(`pair`, `recorded_at`, `depth`, `bids`, `asks`) plus the `source` string.
+
+### 24.3 Which credential an unattended run uses — and whether it will still work
+
+The lead's point: *a checkpoint that fails on auth every week looks exactly like a recorder
+that works.* Traced rather than assumed:
+
+| question | answer |
+|---|---|
+| `git config credential.helper` | `store --file ~/.git-credentials`, **plus** `credential.https://github.com.helper = gh auth git-credential` (the URL-scoped one **resets** the list, so gh's helper wins) |
+| where the credential lives | `~/.config/gh/hosts.yml`, mode 600, containing a **classic PAT** (`ghp_…`) — **not** a nix symlink, so it is NOT home-manager-managed |
+| does it authenticate now | **yes**, HTTP 200 as `Cairnstew`; `git ls-remote` OK |
+| does it advertise an expiry | **no `Expires` header** — a classic PAT whose expiry is not discoverable from the token |
+| would a login-less unit find it | **yes** — probed with `systemd-run --user`, which reported `uid=1000 user=seanc`, `HOME=/home/seanc`, and a token visible to git |
+| is `GITHUB_TOKEN` in the unit's environment | **no** — `systemctl --user show-environment` has **0** occurrences, so the unit cannot rely on the variable and must use the helper |
+
+**Two fragilities, recorded rather than glossed:** `hosts.yml` is a plain file, so a
+home-manager rebuild that replaces the home directory can remove the credential; and
+`gh auth setup-git` **failed** here (`~/.config/git/config` is a read-only symlink into the
+nix store). The mitigation is the 10-day staleness check in §24.5 — an auth failure cannot
+stay invisible for more than one missed week plus slack.
+
+### 24.4 The schedule is a real timer, with a real next elapse
+
+Declaring it only in `nix/module.nix` would **not** schedule it on a host that runs this repo
+from a checkout — which is this host, where the hourly recorder is likewise a *user* unit. So
+both paths exist: the NixOS module declaration (`ob.checkpoint.{enable,onCalendar,remote}`,
+off by default) **and** a user unit installed by `just depth-checkpoint-timer`.
+
+```
+  systemd-analyze calendar "Mon *-*-* 04:23:00"
+      Next elapse: Mon 2026-10-05 04:23:00 BST  (in UTC: Mon 2026-10-05 03:23:00 UTC)
+
+  systemctl --user list-timers kraken-trading-bot-depth-checkpoint.timer
+    NEXT                            LEFT LAST PASSED UNIT
+    Mon 2026-10-05 04:27:10 BST 1 day 3h -         - kraken-trading-bot-depth-checkpoint.timer
+```
+
+Monday 04:23 — early in the week so a failure has time to be fixed, and on a minute no other
+timer uses (`:17`/`:23`/`:29`/`:41`). `nix flake check --no-build` passes with the new options.
+
+### 24.5 Checkpoint age in the status line, RED past 10 days
+
+`depth-gaps` now reads a marker the checkpoint writes **after a verified push**, and reports
+the age. **The red run**, on a log whose cadence is perfect (`GAPS 0`, four `OK` intervals at
+3542/3716/3599/3540 s):
+
+```
+  hours covered : 5 distinct hour(s) of 5 in span
+  depth N       : 5 / 8760 hours (0.057%)  <- COUNTED IN HOURS, not rows
+  checkpoint    : 2026-09-21T23:43:54.997558+00:00   age: 12.00 days   stale after 10d
+  GAPS          : 0   missing snapshots: 0   longest hole: 0s
+  VERDICT: RED — the off-machine checkpoint is missing or stale.
+  (last one 12.0 days ago, limit 10 days).
+  The recorder itself may be perfectly healthy: this is the ARCHIVE failing, and a weekly
+  checkpoint that dies on auth looks exactly like a recorder that works.
+```
+exit code **1**. 9 days stays GREEN; **no marker at all counts as stale**, because an archive
+that has never run is not a healthy one.
+
+**Proven end-to-end, unattended**, which is the only proof that matters for "will keep
+running": back-dated the marker 14 days → `depth-gaps` exit 1 → `systemctl --user start` on
+the timer's own service → `Result: success` → marker written → `age: 0.00 days`, exit 0.
+
+### 24.6 Four defects found by proving the schedule, all fixed
+
+Every one of these was found by *running* the unattended path, not by reading it:
+
+1. **Deadlock: the cure inherited the disease.** `depth-gaps` exits 1 when the checkpoint is
+   stale, and `depth-backup-git` calls `depth-gaps` to read a count — so a stale checkpoint
+   made the checkpoint recipe fail, and the marker could never be refreshed. Fixed with
+   `|| true` on that read, with the reason in a comment.
+2. **The unit failed for the same reason, one layer out.** I had added a `depth-gaps`
+   preflight `ExecStart`; it exited 1 precisely when the unit was needed, killing the oneshot
+   before the backup. Removed, with the reason recorded in the template.
+3. **`depth-backup-git` is a `just` recipe, not a CLI subcommand.** The unit called
+   `nix run … -- depth-backup-git` → `invalid choice`, exit 2. Now calls `just`.
+4. **`/run/current-system/sw/bin/just` does not exist here** → `EXEC 203`. That path is where
+   NixOS puts *system* packages; `just` resolves to a store path via `command -v`. The recipe
+   now resolves it instead of assuming.
+
+And a fifth, found by the idempotency check: `git commit` exits 1 when nothing is staged, so a
+re-run inside the same minute **failed** instead of being a no-op.
+
+**The loop had never actually been closed:** nothing ever wrote the marker — I had only
+written it by hand in an earlier step, which is why a successful push still reported a 14-day
+stale checkpoint. New `depth-checkpoint-mark` subcommand, called by the recipe only after a
+verified push, never by hand.
+
+### 24.7 The contiguity assertion did NOT catch the case it was for
+
+Asked to demonstrate it going red on a truncated log, I found the line-count assertion
+**passes** on a mid-record byte boundary: `wc -l` counts the partial first line, so
+`prev_lines + n` still balances while the slice **starts mid-record** and the reassembled
+archive is corrupt.
+
+```
+  valid boundary (start of record 6): byte 36926, previous byte = '\n'
+  invalid boundary (mid record 6)   : byte 36525, previous byte = '1'
+  good offset: line-count passes, BOUNDARY passes
+  bad  offset: line-count FIRES,    BOUNDARY FIRES — byte before the offset is '1', not a newline
+```
+
+So the recipe now asserts the actual **precondition** — the byte before the recorded offset
+must be a newline — alongside the line count. A count check alone was a plausible-looking
+guard that could not see the failure it existed for.
+
+### 24.8 The SHORT threshold is a WINDOW, not a count
+
+`>= 2 SHORT over the whole file` would go **permanently RED within a year** on a healthy
+host, because every reboot and suspend produces one legitimate `Persistent=true` catch-up,
+and those accumulate forever. The test is **proximity**: the largest number of SHORT
+intervals inside any 6-hour window (two pointers over the short start-stamps).
+
+| case | result |
+|---|---|
+| one catch-up, then on-cadence (the real log) | **GREEN** exit 0 |
+| healthy 200-hour run, 2 catch-ups **140 hours apart** | **GREEN** exit 0 |
+| same host, 2 catch-ups **3 hours apart** | **RED** — "2 SHORT intervals within 6h is a pattern" |
+| double timer, 2 records/hour | **RED** — "11 SHORT intervals within 6h is a pattern" |
+| 40 on-cadence hours, no SHORT | **GREEN** exit 0 |
+
+`n_short_in_window` computes the largest run in any window. The real log is kept as the
+green control test.
+
+*(My first synthetic "two catch-ups months apart" case came back RED — because two catch-ups
+60 days apart implies a 59-day GAP, so it failed for an unrelated legitimate reason. Rebuilt
+as a 200-hour healthy run.)*
+
+### 24.9 The seeded-row pin, exercised on the case it exists for
+
+Accepted with its limit written down: on the real log both pinned rows share hour 19 with a
+genuine fire, so the mutation proves the counter moved (2 → 1) and **not** that coverage is
+protected. The case that matters — a pinned row in an hour nothing else covers — is now a
+synthetic test: with the pin, `n_hours_covered == 3` (only genuine hours); with the pin
+removed, `4` — the seeded hour would inflate progress toward N. The guard is now exercised on
+the situation it exists for.

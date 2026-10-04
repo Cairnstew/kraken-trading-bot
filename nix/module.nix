@@ -240,18 +240,62 @@ in
           '';
         };
 
-        onCalendar = lib.mkOption {
-          type = lib.types.str;
-          default = "*-*-* *:41:00";
-          defaultText = "*-*-* *:41:00";
-          description = ''
-            systemd OnCalendar for the timer.  The default is hourly at :41 —
-            a minute clear of the funding (:17), news (:23) and social (:29)
-            pullers.  Hourly is also the CADENCE FLOOR: the bar interval is
-            `ohlcv_interval_minutes: 60`, so anything finer pays more calls to
-            keep the same usable rows.
-          '';
-        };
+onCalendar = lib.mkOption {
+            type = lib.types.str;
+            default = "*-*-* *:41:00";
+            defaultText = "*-*-* *:41:00";
+            description = ''
+              systemd OnCalendar for the timer.  The default is hourly at :41 —
+              a minute clear of the funding (:17), news (:23) and social (:29)
+              pullers.  Hourly is also the CADENCE FLOOR: the bar interval is
+              `ohlcv_interval_minutes: 60`, so anything finer pays more calls to
+              keep the same usable rows.
+            '';
+          };
+
+          # Off-machine copy.  Off by default, and separately so from `enable`:
+          # the recorder collecting locally and the archive leaving the machine
+          # are different decisions, and a host may reasonably want the first
+          # without volunteering its unrecoverable data to a remote.
+          checkpoint = {
+            enable = lib.mkEnableOption "the weekly off-machine copy of the depth log" // {
+              default = false;
+              description = ''
+                Copy the order-book depth log off this machine weekly.  Off by
+                default.  The log is unrecoverable (Kraken serves no historical
+                Depth endpoint), so a lost disk is lost data — but enabling this
+                sends that data to a REMOTE, which is the lead's decision, not a
+                default.  §8.1 of .data-audit/DECISION.md requires asking first.
+              '';
+            };
+
+            onCalendar = lib.mkOption {
+              type = lib.types.str;
+              default = "Mon *-*-* 04:23:00";
+              defaultText = "Mon *-*-* 04:23:00";
+              example = "Mon *-*-* 04:23:00";
+              description = ''
+                When the weekly copy runs.  Monday 04:23, deliberately not on
+                the hour: every other timer in this module fires at :17/:23/:29
+                or :41, so a distinct minute keeps the checkpoint's journal
+                lines separable from them.  Early in the week, so a failure is
+                noticed with time to fix it before the next run.
+              '';
+            };
+
+            remote = lib.mkOption {
+              type = lib.types.str;
+              default = "https://github.com/Cairnstew/kraken-depth-archive.git";
+              example = "https://github.com/Cairnstew/kraken-depth-archive.git";
+              description = ''
+                Git remote for the archive.  Must be reachable WITHOUT an
+                interactive prompt — the unit runs unattended, so a credential
+                that needs a TTY or a passphrase fails silently every week,
+                which looks exactly like a recorder that works.  The recipe
+                refuses any destination on the same physical disk as the log.
+              '';
+            };
+          };
 
         statusOutput = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
@@ -370,9 +414,44 @@ in
           # already there, and the gap counter still sees the hole.
           Persistent = true;
           RandomizedDelaySec = 120;
-          Unit = "kraken-trading-bot-order-book.service";
+Unit = "kraken-trading-bot-order-book.service";
+          };
         };
-      };
+
+        # ── weekly off-machine checkpoint ──────────────────────────────────
+        # The depth log is UNRECOVERABLE — Kraken has no historical Depth
+        # endpoint, so a lost file is lost data.  `Persistent = true` covers
+        # missed FIRES, not a lost disk.  This copies it off the machine.
+        #
+        # Weekly, not daily: at one record per hour a daily full copy is 11.8 GB
+        # a year, against 129 MB for a rolling file plus weekly incrementals.
+        #
+        # `checkpointOnCalendar` is a Monday morning so the copy is early in the
+        # week, leaving time to notice a failure before the next one.
+        systemd.services."kraken-trading-bot-depth-checkpoint" = lib.mkIf ob.checkpoint.enable {
+          description = "Copy the order-book depth log off this machine (G1)";
+          wantedBy = [ "multi-user.target" ];
+          serviceConfig = {
+            Type = "oneshot";
+            # The repo path is fixed at build time; the recipe refuses any
+            # destination on the same physical disk as the log.
+            WorkingDirectory = cfg.homeDir;
+            ExecStart = "${pkgs.just}/bin/just --justfile ${cfg.homeDir}/Projects/kraken-trading-bot/justfile --working-directory ${cfg.homeDir}/Projects/kraken-trading-bot depth-backup-git ${ob.checkpoint.remote}";
+            # Network and DNS may be down; a failed week must be visible in the
+            # journal, not fatal to boot.
+            SuccessExitStatus = 0;
+          };
+        };
+        systemd.timers."kraken-trading-bot-depth-checkpoint" = lib.mkIf ob.checkpoint.enable {
+          description = "Weekly off-machine copy of the order-book depth log (G1)";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnCalendar = ob.checkpoint.onCalendar;
+            Persistent = true;
+            RandomizedDelaySec = 600;
+            Unit = "kraken-trading-bot-depth-checkpoint.service";
+          };
+        };
 
       # Write a credentials file if individual options are provided.
       # The file is mode 0600 and owned by root, loadable by systemd and

@@ -488,6 +488,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit the verification result as a single JSON object on stdout.",
     )
 
+    # Writes the marker `depth-gaps` reads to judge the ARCHIVE's health.  Called
+    # by `just depth-backup-git` AFTER a verified push, and by nothing else — a
+    # marker written by hand, or before the push, would make a dead archive look
+    # alive, which is the exact failure the age check exists to catch.
+    mark_parser = sub.add_parser(
+        "depth-checkpoint-mark",
+        help=(
+            "Record a SUCCESSFUL off-machine checkpoint so depth-gaps can report "
+            "its age. Call this only after the copy is verified."
+        ),
+    )
+    mark_parser.add_argument("--output", "-o", required=True, help="The JSONL log that was copied.")
+    mark_parser.add_argument("--dest", required=True, help="Where it was copied to.")
+    mark_parser.add_argument("--sha256", required=True, help="sha256 of the raw log as copied.")
+    mark_parser.add_argument("--records", type=int, required=True)
+    mark_parser.add_argument("--hours", type=int, default=0)
+
     return parser
 
 
@@ -565,18 +582,36 @@ def cmd_depth_gaps(args: argparse.Namespace) -> int:
         str(output) + ".status.json"
     )
 
+    from kraken_trading_bot.depth_recorder import read_checkpoint_marker
+
     report = scan_gap_file(
         output,
         expected_interval_seconds=args.expected_interval_seconds,
         gap_factor=args.gap_factor,
     )
-    write_status(status, report, artifact=str(output))
+    checkpoint = read_checkpoint_marker(output)
+    write_status(
+        status,
+        report,
+        artifact=str(output),
+        checkpoint=checkpoint.to_dict(),
+    )
 
     if args.as_json:
-        print(_json.dumps(report.to_dict(), indent=2))
+        print(_json.dumps({**report.to_dict(), "checkpoint": checkpoint.to_dict()}, indent=2))
     else:
-        print(format_report(report, artifact=output, status_file=status))
-    return 0 if report.ok else 1
+        print(
+            format_report(
+                report,
+                artifact=output,
+                status_file=status,
+                checkpoint=checkpoint,
+            )
+        )
+    # The archive failing is a failure of the delivery, not of collection: a
+    # stale checkpoint means the data is one disk from gone, and that must be
+    # visible to a caller, not only to a human reading the text.
+    return 0 if (report.ok and not checkpoint.stale) else 1
 
 
 def cmd_depth_verify(args: argparse.Namespace) -> int:
@@ -794,6 +829,31 @@ def cmd_depth_verify(args: argparse.Namespace) -> int:
             print(f"    ! {p}")
         print(f"\n  VERDICT: {'PASS' if not problems else 'FAIL'}")
     return 0 if not problems else 1
+
+
+def cmd_depth_checkpoint_mark(args: argparse.Namespace) -> int:
+    """Record a verified checkpoint.  Writes the marker, prints what it wrote."""
+    from pathlib import Path as _Path
+
+    from kraken_trading_bot.depth_recorder import (
+        read_checkpoint_marker,
+        write_checkpoint_marker,
+    )
+
+    log = _Path(args.output)
+    p = write_checkpoint_marker(
+        log,
+        raw_sha256=args.sha256,
+        records=args.records,
+        hours=args.hours,
+        dest=args.dest,
+    )
+    state = read_checkpoint_marker(log)
+    print(f"marker: {p}")
+    print(f"  at   : {state.at.isoformat() if state.at else '?'}")
+    print(f"  age  : {state.age_days:.4f} days   stale={state.stale}")
+    print(f"  dest : {state.dest}")
+    return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1218,6 +1278,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "record-depth": cmd_record_depth,
         "depth-gaps": cmd_depth_gaps,
         "depth-verify": cmd_depth_verify,
+        "depth-checkpoint-mark": cmd_depth_checkpoint_mark,
     }
 
     if args.command is None:

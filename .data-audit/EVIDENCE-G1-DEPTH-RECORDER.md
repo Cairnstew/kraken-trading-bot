@@ -237,7 +237,7 @@ funding `:17`, news `:23` and social `:29`.
 
 ---
 
-## 4. §8.1 item 3 + CHECKPOINT RULE — the gap counter, made RED
+## 4. PLAN.md §8.1 item 3 + CHECKPOINT RULE — the gap counter, made RED
 
 The rule (`.opencode/commands/audit-pipeline.md`, *CHECKPOINT RULE*): a guard
 is not delivered until someone has made it **go red on purpose** and recorded
@@ -619,7 +619,7 @@ gaps), which the planted hole does not.
 
 A first attempt used `--check-gaps` on `record-depth` and failed with
 `unrecognized arguments: --check-gaps`; it is a separate `depth-gaps` subcommand. **That
-run was discarded and re-run** per §8.1 — a failed invocation is not a red run.
+run was discarded and re-run** per §8.2 — a failed invocation is not a red run.
 
 ### 2. The INSTALLED unit pointed into a git worktree that `team_cleanup` deletes
 
@@ -649,7 +649,7 @@ with no `worktree` substring anywhere in the installed unit.
 ### 3. The two recovered snapshots, preserved
 
 Rescued from the aborted worktree to `/tmp/g1-rescued/` **before** the merge, then seeded
-into the main checkout's `signals/`. They are the §8.1 "two real snapshots with DISTINCT
+into the main checkout's `signals/`. They are the PLAN.md §8.1 "two real snapshots with DISTINCT
 timestamps" evidence, and they carry the recorder's own clock — a book snapshot has none,
 each level's timestamp being that order's placement time:
 
@@ -732,7 +732,7 @@ three records and wrote that no snapshot had landed. It had: the oneshot finishe
 20:42:32, eight seconds later, and `nix run` had not yet written. `NEXT` also showed `-`
 in that same reading; it was mid-fire and is now scheduled for 21:41:06. **Both readings
 were a race, not a defect, and the "no new snapshot landed" conclusion drawn from them was
-wrong.** Discarded per §8.1 and re-read after the process exited. Recorded here because the
+wrong.** Discarded per §8.2 and re-read after the process exited. Recorded here because the
 false negative is exactly the shape of mistake that would have had me "fixing" a working
 timer.
 

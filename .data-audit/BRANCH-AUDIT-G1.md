@@ -282,7 +282,7 @@ No branch or tag was deleted. No `git worktree remove` was run. `signals/` and
 `configs/` or the root `justfile` was modified in the final state of the tree — the only
 file this pass adds is this one.
 
-One run was discarded and re-run rather than reported, per §8.1: a containment table
+One run was discarded and re-run rather than reported, per §8.2: a containment table
 came back with 2 of 14 rows after a zsh glob failure had truncated a loop. The cause was
 not the glob but a concurrent ref deletion by another actor; the re-run against the
 post-deletion ref set is what is reported, and the pre-deletion table is the one above.

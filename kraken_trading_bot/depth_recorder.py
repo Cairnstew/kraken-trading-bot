@@ -191,6 +191,99 @@ SEEDED_RECORD_SHA256: frozenset[str] = frozenset(
 #: Re-derived in RUN-LOG §22.8; 365 days at one snapshot per hour.
 TARGET_DEPTH_HOURS: int = 8760
 
+#: A checkpoint older than this is RED.  Chosen because the schedule is WEEKLY,
+#: so 10 days is one missed week plus slack: it catches a checkpoint that has
+#: been failing for a fortnight without failing a run that merely ran early.
+#:
+#: This exists because of the failure mode the lead named: an unattended
+#: checkpoint that fails on authentication every week is indistinguishable, from
+#: the recorder's own output, from one that is working.  The recorder has no
+#: other way to notice — it only knows what it wrote.
+CHECKPOINT_STALE_DAYS: float = 10.0
+CHECKPOINT_MARKER_SUFFIX = ".checkpoint.json"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointState:
+    """What the last off-machine checkpoint recorded about itself."""
+
+    at: datetime | None
+    raw_sha256: str | None
+    records: int
+    hours: int
+    dest: str | None
+
+    @property
+    def age_days(self) -> float | None:
+        if self.at is None:
+            return None
+        return (utc_now() - self.at).total_seconds() / 86400.0
+
+    @property
+    def stale(self) -> bool:
+        """True when there is NO checkpoint, or the last one is too old.
+
+        No checkpoint at all counts as stale: an archive that has never run is
+        not a healthy archive, and reporting "no age" would let the absence of
+        evidence read as the absence of a problem.
+        """
+        age = self.age_days
+        return age is None or age > CHECKPOINT_STALE_DAYS
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "at": self.at.isoformat() if self.at else None,
+            "age_days": None if self.age_days is None else round(self.age_days, 3),
+            "stale": self.stale,
+            "stale_after_days": CHECKPOINT_STALE_DAYS,
+            "raw_sha256": self.raw_sha256,
+            "records": self.records,
+            "hours": self.hours,
+            "dest": self.dest,
+        }
+
+
+def checkpoint_marker_path(log_path: str | Path) -> Path:
+    """Where the checkpoint state for ``log_path`` lives."""
+    return Path(str(log_path) + CHECKPOINT_MARKER_SUFFIX)
+
+
+def write_checkpoint_marker(log_path: str | Path, **fields: Any) -> Path:
+    """Record a SUCCESSFUL checkpoint.  Only ever called after verification."""
+    import json as _json
+
+    p = checkpoint_marker_path(log_path)
+    p.write_text(
+        _json.dumps(
+            {"at": utc_now().isoformat(), "recorded_at_note": "written by a VERIFIED checkpoint", **fields},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return p
+
+
+def read_checkpoint_marker(log_path: str | Path) -> CheckpointState:
+    """Read the checkpoint marker.  A missing or corrupt marker is `stale`."""
+    import json as _json
+
+    p = checkpoint_marker_path(log_path)
+    if not p.exists():
+        return CheckpointState(None, None, 0, 0, None)
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except ValueError:
+        return CheckpointState(None, None, 0, 0, None)
+    return CheckpointState(
+        at=parse_timestamp(data.get("at")),
+        raw_sha256=data.get("raw_sha256"),
+        records=int(data.get("records") or 0),
+        hours=int(data.get("hours") or 0),
+        dest=data.get("dest"),
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class Interval:
@@ -247,18 +340,58 @@ class GapReport:
     holes: tuple[Interval, ...] = ()
     intervals: tuple[Interval, ...] = ()
 
+    #: Two SHORT intervals inside this window is a PATTERN.  A whole-file count
+    #: is the wrong unit: every reboot and every suspend produces one legitimate
+    #: `Persistent=true` catch-up SHORT, so "2 or more over the file" would go
+    #: permanently RED within a year on a perfectly healthy single-timer host.
+    #: A second timer instead produces shorts CLOSE TOGETHER — two records in
+    #: every hour — so the test is proximity, not accumulation.
+    SHORT_PATTERN_WINDOW_SECONDS: float = 6 * 3600.0
+
+    @property
+    def n_short_in_window(self) -> int:
+        """Largest number of SHORT intervals inside any one rolling window.
+
+        Two pointers over the SHORT start-stamps: for each right end, advance
+        the left end while the span still fits.  The largest run is the answer.
+        """
+        stamps = sorted(
+            t
+            for i in self.intervals
+            if i.status == STATUS_SHORT
+            for t in (parse_timestamp(i.before),)
+            if t is not None
+        )
+        best = left = 0
+        for right, end in enumerate(stamps):
+            while (end - stamps[left]).total_seconds() > self.SHORT_PATTERN_WINDOW_SECONDS:
+                left += 1
+            best = max(best, right - left + 1)
+        return best
+
+    @property
+    def short_pattern(self) -> bool:
+        """True when SHORT intervals cluster — the second-timer signature."""
+        return self.n_short_in_window >= 2
+
     @property
     def ok(self) -> bool:
         """True when no interval exceeded ``expected * gap_factor`` AND the log
         is not running a sustained double cadence.
 
         Gaps alone are not sufficient.  A double timer produces two records per
-        hour, ~1800 s apart: no interval is long, so ``n_gaps == 0``, and the
-        old verdict read ``GREEN`` on a misconfigured recorder.  ``>= 2`` SHORT
-        intervals is the sustained-pattern threshold — a single SHORT is the
-        expected ``Persistent=true`` catch-up at enablement and stays green.
+        hour, ~1800 s apart: no interval is long, so ``n_gaps == 0``, and an
+        earlier verdict read ``GREEN`` on a misconfigured recorder.
+
+        The threshold is a WINDOW, not a whole-file count.  A cumulative "2 or
+        more SHORT" would go permanently RED within a year on a healthy host,
+        because every reboot and every suspend legitimately produces one
+        ``Persistent=true`` catch-up SHORT — those accumulate forever and mean
+        nothing.  A second timer instead produces shorts that cluster, two every
+        hour, so the test is proximity within
+        ``SHORT_PATTERN_WINDOW_SECONDS`` rather than accumulation.
         """
-        return self.n_gaps == 0 and self.n_short_intervals < 2
+        return self.n_gaps == 0 and not self.short_pattern
 
     @property
     def expected_span_seconds(self) -> float:
@@ -604,7 +737,9 @@ def append_record(path: str | Path, record: dict[str, Any]) -> None:
         os.fsync(fh.fileno())
 
 
-def write_status(path: str | Path, report: GapReport, **extra: Any) -> Path:
+def write_status(
+    path: str | Path, report: GapReport, *, checkpoint: dict[str, Any] | None = None, **extra: Any
+) -> Path:
     """Write (REWRITE) the sidecar status file for a scanned log.
 
     The JSONL log is append-only and never touched; this sidecar is the one
@@ -816,6 +951,7 @@ def format_report(
     *,
     artifact: str | Path | None = None,
     status_file: str | Path | None = None,
+    checkpoint: CheckpointState | None = None,
     max_intervals: int = 12,
 ) -> str:
     """Human-readable expected-vs-actual report.  This is stdout, not the artifact."""
@@ -851,6 +987,18 @@ def format_report(
         f"  depth N       : {report.n_hours_covered} / {TARGET_DEPTH_HOURS} hours"
         f" ({report.depth_fraction * 100:.3f}%)  <- COUNTED IN HOURS, not rows"
     )
+    if checkpoint is not None:
+        age = checkpoint.age_days
+        when = checkpoint.at.isoformat() if checkpoint.at else "NEVER"
+        lines.append(
+            f"  checkpoint    : {when}   age: "
+            + ("never" if age is None else f"{age:.2f} days")
+            + f"   stale after {CHECKPOINT_STALE_DAYS:g}d"
+        )
+        lines.append(
+            f"                 dest: {checkpoint.dest or '(unknown)'}   "
+            f"sha256: {(checkpoint.raw_sha256 or '(none)')[:16]}..."
+        )
     coverage = report.coverage_ratio
     lines.append(
         f"  span          : {report.observed_span_seconds:.0f}s observed"
@@ -881,7 +1029,7 @@ def format_report(
         "                   counted separately from gaps, and NEITHER a duplicate-record "
         "count NOR a depth shortfall"
     )
-    if report.n_short_intervals >= 2:
+    if report.short_pattern:
         # ONE short interval is a legitimate, documented catch-up:
         # `Persistent=true` fires immediately when the timer is enabled and the
         # slot was missed, which on this very log produced 19:37:04 -> 19:42:32
@@ -890,8 +1038,9 @@ def format_report(
         # hour, ~1800 s apart, repeating — so the hint waits for repetition
         # rather than firing on the catch-up every host sees once at enablement.
         lines.append(
-            f"                   >> {report.n_short_intervals} SHORT interval(s) is a"
-            " PATTERN, not a catch-up. If these are not your own manual pulls,"
+            f"                   >> {report.n_short_in_window} SHORT interval(s) within"
+            f" {report.SHORT_PATTERN_WINDOW_SECONDS / 3600:g}h is a PATTERN, not a"
+            " catch-up. If these are not your own manual pulls,"
         )
         lines.append(
             "                      CHECK FOR A SECOND TIMER — `systemctl "
@@ -903,10 +1052,11 @@ def format_report(
         )
         lines.append(
             "                      two timers put two records in one hour, ~1800s apart.")
-    elif report.n_short_intervals == 1:
+    elif report.n_short_intervals >= 1:
         lines.append(
-            "                   (one SHORT interval is the expected `Persistent=true`"
-            " catch-up at enablement; see RUN-LOG 22.9)"
+            f"                   ({report.n_short_intervals} SHORT interval(s), all more"
+            " than 6h apart: the expected `Persistent=true` catch-ups at reboot and"
+            " suspend. They accumulate and mean nothing on their own.)"
         )
     lines.append(
         f"  GAPS          : {report.n_gaps}   "
@@ -960,7 +1110,7 @@ def format_report(
             "backfilled by anything."
         )
         lines.append("  VERDICT: RED")
-    elif report.n_short_intervals >= 2:
+    elif report.short_pattern:
         # A sustained SHORT pattern is a DEFECT, so it must not sit under a GREEN
         # verdict.  Measured: a synthetic double-timer log (12 records, 6 hours,
         # 1800s apart) reported `GAPS 0` and therefore "GREEN — no interval
@@ -970,8 +1120,8 @@ def format_report(
         # resists the inflation (12 rows -> 6 hours), but the verdict has to say
         # so too, or a reader trusts GREEN.
         lines.append(
-            f"  VERDICT: RED — {report.n_short_intervals} SHORT intervals is a"
-            " sustained pattern, not loss."
+            f"  VERDICT: RED — {report.n_short_in_window} SHORT intervals within"
+            f" {report.SHORT_PATTERN_WINDOW_SECONDS / 3600:g}h is a pattern, not loss."
         )
         lines.append(
             "  No hour is missing, but the recorder is not on its cadence: the"
@@ -980,6 +1130,24 @@ def format_report(
         lines.append(
             "  Two timers put two records in every hour and duplicate the depth"
             " series' cadence."
+        )
+    elif checkpoint is not None and checkpoint.stale:
+        age = checkpoint.age_days
+        lines.append(
+            "  VERDICT: RED — the off-machine checkpoint is missing or stale."
+        )
+        lines.append(
+            "  ("
+            + ("it has NEVER run" if age is None else f"last one {age:.1f} days ago")
+            + f", limit {CHECKPOINT_STALE_DAYS:g} days)."
+        )
+        lines.append(
+            "  The recorder itself may be perfectly healthy: this is the ARCHIVE"
+            " failing, and a weekly checkpoint that dies on auth looks exactly"
+        )
+        lines.append(
+            "  like a recorder that works. Check the unit, the credential, and the"
+            " remote."
         )
     else:
         lines.append("  VERDICT: GREEN (no interval exceeded the expectation)")

@@ -1,0 +1,15 @@
+[Unit]
+Description=Weekly off-machine copy of the order-book depth log (G1)
+
+[Timer]
+# Monday 04:23 — early in the week, so a failure is seen with time to fix it,
+# and on a minute no other timer in this module uses (:17/:23/:29/:41).
+OnCalendar=Mon *-*-* 04:23:00
+# A missed week (lid closed, host off) is caught up rather than silently skipped:
+# the log is unrecoverable, so a skipped copy is a lost week.
+Persistent=true
+RandomizedDelaySec=600
+Unit=kraken-trading-bot-depth-checkpoint.service
+
+[Install]
+WantedBy=timers.target

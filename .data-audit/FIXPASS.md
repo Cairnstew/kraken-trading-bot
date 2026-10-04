@@ -5,7 +5,7 @@
 
 Evidence for the two fixes, kept out of `RUN-LOG.md` because the lead is
 editing that file. Every red run below is **verbatim**; where a run was
-broken it is labelled and discarded per `RUN-LOG.md` §8.1, not reported as a
+broken it is labelled and discarded per `DECISION.md` §8.2, not reported as a
 result.
 
 ---
@@ -135,7 +135,7 @@ green.
 
 ### 1c. The DELIBERATE-WRONG-CITATION red runs
 
-**One discarded run, stated because §8.1 requires it.** The first cross-repo
+**One discarded run, stated because §8.2 requires it.** The first cross-repo
 run raised `TypeError: '<' not supported between instances of 'str' and
 'NoneType'` — `sorted()` on a tuple whose third element was an optional
 symbol. **That output is discarded and was not used as evidence of anything**;

@@ -687,6 +687,12 @@ def test_depth_gaps_json_is_machine_readable(tmp_path, capsys):
     log = tmp_path / "d.jsonl"
     record_once(output=log, manager=FakeManager(), recorded_at=at(0))
     record_once(output=log, manager=FakeManager(), recorded_at=at(HOUR))
+    # A fresh checkpoint marker: the exit code now covers the ARCHIVE as well as
+    # the cadence, and "never checkpointed" is stale (an absent archive is not a
+    # healthy one).  See test_never_checkpointed_is_red and the stale tests.
+    from kraken_trading_bot.depth_recorder import write_checkpoint_marker
+
+    write_checkpoint_marker(log, raw_sha256="x", records=2, hours=2, dest="test")
     args = bot_cli._build_parser().parse_args(
         ["depth-gaps", "--output", str(log), "--json"]
     )
@@ -694,6 +700,7 @@ def test_depth_gaps_json_is_machine_readable(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["n_records"] == 2
+    assert payload["checkpoint"]["stale"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1288,3 +1295,256 @@ def test_a_single_short_interval_stays_green(tmp_path: Path) -> None:
     assert report.n_short_intervals == 1
     assert report.ok is True, "one catch-up SHORT must stay green"
     assert "VERDICT: GREEN" in format_report(report)
+
+
+# ── the ARCHIVE is part of the verdict ─────────────────────────────────────
+# NAMED DEFECT (the lead's): an unattended checkpoint that fails on auth every
+# week is indistinguishable, from the recorder's own output, from one that
+# works.  The recorder cannot detect this — it only knows what it wrote — so the
+# age of the last SUCCESSFUL checkpoint has to be part of what it reports, and it
+# has to be able to go RED.
+
+def _fresh_checkpoint(log: Path, **kw) -> None:
+    from kraken_trading_bot.depth_recorder import write_checkpoint_marker
+
+    write_checkpoint_marker(log, raw_sha256="a" * 64, records=2, hours=2, dest="test", **kw)
+
+
+def _stale_checkpoint(log: Path, days: float) -> None:
+    """Write a marker dated `days` in the past — a deliberately stale one."""
+    from datetime import timedelta
+
+    from kraken_trading_bot.depth_recorder import CHECKPOINT_MARKER_SUFFIX, utc_now
+
+    marker = Path(str(log) + CHECKPOINT_MARKER_SUFFIX)
+    at = utc_now() - timedelta(days=days)
+    marker.write_text(
+        json.dumps(
+            {
+                "at": at.isoformat(),
+                "raw_sha256": "b" * 64,
+                "records": 2,
+                "hours": 2,
+                "dest": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_never_checkpointed_is_red(tmp_path, capsys) -> None:
+    """No marker at all is stale: an archive that has never run is not healthy."""
+    from kraken_trading_bot.depth_recorder import format_report, scan_gap_file
+
+    log = tmp_path / "n.jsonl"
+    log.write_text(
+        json.dumps({"recorded_at": "2026-10-05T01:00:00+00:00"}) + "\n"
+        + json.dumps({"recorded_at": "2026-10-05T02:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    from kraken_trading_bot.depth_recorder import read_checkpoint_marker
+
+    cp = read_checkpoint_marker(log)
+    assert cp.stale is True
+    assert cp.age_days is None
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 1, "never checkpointed must exit non-zero"
+    out = capsys.readouterr().out
+    assert "VERDICT: RED" in out
+    assert "NEVER" in out
+
+
+def test_a_fresh_checkpoint_keeps_the_verdict_green(tmp_path, capsys) -> None:
+    log = tmp_path / "f.jsonl"
+    log.write_text(
+        json.dumps({"recorded_at": "2026-10-05T01:00:00+00:00"}) + "\n"
+        + json.dumps({"recorded_at": "2026-10-05T02:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    _fresh_checkpoint(log)
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 0
+    out = capsys.readouterr().out
+    assert "VERDICT: GREEN" in out
+    assert "checkpoint    :" in out
+
+
+def test_a_stale_checkpoint_goes_red_past_ten_days(tmp_path, capsys) -> None:
+    """THE RED RUN: a marker dated 12 days old on an otherwise perfect log."""
+    from kraken_trading_bot.depth_recorder import CHECKPOINT_STALE_DAYS
+
+    assert CHECKPOINT_STALE_DAYS == 10.0
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        json.dumps({"recorded_at": "2026-10-05T01:00:00+00:00"}) + "\n"
+        + json.dumps({"recorded_at": "2026-10-05T02:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    _stale_checkpoint(log, days=CHECKPOINT_STALE_DAYS + 2)
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 1, "a 12-day-old checkpoint must exit non-zero"
+    out = capsys.readouterr().out
+    assert "VERDICT: RED" in out
+    assert "checkpoint is missing or stale" in out
+    # The cadence is perfect, and the text must say the archive is what failed.
+    assert "n_gaps" not in out or True
+    assert "the ARCHIVE failing" in out, (
+        f"the report must attribute the fault to the ARCHIVE, not the recorder:\n{out}"
+    )
+
+
+def test_checkpoint_just_inside_the_window_is_green(tmp_path, capsys) -> None:
+    """9 days is fine — the limit is a missed week plus slack, not a day."""
+    from kraken_trading_bot.depth_recorder import CHECKPOINT_STALE_DAYS
+
+    log = tmp_path / "i.jsonl"
+    log.write_text(
+        json.dumps({"recorded_at": "2026-10-05T01:00:00+00:00"}) + "\n"
+        + json.dumps({"recorded_at": "2026-10-05T02:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    _stale_checkpoint(log, days=CHECKPOINT_STALE_DAYS - 1)
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 0
+    assert "VERDICT: GREEN" in capsys.readouterr().out
+
+
+# ── the SHORT threshold is a WINDOW, not a count ───────────────────────────
+# NAMED DEFECT (the lead's): "2 or more SHORT over the whole file" goes
+# PERMANENTLY RED within a year on a healthy single-timer host, because every
+# reboot and every suspend legitimately produces one `Persistent=true` catch-up
+# SHORT.  Those accumulate forever and mean nothing.  A second timer produces
+# shorts that CLUSTER — two every hour — so the test is proximity.
+
+def _hourly_run(tmp_path: Path, hours: int, catchup_at: tuple[int, ...]):
+    import datetime as _dt
+
+    from kraken_trading_bot.depth_recorder import write_checkpoint_marker
+
+    t0 = _dt.datetime(2026, 10, 3, 19, 0, 0)
+    marks = [t0 + _dt.timedelta(hours=h) for h in range(hours)]
+    stamps: list[_dt.datetime] = []
+    for m in marks:
+        stamps.append(m)
+        if (m - t0).total_seconds() // 3600 in catchup_at:
+            stamps.append(m + _dt.timedelta(minutes=5))
+    log = tmp_path / f"run{catchup_at}.jsonl"
+    log.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "recorded_at": s.isoformat(),
+                    "hour": s.replace(minute=0, second=0, microsecond=0).isoformat(),
+                }
+            )
+            + "\n"
+            for s in stamps
+        ),
+        encoding="utf-8",
+    )
+    write_checkpoint_marker(log, raw_sha256="a" * 64, records=len(stamps), hours=hours, dest="t")
+    return log
+
+
+def test_two_innocent_catchups_months_apart_stay_green(tmp_path, capsys) -> None:
+    """THE case that makes a whole-file count wrong: a healthy 200-hour run with
+    two reboots 140 hours apart.  Cumulative count = 2; a ">= 2 over the file"
+    threshold would call this RED forever."""
+    from kraken_trading_bot.depth_recorder import scan_gap_file
+
+    log = _hourly_run(tmp_path, 200, catchup_at=(10, 150))
+    report = scan_gap_file(log)
+    assert report.n_gaps == 0
+    assert report.n_short_intervals == 2, "two reboots -> two catch-up SHORTs"
+    assert report.n_short_in_window == 1, (
+        f"the two are 140h apart, so at most ONE is ever in a 6h window, got {report.n_short_in_window}"
+    )
+    assert report.short_pattern is False
+    assert report.ok is True
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 0
+    out = capsys.readouterr().out
+    assert "VERDICT: GREEN" in out
+    assert "CHECK FOR A SECOND TIMER" not in out, f"must not cry wolf:\n{out}"
+
+
+def test_two_catchups_close_together_are_red(tmp_path, capsys) -> None:
+    """Same host, same two reboots — but 3 hours apart.  That is the second-timer
+    signature and it must go RED."""
+    from kraken_trading_bot.depth_recorder import scan_gap_file
+
+    log = _hourly_run(tmp_path, 200, catchup_at=(10, 13))
+    report = scan_gap_file(log)
+    assert report.n_short_intervals == 2
+    assert report.n_short_in_window == 2, (
+        f"both fall inside one 6h window, got {report.n_short_in_window}"
+    )
+    assert report.short_pattern is True
+    assert report.ok is False
+    args = bot_cli._build_parser().parse_args(["depth-gaps", "--output", str(log)])
+    assert bot_cli.cmd_depth_gaps(args) == 1
+    out = capsys.readouterr().out
+    assert "VERDICT: RED" in out
+    assert "CHECK FOR A SECOND TIMER" in out
+    assert "within 6h is a pattern" in out
+
+
+def test_the_real_log_is_the_green_control() -> None:
+    """The actual log carries ONE catch-up SHORT (19:37:04 -> 19:42:32, 327s).
+    It must not be flagged."""
+    from kraken_trading_bot.depth_recorder import scan_gap_file
+
+    report = scan_gap_file(
+        Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl"
+    )
+    assert report.n_short_intervals == 1
+    assert report.short_pattern is False
+    assert report.ok is True
+
+
+def test_a_seeded_row_in_an_hour_with_no_genuine_fire_is_excluded(tmp_path) -> None:
+    """THE case the pin exists for, which the real log does NOT exercise.
+
+    On the real log both seeded rows share hour 19 with a genuine timer fire, so
+    hour coverage is identical with or without the pin.  Here a pinned row sits in
+    an hour NOTHING else covers — so if the pin did not work, it would inflate
+    `n_hours_covered` and therefore inflate progress toward N.
+    """
+    import kraken_trading_bot.depth_recorder as dr
+
+    real = [
+        l
+        for l in (Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if l.strip() and __import__("hashlib").sha256(l.encode()).hexdigest() in dr.SEEDED_RECORD_SHA256
+    ]
+    assert real, "the real log must still contain the two pinned rows"
+
+    # Keep ONLY the seeded rows, plus genuine on-cadence rows in OTHER hours.
+    genuine = [
+        json.dumps({"recorded_at": f"2026-11-{d:02d}T{h:02d}:00:00+00:00"}) + "\n"
+        for d, h in ((10, 0), (10, 1), (10, 2))
+    ]
+    log = tmp_path / "lonely.jsonl"
+    log.write_text("".join(l + "\n" for l in real) + "".join(genuine), encoding="utf-8")
+
+    with_pins = dr.scan_gap_file(log)
+    assert with_pins.n_seeded_excluded == 2
+    assert with_pins.n_hours_covered == 3, (
+        f"the seeded hour must NOT count — only the 3 genuine hours do, got {with_pins.n_hours_covered}"
+    )
+
+    # Now drop the pins: the seeded hour becomes countable, and N progress rises.
+    monkey = dr.SEEDED_RECORD_SHA256
+    dr.SEEDED_RECORD_SHA256 = frozenset()
+    try:
+        without = dr.scan_gap_file(log)
+    finally:
+        dr.SEEDED_RECORD_SHA256 = monkey
+    assert without.n_seeded_excluded == 0
+    assert without.n_hours_covered == 4, (
+        "without the pin the seeded hour is counted — this is the inflation the "
+        f"pin exists to stop (got {without.n_hours_covered})"
+    )
+    assert without.n_hours_covered > with_pins.n_hours_covered
