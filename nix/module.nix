@@ -285,8 +285,11 @@ onCalendar = lib.mkOption {
 
             remote = lib.mkOption {
               type = lib.types.str;
-              default = "https://github.com/Cairnstew/kraken-depth-archive.git";
-              example = "https://github.com/Cairnstew/kraken-depth-archive.git";
+              # SSH, not HTTPS: the credential is a per-repo deploy key, which an
+              # HTTPS PAT cannot be.  A PAT is scoped by what the TOKEN may do; a
+              # deploy key is scoped by what the KEY is registered against.
+              default = "git@github.com:Cairnstew/kraken-depth-archive.git";
+              example = "git@github.com:Cairnstew/kraken-depth-archive.git";
               description = ''
                 Git remote for the archive.  Must be reachable WITHOUT an
                 interactive prompt — the unit runs unattended, so a credential
@@ -431,16 +434,26 @@ Unit = "kraken-trading-bot-order-book.service";
         systemd.services."kraken-trading-bot-depth-checkpoint" = lib.mkIf ob.checkpoint.enable {
           description = "Copy the order-book depth log off this machine (G1)";
           wantedBy = [ "multi-user.target" ];
-          serviceConfig = {
-            Type = "oneshot";
-            # The repo path is fixed at build time; the recipe refuses any
-            # destination on the same physical disk as the log.
-            WorkingDirectory = cfg.homeDir;
-            ExecStart = "${pkgs.just}/bin/just --justfile ${cfg.homeDir}/Projects/kraken-trading-bot/justfile --working-directory ${cfg.homeDir}/Projects/kraken-trading-bot depth-backup-git ${ob.checkpoint.remote}";
-            # Network and DNS may be down; a failed week must be visible in the
-            # journal, not fatal to boot.
-            SuccessExitStatus = 0;
-          };
+serviceConfig = {
+              Type = "oneshot";
+              # The repo path is fixed at build time; the recipe refuses any
+              # destination on the same physical disk as the log.
+              WorkingDirectory = cfg.homeDir;
+              ExecStart = "${pkgs.just}/bin/just --justfile ${cfg.homeDir}/Projects/kraken-trading-bot/justfile --working-directory ${cfg.homeDir}/Projects/kraken-trading-bot depth-backup-git ${ob.checkpoint.remote}";
+              # A dedicated deploy key on kraken-depth-archive alone, NOT a PAT and
+              # not id_ed25519 — a deploy key cannot reach any other repo, which a
+              # PAT or a registered personal key can.  IdentitiesOnly=yes stops an
+              # agent key from standing in for it, so the scoping is not merely
+              # nominal.  Pinned per-unit: the credential is a property of THIS
+              # unit, not of whoever happens to be logged in.
+              Environment = [
+                "HOME=${cfg.homeDir}"
+                "GIT_SSH_COMMAND=ssh -i ${cfg.homeDir}/.ssh/kraken-depth-archive -o IdentitiesOnly=yes -o BatchMode=yes"
+              ];
+              # Network and DNS may be down; a failed week must be visible in the
+              # journal, not fatal to boot.
+              SuccessExitStatus = 0;
+            };
         };
         systemd.timers."kraken-trading-bot-depth-checkpoint" = lib.mkIf ob.checkpoint.enable {
           description = "Weekly off-machine copy of the order-book depth log (G1)";

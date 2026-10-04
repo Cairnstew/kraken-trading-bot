@@ -20,7 +20,10 @@ WorkingDirectory=@ROOT@
 ExecStart=@JUST@ --justfile @ROOT@/justfile --working-directory @ROOT@ depth-backup-git @REMOTE@
 # Network or DNS down must be visible in the journal, not fatal to the boot.
 SuccessExitStatus=0
-# The credential is read from ~/.git-credentials via the gh credential helper,
-# both under $HOME.  Pin HOME so a login-less unit still finds them.
-Environment=HOME=@HOME@
+  # The credential is a DEDICATED deploy key on kraken-depth-archive alone, not a
+  # PAT and not id_ed25519.  IdentitiesOnly=yes is what makes the scoping real: an
+  # agent holding some other key must not be able to satisfy this unit's auth.
+  # HOME is pinned so the unit resolves ~ the same way the credential expects.
+  Environment=HOME=@HOME@
+  Environment=GIT_SSH_COMMAND=ssh -i @HOME@/.ssh/kraken-depth-archive -o IdentitiesOnly=yes -o BatchMode=yes
 TimeoutStartSec=300

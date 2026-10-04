@@ -795,11 +795,23 @@ depth-reassemble dest output="signals/eth_usd_orderbook.jsonl":
 # Layout, chosen so the archive does not grow without bound:
 #   rolling/depth.jsonl.gz              one rolling file, force-updated
 #   checkpoints/depth.<week>.jsonl.gz   WEEKLY INCREMENTAL, dated, never a full copy
-depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
+#
+# The remote is SSH, and the key is a DEDICATED deploy key registered on
+# kraken-depth-archive alone.  `IdentitiesOnly=yes` is the load-bearing part: an
+# agent holding another key must not be able to satisfy this repository's auth,
+# or the scoping below is only as good as whatever the agent happens to offer.
+# Proven: this same key is refused by kraken-trading-bot
+#   ERROR: Permission to Cairnstew/kraken-trading-bot.git denied to deploy key
+depth-backup-git remote="git@github.com:Cairnstew/kraken-depth-archive.git":
   #!/usr/bin/env bash
   set -euo pipefail
   root="{{justfile_directory()}}"
   src="$root/signals/eth_usd_orderbook.jsonl"
+  # Pinned here as well as in the unit, so a manual run cannot silently fall
+  # back to a PAT or to an agent key.  The unit sets it too; this is the floor.
+  key="${DEPTH_ARCHIVE_KEY:-$HOME/.ssh/kraken-depth-archive}"
+  [ -r "$key" ] || { echo "no archive key at $key — set DEPTH_ARCHIVE_KEY" >&2; exit 1; }
+  export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes"
   state="$root/.depth-backup-state"
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
@@ -852,13 +864,22 @@ depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
   # sha256 of the RESULT — not the compressed container, whose bytes vary with
   # the gzip version, and not the local file, which is what we are testing.
   verify_dir="$(mktemp -d)"
-  git clone -q --depth 1 "{{remote}}" "$verify_dir/remote"
+  # `--branch main` is load-bearing, and it was missing.  The push targets
+  # `HEAD:main`, but a bare clone follows the remote's DEFAULT branch, which is
+  # independent of what was just pushed.  On a bare repo whose HEAD still points
+  # at refs/heads/master the clone returned an EMPTY tree; gzip then died under
+  # `set -e`, exiting non-zero WITHOUT printing MISMATCH — so a real verification
+  # failure reported itself as a bare exit code.  Found by writing the test
+  # below.  GitHub hides this by pointing HEAD at main; a fresh bare remote does not.
+  git clone -q --depth 1 --branch main --single-branch "{{remote}}" "$verify_dir/remote"
   gzip -dc "$verify_dir/remote/rolling/depth.jsonl.gz" > "$verify_dir/roundtrip.jsonl"
   local_sha="$(sha256sum "$src" | cut -d' ' -f1)"
   remote_sha="$(sha256sum "$verify_dir/roundtrip.jsonl" | cut -d' ' -f1)"
   rm -rf "$verify_dir"
   if [ "$local_sha" != "$remote_sha" ]; then
-    echo "READ-BACK MISMATCH — the push reported success but the remote copy differs" >&2
+    echo "READ-BACK MISMATCH — the push reported success but refs/heads/main on" >&2
+    echo "  the remote does not hold what was pushed (accepted and discarded, or" >&2
+    echo "  still serving another ref)" >&2
     echo "  local  sha256: $local_sha" >&2
     echo "  remote sha256: $remote_sha" >&2
     echo "  MARKER NOT WRITTEN. The checkpoint did not happen." >&2
@@ -879,14 +900,19 @@ depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
 # READ BACK the off-machine copy and check it byte-for-byte against the live log.
 # This is what "done" means: not that a push happened, but that the pushed bytes
 # GUNZIP to exactly the local file.  Anything less is a hope, not a backup.
-depth-verify-offmachine remote="https://github.com/Cairnstew/kraken-depth-archive.git":
+depth-verify-offmachine remote="git@github.com:Cairnstew/kraken-depth-archive.git":
   #!/usr/bin/env bash
   set -euo pipefail
   root="{{justfile_directory()}}"
   src="$root/signals/eth_usd_orderbook.jsonl"
   work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
+  key="${DEPTH_ARCHIVE_KEY:-$HOME/.ssh/kraken-depth-archive}"
+  [ -r "$key" ] || { echo "no archive key at $key — set DEPTH_ARCHIVE_KEY" >&2; exit 1; }
+  export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes"
   echo "  fetching the OFF-MACHINE copy from {{remote}} ..."
-  git clone -q --depth 1 "{{remote}}" "$work/remote"
+  # Same `--branch main` correction as depth-backup-git: a bare clone follows the
+  # remote's DEFAULT branch, so this verified a ref the push never named.
+  git clone -q --depth 1 --branch main --single-branch "{{remote}}" "$work/remote"
   echo "  fetched rolling/depth.jsonl.gz ($(wc -c < "$work/remote/rolling/depth.jsonl.gz") bytes compressed)"
   gzip -dc "$work/remote/rolling/depth.jsonl.gz" > "$work/roundtrip.jsonl"
   local_sha="$(sha256sum "$src" | cut -d' ' -f1)"

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1697,3 +1698,221 @@ def read_checkpoint_marker_stale(log: Path, days: float = 30.0):
         encoding="utf-8",
     )
     return read_checkpoint_marker(log)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The read-back must observe the REMOTE, not the repo that just pushed.
+#
+# `git push` exiting 0 says the remote accepted the objects.  It does not say the
+# remote's ref already resolves to them: a hook can accept and discard, a mirror
+# can lag, a proxy can swallow.  So the only honest check re-clones the remote and
+# compares what came BACK.  A read-back against the local repo would compare the
+# file against itself and always pass — which is the failure this pair of tests
+# exists to make impossible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _fake_root(tmp_path: Path) -> Path:
+    """An isolated copy of the repo bits the recipe reads, so a test run cannot
+    overwrite the real checkpoint marker next to the live log."""
+    root = tmp_path / "root"
+    (root / "signals").mkdir(parents=True)
+    repo = Path(__file__).resolve().parents[1]
+    (root / "justfile").write_text((repo / "justfile").read_text(encoding="utf-8"), encoding="utf-8")
+    shutil.copy(
+        repo / "signals" / "eth_usd_orderbook.jsonl",
+        root / "signals" / "eth_usd_orderbook.jsonl",
+    )
+    return root
+
+
+def _gz(data: bytes) -> bytes:
+    return subprocess.run(
+        ["gzip", "-9", "-c"], input=data, check=True, capture_output=True
+    ).stdout
+
+
+def _git(*a: str, cwd: Path) -> None:
+    subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+
+
+def _seed_branch(bare: Path, work: Path, branch: str, rolling: bytes) -> None:
+    """Publish one branch holding `rolling`, and leave the bare repo's HEAD alone."""
+    work.mkdir(parents=True, exist_ok=True)
+    _git("init", "-q", ".", cwd=work)
+    (work / "rolling").mkdir(exist_ok=True)
+    (work / "rolling" / "depth.jsonl.gz").write_bytes(rolling)
+    env = {
+        "GIT_AUTHOR_NAME": "seed", "GIT_AUTHOR_EMAIL": "s@x",
+        "GIT_COMMITTER_NAME": "seed", "GIT_COMMITTER_EMAIL": "s@x",
+        "PATH": os.environ["PATH"], "HOME": os.environ.get("HOME", "/tmp"),
+    }
+    def g(*a):
+        subprocess.run(["git", *a], cwd=work, check=True, capture_output=True, env=env)
+    g("add", "-A")
+    g("commit", "-qm", f"seed {branch}")
+    g("remote", "add", "origin", str(bare))
+    g("push", "-q", "--force", "origin", f"HEAD:{branch}")
+
+
+def _live_remote(tmp_path: Path) -> Path:
+    """A bare remote whose HEAD is `master` holding STALE bytes, while `main` is
+    absent.  This is the shape that broke the read-back: the recipe pushes
+    HEAD:main, but a bare clone follows the remote's DEFAULT branch."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(
+        ["git", "--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/master"],
+        check=True,
+    )
+    _seed_branch(bare, tmp_path / "seedmaster", "master", _gz(b'{"recorded_at":"STALE"}\n'))
+    return bare
+
+
+def _run_checkpoint(root: Path, bare: Path) -> subprocess.CompletedProcess:
+    """Run the REAL recipe against a local bare 'remote', with `nix` stubbed out.
+
+    The recipe reads the hour count via `nix run ... || true`; in a temp root there
+    is no flake, and that call is irrelevant to the read-back.  Stubbing it keeps
+    the test fast and hermetic rather than dependent on the dev shell.
+    """
+    stub = root / "stubbin"
+    stub.mkdir()
+    # `nix run "$root"#kraken-trading-bot -- ARGS` in a temp root has no flake to
+    # resolve, so dispatch to the CLI the dev shell already put on PATH.  The
+    # recipe's two uses (depth-gaps for the hour count, depth-checkpoint-mark for
+    # the marker) then run for real, and the whole recipe is exercised rather than
+    # stopping at the read-back.
+    (stub / "nix").write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = run ] && shift\n'
+        'while [ $# -gt 0 ] && [ "$1" != -- ]; do shift; done\n'
+        "shift\n"
+        'exec kraken-trading-bot "$@"\n',
+        encoding="utf-8",
+    )
+    (stub / "nix").chmod(0o755)
+    key = root / "fakekey"
+    key.write_text("not a real key; the remote is a local path\n", encoding="utf-8")
+    return subprocess.run(
+        ["just", "--justfile", str(root / "justfile"), "--working-directory", str(root),
+         "depth-backup-git", str(bare)],
+        capture_output=True, text=True, timeout=180,
+        env={**os.environ, "PATH": f"{stub}{os.pathsep}{os.environ['PATH']}",
+             "DEPTH_ARCHIVE_KEY": str(key), "HOME": str(root)},
+    )
+
+
+def _marker(root: Path) -> Path:
+    return root / "signals" / "eth_usd_orderbook.jsonl.checkpoint.json"
+
+
+def test_readback_reads_the_pushed_ref_not_the_remotes_default_branch(tmp_path) -> None:
+    """A push that reports success while the remote does not hold the data.
+
+    `git push` exiting 0 says the remote accepted the objects; it does not say the
+    ref you pushed has become the ref you can read back.  Here the remote's
+    default branch is `master` holding stale bytes, and `main` is what was
+    pushed — the shape that made the read-back compare the wrong ref entirely.
+
+    RED before the fix: the clone followed HEAD to `master`, so gzip died on a
+    file that was not there and `set -e` exited non-zero WITHOUT printing
+    MISMATCH — a verification failure indistinguishable from a plumbing crash.
+    """
+    root = _fake_root(tmp_path)
+    bare = _live_remote(tmp_path)
+
+    proc = _run_checkpoint(root, bare)
+    out = proc.stdout + proc.stderr
+
+    assert "pushed ->" in out, f"the push itself must appear to succeed:\n{out}"
+    assert proc.returncode == 0, (
+        "the read-back did not follow refs/heads/main — the branch actually pushed "
+        f"— so it either failed on the wrong ref or aborted before reporting:\n{out}"
+    )
+    assert "read-back verified byte-identical" in out, (
+        f"the read-back did not verify the pushed ref:\n{out}"
+    )
+    assert _marker(root).exists(), f"a verified checkpoint must write its marker:\n{out}"
+
+
+def test_a_rejected_push_writes_no_marker(tmp_path) -> None:
+    """The other half: when the remote refuses the push, no marker.  A green
+    checkpoint age is a claim about the remote, so it may only follow a push the
+    remote accepted AND a read-back that matched."""
+    root = _fake_root(tmp_path)
+    bare = _live_remote(tmp_path)
+    hook = bare / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+
+    proc = _run_checkpoint(root, bare)
+    out = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0, f"a rejected push must fail the recipe:\n{out}"
+    assert not _marker(root).exists(), (
+        f"a marker was written although the remote rejected the push:\n{out}"
+    )
+
+
+def test_readback_clones_the_same_remote_that_was_pushed_to() -> None:
+    """Structural: push, echo and read-back must all name ONE remote.
+
+    A clone of the local `$repo` would compare the log against itself and pass
+    unconditionally.  Comparing the three call sites also catches the narrower
+    mistake — a read-back pointed at a DIFFERENT remote than the one just pushed
+    to, which would compare two unrelated things.
+
+    The extractor substitutes the recipe's argument, so the token is opaque here;
+    the invariant is that the three call sites AGREE, not what the token spells.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    body = _recipe_body(repo, "depth-backup-git")
+    blines = [l.strip() for l in body.splitlines() if l.strip()]
+
+    clone = [l for l in blines if "git clone" in l]
+    assert clone, "the read-back must clone what was pushed"
+    src = next(
+        t for t in clone[0].split()
+        if t.startswith(('"', "'")) and "$" not in t
+    )
+    assert src.startswith(('"', "'")) and src.endswith(('"', "'")), (
+        f"the read-back must clone from a remote URL, not a local path: {clone[0]!r}"
+    )
+    assert "$repo" not in clone[0], (
+        f"the read-back clones the LOCAL repo: {clone[0]!r} — that compares the log "
+        "with itself and always passes"
+    )
+    tgt = [l for l in blines if "remote add origin" in l][0]
+    tgt = tgt.split("remote add origin", 1)[1].split()[0].strip("\"'")
+    assert src.strip("\"'") == tgt, (
+        f"read-back clones {src} but the push targets {tgt} — two different remotes"
+    )
+    pushed = [l for l in blines if "pushed ->" in l]
+    echoed = pushed[0].split("pushed ->", 1)[1].strip().strip("\"'") if pushed else ""
+    assert echoed == src.strip("\"'"), (
+        "the push confirmation names a different remote than the read-back clones: "
+        f"{echoed or '(no push confirmation found)'} vs {src}"
+    )
+
+
+def test_readback_names_the_branch_it_pushed() -> None:
+    """Structural: the push target and the read-back branch must be the same ref.
+
+    `git clone` without `--branch` follows the remote's DEFAULT branch, which is
+    server configuration, not something this recipe controls.  Reading back
+    `HEAD` after pushing `HEAD:main` verifies a ref the push never named.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    body = _recipe_body(repo, "depth-backup-git")
+    push = [l for l in body.splitlines() if "git push" in l]
+    assert push, "the recipe must push"
+    m = re.search(r"HEAD:(\S+)", push[0])
+    assert m, f"cannot read the pushed ref out of {push[0]!r}"
+    branch = m.group(1)
+    clones = [l for l in body.splitlines() if "git clone" in l and "verify_dir" in l]
+    assert clones, "the read-back clone is missing"
+    assert f"--branch {branch}" in clones[0], (
+        f"the push targets {branch} but the read-back clone does not name it: "
+        f"{clones[0].strip()!r} — a bare clone follows the remote's default branch"
+    )

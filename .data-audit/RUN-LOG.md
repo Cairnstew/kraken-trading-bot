@@ -1823,3 +1823,123 @@ protected. The case that matters — a pinned row in an hour nothing else covers
 synthetic test: with the pin, `n_hours_covered == 3` (only genuine hours); with the pin
 removed, `4` — the seeded hour would inflate progress toward N. The guard is now exercised on
 the situation it exists for.
+
+### 25.1 The "expected red" framing of `audit-verify` was wrong, and is withdrawn
+
+For several days `audit-verify` reported `RESULT FAIL` on
+`measurement-track CHANGED differs from prereg`, and I recorded that red as
+**expected** — the estimator guard that would judge it properly did not exist
+yet. That framing was wrong in two independent ways, and both matter to whoever
+reads this next.
+
+**First: it could never have passed.** The only thing that would clear it was
+byte-identity between `tools/model_matrix.py` at `97a2a52` and at HEAD. That was
+never achievable, because the required work *is* an addition to that file — a
+guard that asserts the measurement rule did not move cannot itself be an addition
+that leaves the file byte-identical. So the red was not "a gate awaiting its
+judge"; it was a gate demanding the impossible, annotated as tolerable. A FAIL
+labelled EXPECTED trains a reader to ignore FAILs, which is the exact habit that
+lets a real one through.
+
+**Second: the remedy was a better question, not a better excuse.** The correct
+response to "the file changed, is the measurement intact?" is to *check the
+measurement*, not to certify the file. So the guard now answers it
+(`ESTIMATOR_SYMBOLS`, `estimator_symbol_diff`, a nine-case self-test) and
+byte-identity is reported but no longer decides the verdict. Same red input,
+different question, and now it can pass:
+
+    measurement-track  CHANGED  differs from prereg 97a2a52 (+162/-0 lines)
+    estimator-symbols  MATCH  all 25 pinned estimator symbol(s) UNCHANGED
+    suite              PASS  638 passed
+    RESULT             PASS
+
+**The rule this establishes:** a red that is labelled "expected" is a claim that
+the check is wrong, and it must be discharged by fixing the check or by proving
+the claim — never by annotating the output. "Expected" is not a verdict.
+
+### 25.2 Where the 25-name pin came from, and the "five symbols" that never existed
+
+Asked to explain a jump from "five symbols" to "all 25 pinned", I checked before
+answering. **There has never been a five-symbol estimator pin.** The pin has been
+25 names since the commit that introduced it (`4d71a8b`), and that is the only
+commit that has ever contained `ESTIMATOR_SYMBOLS`:
+
+    for c in $(git log --format=%h -6 4d71a8b); do ... pin size ...; done
+      4d71a8b  pinned=25   feat(audit): Phase 7 estimator-SYMBOL guard
+
+The number I gave earlier was wrong, and two plausible sources exist for it in the
+record. `5/5 symbols` is real but belongs to a **different artifact** — the
+`4c65432` branch pin in `BRANCH-AUDIT-G1.md:18`, which counts that branch's
+symbols, not the estimator's. And `audit_checks.py` prints **two different
+counts** from adjacent branches, which is an easy thing to misread:
+
+- `MATCH {len(_symbols(cur))} symbol(s) unchanged` — byte-identical case; the
+  number is every top-level symbol in the file (74), not the pin.
+- `MATCH all {len(ESTIMATOR_SYMBOLS)} pinned estimator symbol(s) UNCHANGED` —
+  the CHANGED-but-estator-intact case; the number is the pin (25).
+
+### 25.3 Provenance: the pin is extracted from 97a2a52, never from the file under test
+
+A pin taken from the file being checked passes by construction, so this is shown
+rather than asserted. Extraction, run against the pre-registration commit only —
+the working tree is never an input:
+
+    git show 97a2a52:tools/model_matrix.py > mm-prereg.py
+    ast.parse -> top-level FunctionDef/AsyncFunctionDef/ClassDef names
+               ∪ module-level UPPER_CASE Assign targets
+
+    mm-prereg: 64 defs/classes + 10 UPPER_CASE constants = 74 top-level symbols
+    mm-head:   66 defs/classes + 12 UPPER_CASE constants = 78 top-level symbols
+
+    pin size                    : 25
+    ALL pinned exist @97a2a52   : True   missing: none
+    pinned ∩ added-since-prereg : none (nothing pinned was added later)
+    added since prereg          : ['_SIGNAL_TICKER_ALIASES', '_SIGNAL_TICKER_FIELD',
+                                   '_signal_file_tickers', 'canonical_pair']
+
+The last line is the load-bearing one: the four symbols added since the
+pre-registration are **deliberately unpinned**, which is what a pin derived from
+`97a2a52` looks like and what a pin derived from HEAD could not look like.
+
+### 25.4 The read-back was verifying a ref the push never named
+
+Asked for a test where a push succeeds but returns before the remote has the
+data, I built it against a local bare remote — and it failed for a reason I had
+not anticipated. The recipe pushes `HEAD:main` and then ran:
+
+    git clone -q --depth 1 "{{remote}}" "$verify_dir/remote"
+
+A bare clone follows the remote's **default branch**, which is server
+configuration, not something the recipe controls. On a bare repo whose HEAD still
+points at `refs/heads/master`, the clone returned an empty tree; `gzip -dc` then
+died on a missing file and `set -e` exited non-zero **without printing
+MISMATCH** — a verification failure indistinguishable from a plumbing crash.
+
+This is the exact failure the requested test is about, one level of indirection
+further out: not "the remote lacks the data" but "the remote was never asked
+about the ref that has it". GitHub hides it, because its HEAD points at `main`
+after the first push; a fresh bare remote does not, which is why the live test
+finds it and the weekly run would not have.
+
+Fixed in both read-back sites by naming the branch that was pushed:
+
+    git clone -q --depth 1 --branch main --single-branch "{{remote}}" ...
+
+**RED RUN (fix reverted), which is the proof the test is not vacuous:**
+
+    weekly incremental for 2026-W40: 17 new record(s)
+    pushed -> …/remote.git
+    warning: --depth is ignored in local clones; use file:// instead.
+    READ-BACK MISMATCH — the push reported success but refs/heads/main on
+      the remote does not hold what was pushed (accepted and discarded, or
+      still serving another ref)
+      local  sha256: fac4dfeb…
+      remote sha256: <stale master>
+      MARKER NOT WRITTEN. The checkpoint did not happen.
+    exit 1        -> 2 tests FAILED
+
+With the fix: `read-back verified byte-identical`, marker written, `5 passed`.
+The two live tests run the **real recipe** via `just` against a temp bare remote,
+with `nix run "$root"#kraken-trading-bot` stubbed to the already-built CLI on
+PATH — so the whole recipe runs, marker write included, not just the read-back.
+Suite 638 -> 642.
