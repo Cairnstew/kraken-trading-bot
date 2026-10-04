@@ -55,6 +55,44 @@ def at(seconds: float) -> datetime:
     return T0 + timedelta(seconds=seconds)
 
 
+class _SequenceClock:
+    """A pinned `utc_now` that yields a scripted sequence, then keeps advancing.
+
+    Readable any number of times, so a test asserts the ORDER of the scripted
+    values rather than the total NUMBER of clock reads.  This replaced
+    `iter([at(0), at(0), at(HOUR), at(HOUR)])`, which silently coupled a test to
+    the exact count of `utc_now()` calls the code makes: adding the snapshot-age
+    read to the status line and the checkpoint-age read made it five, the
+    iterator ran dry, and the failure surfaced as an EMPTY message from a broad
+    except.  Any future clock read would have broken it again.
+    """
+
+    def __init__(self, sequence, step_seconds: float = 3600.0):
+        self._seq = list(sequence)
+        self._step = step_seconds
+        self._n = 0
+
+    def __call__(self):
+        i = self._n
+        self._n += 1
+        if i < len(self._seq):
+            return self._seq[i]
+        last = self._seq[-1]
+        return last + timedelta(seconds=self._step * (i - len(self._seq) + 1))
+
+    @property
+    def reads(self) -> int:
+        return self._n
+
+    # Call sites use `next(...)`, so be an iterator as well.  Iterating must NOT
+    # reset the script, or a `next()` after a loop would replay from zero.
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> datetime:
+        return self()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fakes
 # ─────────────────────────────────────────────────────────────────────────────
@@ -655,7 +693,7 @@ def test_record_depth_exits_zero_and_says_green_with_two_records_on_cadence(
     # ONE `record_once` reads the clock TWICE: once for the record's own
     # `recorded_at`, once for the status sidecar's `generated_at`.  Two
     # fires therefore need four stamps, in that order.
-    stamps = iter([at(0), at(0), at(HOUR), at(HOUR)])
+    stamps = _SequenceClock([at(0), at(0), at(HOUR), at(HOUR)])
     monkeypatch.setattr(
         kraken_api.KrakenManager, "from_env", staticmethod(lambda: FakeManager())
     )
@@ -831,13 +869,19 @@ def test_the_feature_seam_is_unchanged_on_disk():
 _RECIPE_NAME = "depth-timer"
 
 
-def _recipe_body(repo: Path) -> str:
-    """The shell body of the `depth-timer` recipe, placeholders already resolved."""
+def _recipe_body(repo: Path, recipe: str | None = None) -> str:
+    """The shell body of a just recipe, placeholders already resolved.
+
+    `recipe` defaults to `depth-timer`; pass a name to read a different one.
+    (It was hardcoded, so a test aimed at `depth-backup-git` silently read the
+    depth-timer body and asserted against the wrong recipe.)
+    """
+    name = recipe or _RECIPE_NAME
     lines = (repo / "justfile").read_text(encoding="utf-8").splitlines()
     start = next(
-        (i for i, l in enumerate(lines) if re.match(rf"^{_RECIPE_NAME}\b", l)), None
+        (i for i, l in enumerate(lines) if re.match(rf"^{re.escape(name)}\b", l)), None
     )
-    assert start is not None, f"justfile has no {_RECIPE_NAME} recipe"
+    assert start is not None, f"justfile has no {name} recipe"
     # A just recipe body runs until the next line that is neither blank nor indented.
     # Deliberately NOT `\s{4}`: that assumed an indent width, and depth-timer alone
     # was mixed (4-space header over a 2-space body) before this normalised it.
@@ -1548,3 +1592,108 @@ def test_a_seeded_row_in_an_hour_with_no_genuine_fire_is_excluded(tmp_path) -> N
         f"pin exists to stop (got {without.n_hours_covered})"
     )
     assert without.n_hours_covered > with_pins.n_hours_covered
+
+
+# ── the checkpoint must not be gated on ANY recorder RED ───────────────────
+# NAMED DEFECT, found twice: `depth-gaps` exits 1 when the ARCHIVE is stale, and
+# the checkpoint recipe/unit called it — so the cure inherited the disease and a
+# stale checkpoint could never be cleared.  Once fixed for `stale`, the same
+# coupling would have re-broken it for a `hole` or a `cadence` RED, so the
+# invariant is asserted STRUCTURALLY rather than by planting defects in the
+# unrecoverable log.
+
+def test_checkpoint_recipe_ignores_depth_gaps_exit_code() -> None:
+    """`depth-gaps` is called for a NUMBER only; its verdict must not gate."""
+    repo = Path(__file__).resolve().parents[1]
+    body = _recipe_body(repo, "depth-backup-git")  # the extractor de-indents
+    blines = body.splitlines()
+    # The `hours=$(... depth-gaps ...)` pipeline spans lines and its `|| true`
+    # lands on the CONTINUATION line, so a per-line check for both misses it.
+    idx = [i for i, l in enumerate(blines) if "hours=$(" in l and "depth-gaps" in l]
+    assert idx, "depth-backup-git must read the hour count from depth-gaps"
+    window = "\n".join(blines[idx[0] : idx[0] + 3])
+    assert "|| true" in window, (
+        "the depth-gaps pipeline inside depth-backup-git must tolerate a non-zero "
+        "exit — it runs while the archive is stale, which is exactly when "
+        f"depth-gaps exits 1. Pipeline:\n{window}"
+    )
+
+
+def test_checkpoint_unit_has_no_depth_gaps_preflight() -> None:
+    """A preflight `depth-gaps` ExecStart killed the oneshot on the stale
+    verdict — the unit failed on the very condition it exists to repair."""
+    unit = (
+        Path(__file__).resolve().parents[1]
+        / "systemd"
+        / "kraken-trading-bot-depth-checkpoint.service.in"
+    ).read_text(encoding="utf-8")
+    exec_starts = [
+        l for l in unit.splitlines() if l.startswith("ExecStart=") and "depth-gaps" in l
+    ]
+    assert not exec_starts, (
+        "the checkpoint unit must not run `depth-gaps` as an ExecStart: it exits 1 "
+        f"when the archive is stale, which is what this unit repairs:\n{exec_starts}"
+    )
+
+
+def test_checkpoint_marker_requires_the_readback_to_precede_it() -> None:
+    """A marker written on a push that only LOOKED successful turns a dead
+    archive green — the exact illusion the age check exists to prevent.  So the
+    read-back comparison must appear BEFORE depth-checkpoint-mark in the recipe."""
+    repo = Path(__file__).resolve().parents[1]
+    body = _recipe_body(repo, "depth-backup-git")
+    readback = body.find("READ-BACK MISMATCH")
+    marker = body.find("depth-checkpoint-mark")
+    assert readback != -1, "the read-back verification is missing from the recipe"
+    assert marker != -1, "the recipe must write the checkpoint marker"
+    assert readback < marker, (
+        "the marker is written BEFORE the read-back check — a failed read-back "
+        f"would still leave a green marker (read-back at {readback}, marker at {marker})"
+    )
+
+
+def test_recorder_status_line_reports_four_independent_facts(tmp_path, capsys) -> None:
+    """One line a reader can act on: snapshot age, holes, cadence, archive."""
+    from kraken_trading_bot.depth_recorder import format_report, scan_gap_file
+
+    log = tmp_path / "s.jsonl"
+    log.write_text(
+        json.dumps({"recorded_at": "2026-10-05T01:00:00+00:00"}) + "\n"
+        + json.dumps({"recorded_at": "2026-10-05T02:00:00+00:00"}) + "\n",
+        encoding="utf-8",
+    )
+    _fresh_checkpoint(log)
+    out = format_report(scan_gap_file(log), checkpoint=read_checkpoint_marker_stale(log))
+    status = [l for l in out.splitlines() if l.startswith("  RECORDER STATUS")]
+    assert status, f"no consolidated status line:\n{out}"
+    line = status[0]
+    for field in ("snapshot=", "depth=", "coverage=", "holes=", "cadence=", "archive="):
+        assert field in line, f"{field} missing from the status line:\n{line}"
+    assert "STALE" in line, f"a stale archive must be visible on the one line:\n{line}"
+
+
+def read_checkpoint_marker_stale(log: Path, days: float = 30.0):
+    """A deliberately stale CheckpointState, for the status-line test."""
+    import json as _json
+    from datetime import timedelta
+
+    from kraken_trading_bot.depth_recorder import (
+        CHECKPOINT_MARKER_SUFFIX,
+        read_checkpoint_marker,
+        utc_now,
+    )
+
+    m = Path(str(log) + CHECKPOINT_MARKER_SUFFIX)
+    m.write_text(
+        _json.dumps(
+            {
+                "at": (utc_now() - timedelta(days=days)).isoformat(),
+                "raw_sha256": "c" * 64,
+                "records": 2,
+                "hours": 2,
+                "dest": "test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return read_checkpoint_marker(log)

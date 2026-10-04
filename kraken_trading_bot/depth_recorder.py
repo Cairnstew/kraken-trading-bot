@@ -999,7 +999,42 @@ def format_report(
             f"                 dest: {checkpoint.dest or '(unknown)'}   "
             f"sha256: {(checkpoint.raw_sha256 or '(none)')[:16]}..."
         )
+    # ONE line a reader can act on: how old the newest snapshot is, whether hours
+    # are missing, whether the cadence is doubled, and whether the ARCHIVE is
+    # alive.  Four independent questions that each used to need a different part
+    # of this report, or — the archive one — a different command entirely.
     coverage = report.coverage_ratio
+    snap_age_h = (
+        (utc_now() - parse_timestamp(report.last_recorded_at)).total_seconds() / 3600.0
+        if report.last_recorded_at
+        else None
+    )
+    holes = "OK" if report.n_gaps == 0 else f"{report.n_gaps} HOLE(S)"
+    short = (
+        "OK"
+        if report.n_short_intervals == 0
+        else (
+            f"{report.n_short_in_window}/6h PATTERN"
+            if report.short_pattern
+            else f"{report.n_short_intervals} catch-up"
+        )
+    )
+    arch = (
+        "NEVER CHECKPOINTED"
+        if checkpoint is None or checkpoint.age_days is None
+        else (
+            f"{checkpoint.age_days:.1f}d STALE"
+            if checkpoint.stale
+            else f"{checkpoint.age_days:.1f}d ok"
+        )
+    )
+    lines.append("")
+    lines.append(
+        f"  RECORDER STATUS  snapshot={('never' if snap_age_h is None else f'{snap_age_h:.1f}h ago')}"
+        f"  depth={report.n_hours_covered}/{TARGET_DEPTH_HOURS}h"
+        f"  coverage={('n/a' if coverage is None else f'{coverage * 100:.0f}%')}"
+        f"  holes={holes}  cadence={short}  archive={arch}"
+    )
     lines.append(
         f"  span          : {report.observed_span_seconds:.0f}s observed"
         + (

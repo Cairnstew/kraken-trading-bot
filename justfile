@@ -845,11 +845,31 @@ depth-backup-git remote="https://github.com/Cairnstew/kraken-depth-archive.git":
        fi \
     && git push -q --force origin HEAD:main )
   echo "  pushed -> {{remote}}"
-  # Record the checkpoint ONLY now, after the push succeeded.  This is what
-  # `depth-gaps` reads to decide whether the ARCHIVE is healthy — so it must be
-  # written by the thing that actually did the work, never by hand.  It was
-  # missing here, which is why a successful run still reported a 14-day-old
-  # checkpoint: nothing had ever closed the loop.
+  # READ BACK BEFORE RECORDING ANYTHING.  A marker written on a push that only
+  # LOOKED successful is worse than no marker at all: it turns a dead archive
+  # into a green one, which is the exact illusion the 10-day check exists to
+  # prevent.  So clone what was actually pushed, gunzip it, and compare the
+  # sha256 of the RESULT — not the compressed container, whose bytes vary with
+  # the gzip version, and not the local file, which is what we are testing.
+  verify_dir="$(mktemp -d)"
+  git clone -q --depth 1 "{{remote}}" "$verify_dir/remote"
+  gzip -dc "$verify_dir/remote/rolling/depth.jsonl.gz" > "$verify_dir/roundtrip.jsonl"
+  local_sha="$(sha256sum "$src" | cut -d' ' -f1)"
+  remote_sha="$(sha256sum "$verify_dir/roundtrip.jsonl" | cut -d' ' -f1)"
+  rm -rf "$verify_dir"
+  if [ "$local_sha" != "$remote_sha" ]; then
+    echo "READ-BACK MISMATCH — the push reported success but the remote copy differs" >&2
+    echo "  local  sha256: $local_sha" >&2
+    echo "  remote sha256: $remote_sha" >&2
+    echo "  MARKER NOT WRITTEN. The checkpoint did not happen." >&2
+    exit 1
+  fi
+  echo "  read-back verified byte-identical ($remote_sha)"
+  # Record the checkpoint only now: after the push AND the read-back.  This is
+  # what `depth-gaps` reads to decide whether the ARCHIVE is healthy, so it must
+  # be written by the thing that actually did the work, never by hand.  It was
+  # missing entirely at first, which is why a successful run still reported a
+  # 14-day-old checkpoint: nothing had ever closed the loop.
   nix run "$root"#kraken-trading-bot -- depth-checkpoint-mark \
     --output "$src" --dest "{{remote}}" \
     --sha256 "$(sha256sum "$src" | cut -d' ' -f1)" \
