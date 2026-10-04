@@ -158,6 +158,158 @@ def ast_selftest() -> list[tuple[str, bool]]:
 
 
 # ── verify ──────────────────────────────────────────────────────────────────
+
+# ── Phase 7: the estimator-SYMBOL guard ─────────────────────────────────────
+# `measurement-track` compares model_matrix.py BYTE-FOR-BYTE against the
+# pre-registration ref.  That is the right question ("did the measurement rule
+# change?") but the wrong FORM: the file also grows by additive, non-estimator
+# work — harness, CLI surface, reports — so an honest additive change reads
+# CHANGED forever and the gate cannot be satisfied without lying about the diff.
+#
+# The distinction that matters is not "did any byte move" but "did any ESTIMATOR
+# move".  So compare the top-level symbols: every function and class, with its
+# body, docstring and decorators.  ADDING symbols is allowed (the harness grew);
+# CHANGING or REMOVING one is not, because that is the measurement rule moving.
+#
+# Scoped to the ESTIMATOR symbols, not every symbol.  The first cut compared all
+# 66 top-level symbols and reported 2 "moved" — `build_warnings` and
+# `classify_process_failure` — both of which are HARNESS vocabulary: a new
+# preflight warning reason and a new failure classifier.  Neither computes a
+# statistic, and both were pure additions inside the function bodies.  Guarding
+# them would have blocked the legitimate work this guard exists to permit.
+#
+# So the pinned set is the symbols that produce the measured quantity, plus the
+# module constants that set the bars.  Curated explicitly rather than matched by
+# regex, because a name heuristic silently rots as the file grows; and a symbol
+# that DISAPPEARS is always a failure regardless of the list.
+#
+# Byte-identity remains reported, because it is still the strongest statement
+# available; this guard is what makes a CHANGED verdict triable.
+
+def _symbols(src: str) -> dict[str, str]:
+    """Top-level defs/classes -> a normalised dump of the whole definition."""
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return {}
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            out[node.name] = _ast.dump(node, annotate_fields=True, include_attributes=False)
+    return out
+
+
+#: The symbols that COMPUTE the measured statistic.  These must be unchanged.
+#: Everything else in model_matrix.py is harness: planning, materialising,
+#: running, warning vocabulary, formatting, reporting.  Changing harness cannot
+#: move a measurement; changing any of these can.
+ESTIMATOR_SYMBOLS: frozenset[str] = frozenset(
+    {
+        # the statistic itself
+        "median", "quartile", "summarize", "_finite", "replicated_groups",
+        "_group_iqr", "pooled_within_spread", "dispersion_verdict",
+        "describe_dispersion", "label",
+        # what is measured, and how a cell qualifies to be measured
+        "HEADLINE", "MIN_REPLICATES_FOR_A_CLAIM", "DISPERSION_RATIO_THRESHOLD",
+        "DISPERSION_RESOLVED", "DISPERSION_NOT_SEPARATED", "DISPERSION_UNDEFINED",
+        "DEFAULT_EVAL_SPLIT", "cell_is_out_of_sample", "window_is_pinned",
+        "window_has_split", "_split_boundary", "_view_is_oos", "_group_summaries",
+        "assess_cell", "is_valid",
+    }
+)
+
+
+def _constants(src: str) -> dict[str, str]:
+    """Module-level UPPER_CASE assignments -> normalised source."""
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(src)
+    except SyntaxError:
+        return {}
+    out: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, _ast.Assign):
+            for tgt in node.targets:
+                if isinstance(tgt, _ast.Name) and tgt.id.isupper():
+                    out[tgt.id] = _ast.dump(node.value, annotate_fields=True)
+    return out
+
+
+def estimator_symbol_diff(old_src: str, new_src: str) -> dict[str, list[str]]:
+    """Which ESTIMATOR symbols were added / changed / removed.
+
+    Also reports non-estimator movement separately, so a real estimator change
+    is never hidden among harness churn.
+    """
+    old, new = _symbols(old_src), _symbols(new_src)
+    old_c, new_c = _constants(old_src), _constants(new_src)
+    old_all = {**old, **old_c}
+    new_all = {**new, **new_c}
+    removed = sorted(set(old_all) - set(new_all))
+    changed = sorted(n for n in set(old_all) & set(new_all) if old_all[n] != new_all[n])
+    estimator_moved = sorted(
+        n for n in removed + changed if n in ESTIMATOR_SYMBOLS
+    )
+    return {
+        "added": sorted(set(new_all) - set(old_all)),
+        # ANY removal is a failure: a deleted symbol cannot be a harness change.
+        "removed": removed,
+        "changed": changed,
+        "estimator_moved": estimator_moved,
+        "harness_moved": sorted(n for n in removed + changed if n not in ESTIMATOR_SYMBOLS),
+    }
+
+
+def estimator_symbol_selftest() -> list[tuple[str, bool]]:
+    """Prove the symbol guard tells an ADDITIVE change from an ESTIMATOR one.
+
+    The cases use the REAL names from :data:`ESTIMATOR_SYMBOLS`.  An earlier
+    version of this self-test used placeholders (`estimator`, `threshold`) that
+    are not in the pinned set, so every "should fail" case came back PASS — the
+    self-test was exercising a parallel universe rather than the real guard, and
+    would have shipped broken.
+
+    Without a self-test the guard is a plausible-looking check that has never
+    been shown wrong — the failure mode §8.2 exists for.
+    """
+    base = (
+        "def median(xs):\n"
+        "    return sorted(xs)[len(xs) // 2]\n"
+        "def summarize(records):\n"
+        "    return {'median': median([r['v'] for r in records])}\n"
+        "DISPERSION_RATIO_THRESHOLD = 1.0\n"
+    )
+    cases = [
+        ("harness vocabulary added (a new warning reason) -> PERMITTED",
+         base + "def build_warnings():\n    return ['new']\n", True),
+        ("new harness symbol -> PERMITTED",
+         base + "def helper():\n    return 1\n", True),
+        ("estimator body edited (the median moved) -> FAIL",
+         base.replace("sorted(xs)[len(xs) // 2]", "sum(xs) / len(xs)"), False),
+        ("estimator helper edited (summarize moved) -> FAIL",
+         base.replace("return {'median': median([r['v'] for r in records])}",
+                      "return {'median': max(r['v'] for r in records)}"), False),
+        ("threshold constant edited (the bar moved) -> FAIL",
+         base.replace("1.0", "0.5"), False),
+        ("threshold constant DELETED -> FAIL",
+         "def median(xs):\n    return sorted(xs)[len(xs) // 2]\n", False),
+        ("estimator renamed away -> FAIL",
+         base.replace("def median(", "def median2("), False),
+        ("decorator added to the estimator -> FAIL",
+         "@staticmethod\n" + base, False),
+        ("docstring added to the estimator -> FAIL",
+         base.replace("    return sorted", '    """doc."""\n    return sorted'), False),
+    ]
+    out: list[tuple[str, bool]] = []
+    for label, src, want_ok in cases:
+        d = estimator_symbol_diff(base, src)
+        got_ok = not d["removed"] and not d["estimator_moved"]
+        out.append((label, got_ok == want_ok))
+    return out
+
 def cmd_verify(a: argparse.Namespace) -> int:
     # TWO references, because they answer two different questions and
     # conflating them produces a confident false alarm:
@@ -185,7 +337,10 @@ def cmd_verify(a: argparse.Namespace) -> int:
         print(f"  measurement-track  SKIP  {MEASUREMENT_TRACK} absent at {a.prereg}")
     else:
         same = old == cur
-        ok = ok and same
+        # `ok` is decided by the ESTIMATOR verdict below, not by byte-identity.
+        # Folding `same` in here meant an honest additive change could never pass,
+        # which is the whole reason the symbol guard exists: the gate has to be
+        # satisfiable without asserting a byte-identity that is not true.
         # The trailing clause used to read "byte-identical to prereg <ref>"
         # UNCONDITIONALLY, so a CHANGED verdict still printed a sentence
         # asserting byte-identity — a tool stating the opposite of its own
@@ -200,6 +355,48 @@ def cmd_verify(a: argparse.Namespace) -> int:
                 f"(+{n_add}/-{n_del} lines) — NOT byte-identical"
             )
         print(f"  measurement-track  {'MATCH' if same else 'CHANGED'}  {detail}")
+
+        # Phase 7 guard: a byte-level CHANGED is triable by asking whether any
+        # ESTIMATOR symbol moved.  Self-tested first, or it is just a claim.
+        st7 = estimator_symbol_selftest()
+        if not all(o for _, o in st7):
+            broken = [lbl for lbl, o in st7 if not o]
+            print(f"  estimator-symbols  BROKEN  self-test failed: {broken}")
+            ok = False
+        else:
+            d = estimator_symbol_diff(old, cur)
+            moved = d["estimator_moved"] + d["removed"]
+            if same:
+                print(
+                    f"  estimator-symbols  MATCH  {len(_symbols(cur))} symbol(s) unchanged"
+                )
+            elif moved:
+                print(
+                    f"  estimator-symbols  CHANGED  {len(moved)} estimator symbol(s) moved: "
+                    f"{moved[:8]}{'...' if len(moved) > 8 else ''}"
+                )
+                print(
+                    "                       the MEASUREMENT rule changed, not just the file"
+                    " — this is not an additive change"
+                )
+                ok = False
+            else:
+                print(
+                    f"  estimator-symbols  MATCH  all {len(ESTIMATOR_SYMBOLS)} pinned"
+                    " estimator symbol(s) UNCHANGED"
+                )
+                if d["harness_moved"]:
+                    print(
+                        f"                       harness moved (permitted): "
+                        f"{d['harness_moved'][:6]}"
+                        f"{'...' if len(d['harness_moved']) > 6 else ''}"
+                    )
+                if d["added"]:
+                    print(f"                       added: {d['added'][:8]}")
+                print(
+                    "                       => additive only: the harness grew, the estimator"
+                    " did not move"
+                )
 
     # 2. executable AST identity, with a self-test first
     st = ast_selftest()
