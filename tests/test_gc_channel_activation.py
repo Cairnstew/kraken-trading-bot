@@ -373,13 +373,13 @@ def test_the_config_comments_document_the_fresh_clone_consequence() -> None:
 # ---------------------------------------------------------------------------
 # the AST forwarding guard: every consumer still forwards all three keys
 # ---------------------------------------------------------------------------
-def test_every_consumer_threads_all_three_signal_file_keys() -> None:
-    """Every ``read_ohlc_dataframe`` call site carries all three file keys.
+def test_every_consumer_threads_all_signal_file_keys() -> None:
+    """Every ``read_ohlc_dataframe`` call site carries all four file keys.
 
     The generalisation of the guard at
     ``tests/test_rl_signal_config_wiring.py:497-551``: that one proves the
     five keys are threaded for the legs that exist today, this one names the
-    three FILE keys specifically, so the leg that forgets one is caught by a
+    four FILE keys specifically, so the leg that forgets one is caught by a
     message that says which file went unforwarded.
 
     It is a *structural* check on purpose.  ``export`` is proved
@@ -394,8 +394,9 @@ def test_every_consumer_threads_all_three_signal_file_keys() -> None:
         "extra_features_file",
         "funding_features_file",
         "social_features_file",
+        "orderbook_features_file",
     }, (
-        "the three exogenous channels changed shape; update this guard and "
+        "the exogenous channels changed shape; update this guard and "
         f"test_rl_data_store.py together. got {sorted(file_keys)}"
     )
 

@@ -178,6 +178,7 @@ def build_export_frame(
         extra_features_file=cfg.get("extra_features_file"),
         funding_features_file=cfg.get("funding_features_file"),
         social_features_file=cfg.get("social_features_file"),
+        orderbook_features_file=cfg.get("orderbook_features_file"),
         signal_max_age_hours=cfg.get("signal_max_age_hours"),
         signal_require_ticker=cfg.get("signal_require_ticker", True),
         market_data_store=cfg.get("market_data_store"),

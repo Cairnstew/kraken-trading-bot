@@ -269,4 +269,33 @@ negative.
 
 ---
 
+## 8. Pinned findings — disposition parity (carried forward)
+
+`just audit-findings` binds every id in `VALIDATION.md` §8's pinned finding
+index (F-1 … F-16, pinned against `5eb1776`) to a decision-level mention here.
+This pass's DECISION.md supersedes the prior one, so the pinned set is carried
+forward verbatim from `VALIDATION.md` §8 — a rewrite that dropped them is the
+exact failure the pin exists to catch (`tools/audit_checks.py:822`).
+
+| id | disposition (from `VALIDATION.md` §8) |
+|---|---|
+| **F-1** | Closed — 52 is the all-null width; shipped default composes 60 (`aba7b9b`) |
+| **F-2** | Accepted and disclosed — `signal_observed` is a per-channel OR |
+| **F-3** | Accepted, bounded, asserted — forward-only cold start at a rolling ~366-day cap |
+| **F-4** | Correction recorded — AUDIT's "12 of 721" was 13 |
+| **F-5** | Override, measured equivalent — `null` vs `0.0` for unrecoverable fields |
+| **F-6** | Override: fix the comment, not the value (`signal_max_age_hours` 12) |
+| **F-7** | Corrected and acted on — hour-dedup direction fixed on the consumer (`5951f72`) |
+| **F-8** | Superseded — measure 52/60; assert no literals |
+| **F-9** | Resolved — frame mismatch (`697 − 13 = 684`) |
+| **F-10** | Restated per shape — `signal_age_hours` ≤ 2.0 unachievable; 12.0 on the shipped shape |
+| **F-11** | Resolved — one arm, two frames (13 computed + 11 ffill = 24) |
+| **F-12** | Restated as a superset — record has 14 keys |
+| **F-13** | Closed (`aba7b9b`) — F-1's number was wrong as well as its text |
+| **F-14** | Accepted, not a defect — characterisation tests vacuous for a zero-executable-change diff |
+| **F-15** | Accepted — `width_check.py` skips `add_derived_ohlcv_features`; docstring-only |
+| **F-16** | Fixed — `audit_checks.find_in_repo` degrades to the absolute path instead of crashing |
+
+---
+
 DECISION COMPLETE

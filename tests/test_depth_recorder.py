@@ -745,6 +745,12 @@ def test_depth_gaps_json_is_machine_readable(tmp_path, capsys):
 # ─────────────────────────────────────────────────────────────────────────────
 # No-consume scope — §8.1.4.  These are the tests that make "the recorder is
 # the deliverable, the feature is NOT" mechanically checkable.
+#
+# SUPERSEDED FOR THE READER (2026-10-08, G-1): the recorder still writes and
+# reads nothing back (the two recorder tests below still hold), but G-1 is the
+# follow-on slice that DOES read the file back into the RL observation, so
+# `rl/features.py` is now intentionally changed.  The "seam unchanged" pin is
+# replaced by `test_the_feature_seam_carries_the_g1_depth_wiring`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -813,13 +819,14 @@ def test_recorder_has_no_feature_pipeline_symbols_at_all():
         )
 
 
-def test_the_feature_seam_is_byte_identical_to_its_committed_state():
-    """The strongest form of the no-consume claim: `rl/features.py` is not in
-    this slice's diff at all.  `git diff HEAD -- <path>` empty is checked by
-    the caller (see test_the_feature_seam_is_unchanged_on_disk); here we
-    assert the file still parses and still carries its original signal
-    column tuple length, so a well-meaning future edit cannot quietly widen
-    it and call it a refactor."""
+def test_the_feature_seam_still_carries_the_signal_column_tuple():
+    """`rl/features.py` still parses and still defines `_SIGNAL_COLUMNS`.
+
+    The depth-recorder slice's no-consume pin asserted the file was not in its
+    diff; G-1 (2026-10-08) supersedes that by widening the tuple on purpose.
+    This test keeps the weaker, still-true half: the tuple must remain
+    findable and parseable, so a future edit cannot delete it and call it a
+    refactor."""
     import ast
 
     source = Path("kraken_trading_bot/rl/features.py").read_text(encoding="utf-8")
@@ -832,27 +839,27 @@ def test_the_feature_seam_is_byte_identical_to_its_committed_state():
     raise AssertionError("_SIGNAL_COLUMNS no longer found in rl/features.py")
 
 
-def test_the_feature_seam_is_unchanged_on_disk():
-    """`rl/features.py` must be untouched by this slice.
+def test_the_feature_seam_carries_the_g1_depth_wiring():
+    """G-1 (2026-10-08): the seam now DOES consume the recorded depth.
 
-    Checked against HEAD so the assertion is about THIS slice's diff rather
-    than about anything the file happens to contain.  Skips (rather than
-    fails) when the file is untracked or the repo has no HEAD, so the test is
-    honest about what it can and cannot prove.
+    The depth-recorder slice pinned `rl/features.py` untouched (§8.1.4: the
+    recorder writes and reads nothing back — that pin was
+    ``test_the_feature_seam_is_unchanged_on_disk``).  G-1 is the follow-on
+    slice that reads the recorder's file back, so the pin is deliberately
+    superseded: `bid_vol`/`ask_vol` are now on both allow-lists and the
+    existing `order_book_imbalance` builder turns them into the single new
+    observation column.  The recorder itself is still no-consume; what changed
+    is the reader.
     """
-    import subprocess
+    from kraken_trading_bot.rl.features import (
+        _SIGNAL_BUILDER_INPUT_COLUMNS,
+        _SIGNAL_COLUMNS,
+    )
 
-    path = "kraken_trading_bot/rl/features.py"
-    proc = subprocess.run(
-        ["git", "diff", "--stat", "HEAD", "--", path],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        pytest.skip(f"git unavailable: {proc.stderr.strip()}")
-    assert proc.stdout.strip() == "", (
-        f"§8.1.4 forbids touching the feature seam; this slice changed it:\n{proc.stdout}"
-    )
+    assert "bid_vol" in _SIGNAL_COLUMNS
+    assert "ask_vol" in _SIGNAL_COLUMNS
+    assert "bid_vol" in _SIGNAL_BUILDER_INPUT_COLUMNS
+    assert "ask_vol" in _SIGNAL_BUILDER_INPUT_COLUMNS
 
 
 # ── the double-timer guard ────────────────────────────────────────────────
@@ -1534,17 +1541,29 @@ def test_two_catchups_close_together_are_red(tmp_path, capsys) -> None:
     assert "within 6h is a pattern" in out
 
 
-def test_the_real_log_is_the_green_control() -> None:
-    """The actual log carries ONE catch-up SHORT (19:37:04 -> 19:42:32, 327s).
-    It must not be flagged."""
+def test_the_real_log_reports_its_known_gap_not_a_false_positive() -> None:
+    """The actual log: one catch-up SHORT, plus one genuinely missing hour.
+
+    The catch-up SHORT (19:37:04 -> 19:42:32, 327s) must not be flagged as a
+    second-timer pattern.  The log ALSO carries a real gap —
+    2026-10-05T13:00 -> 15:00, the 14:00 hour was never recorded — which the
+    scanner correctly reports as RED.  So this control is two-sided: the
+    catch-up is not a false positive, and the missing hour is not silently
+    green.  It reads the LIVE log (gitignored), so it skips when the log is
+    absent rather than erroring on a fresh clone.
+    """
     from kraken_trading_bot.depth_recorder import scan_gap_file
 
-    report = scan_gap_file(
-        Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl"
-    )
-    assert report.n_short_intervals == 1
+    log = Path(__file__).resolve().parents[1] / "signals" / "eth_usd_orderbook.jsonl"
+    if not log.exists():
+        pytest.skip(f"no live depth log at {log}")
+    report = scan_gap_file(log)
+    # A catch-up is a SHORT interval, never a second-timer pattern.
+    assert report.n_short_intervals >= 1
     assert report.short_pattern is False
-    assert report.ok is True
+    # The log has at least the one known missing hour, so it is not green.
+    assert report.n_gaps >= 1
+    assert report.ok is False
 
 
 def test_a_seeded_row_in_an_hour_with_no_genuine_fire_is_excluded(tmp_path) -> None:

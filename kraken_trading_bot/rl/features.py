@@ -122,6 +122,12 @@ _SIGNAL_COLUMNS = (
     # into `spread`, so they never reach the observation themselves.
     "bid",
     "ask",
+    # Top-N level volumes from the order-book depth channel.  Listed so
+    # the merge seam carries them to the frame; the micro builder turns
+    # them into `order_book_imbalance`, so they never reach the
+    # observation themselves.
+    "bid_vol",
+    "ask_vol",
 )
 
 # The two columns above that describe freshness rather than a signal
@@ -144,9 +150,15 @@ _SIGNAL_FRESHNESS_COLUMNS = ("signal_age_hours", "signal_observed")
 #   single writer; copying it here as well would be a second writer for
 #   one column.  A future tick-level tape recorder must use
 #   ``realized_spread_bps`` instead of competing for this name.
+# * ``bid_vol``/``ask_vol`` are the order-book depth top-N level
+#   volumes: ``_add_microstructure_features`` turns them into the single
+#   ``order_book_imbalance`` column, so whitelisting them raw would put
+#   two more volume-scale columns into the observation for information
+#   the volume group already carries.
 #
-# Net accounting is therefore +1 for the funding bid/ask pair, not +3.
-_SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread")
+# Net accounting is therefore +1 for the funding bid/ask pair and +1 for
+# the depth bid_vol/ask_vol pair.
+_SIGNAL_BUILDER_INPUT_COLUMNS = ("bid", "ask", "spread", "bid_vol", "ask_vol")
 
 # Every observation column whose value comes from an exogenous file
 # rather than from a look-back window over the OHLCV frame.

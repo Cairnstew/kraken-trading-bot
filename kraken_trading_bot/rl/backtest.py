@@ -564,6 +564,7 @@ def backtest_model(
             extra_features_file=record.config.get("extra_features_file"),
             funding_features_file=record.config.get("funding_features_file"),
             social_features_file=record.config.get("social_features_file"),
+            orderbook_features_file=record.config.get("orderbook_features_file"),
             signal_max_age_hours=record.config.get("signal_max_age_hours"),
             signal_require_ticker=record.config.get("signal_require_ticker", True),
             # A run config may point the read at a different store; absent

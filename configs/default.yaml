@@ -143,6 +143,28 @@ funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jso
 # reaches the observation as NaN.
 social_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_social.jsonl
 
+# Path to a JSONL file of per-(ticker, hour) order-book depth snapshots
+# produced by THIS repo's `record-depth` recorder — the
+# kraken-trading-bot-order-book.{service,timer} pair fires hourly at :41:
+#   just depth-pull
+# Each record stores the raw book verbatim (`bids`/`asks` as lists of
+# [price, volume, order_ts], plus best_bid/best_ask/mid/spread/depth).  The
+# reader flattens it (`_flatten_orderbook_records`) into top-N level
+# volumes `bid_vol`/`ask_vol` and `realized_spread_bps`, then the
+# `microstructure` group's existing builder turns the volumes into the
+# single `order_book_imbalance` observation column.  Merged **last**, and
+# it never emits `spread` (which would overwrite the funding-derived one).
+#
+# OFF BY DEFAULT (`null`), unlike the three channels above: coverage is
+# FORWARD-ONLY — the recorder appends one snapshot per hour and Kraken's
+# `/0/public/Depth` has no history endpoint — so on a multi-year training
+# window the column is 0.0 for every hour the recorder did not run.  Point
+# it at the recorder's file to add the column (+1 observation width):
+#   orderbook_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_orderbook.jsonl
+# That is honest absence, not a zero reading, and the `signals` group's
+# `signal_age_hours`/`signal_observed` pair is what tells them apart.
+orderbook_features_file: null
+
 # How long a merged signal reading may be carried forward, in hours, for
 # ALL three files above.  A reading is forward-filled for at most this many
 # hours (and never unboundedly), then the bar is marked unobserved; every

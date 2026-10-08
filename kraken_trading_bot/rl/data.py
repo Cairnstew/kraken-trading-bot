@@ -159,7 +159,7 @@ _TICKER_ALIASES = {"XBT": "BTC"}
 # file (WARNING, still merged) for backwards compatibility.
 _TICKER_FIELD = "ticker"
 
-# The three exogenous channels in merge order, each paired with the command
+# The four exogenous channels in merge order, each paired with the command
 # that produces its file.  Both the fetch leg and the store leg iterate this
 # one list, so the two can never disagree about which key feeds which merge
 # or about the wording of a refusal — a disagreement that would show up as
@@ -195,6 +195,17 @@ _SIGNAL_CHANNELS: tuple[tuple[str, str], ...] = (
         "nix run ~/Projects/kraken-social-signals#kraken-social-signals -- "
         "pull --ticker <PAIR> --output <path> --append",
     ),
+    (
+        "orderbook_features_file",
+        # `just depth-pull` — the recipe the kraken-trading-bot-order-book
+        # timer runs at :41.  The recorder stores the raw book verbatim and
+        # writes none of it back, so the reader flattens it (see
+        # _flatten_orderbook_records).  Merged LAST on purpose: its columns
+        # are written after funding's, which is safe only because the
+        # flattener emits `realized_spread_bps`, never `spread` — a depth
+        # `spread` would overwrite funding's (last writer wins).
+        "just depth-pull",
+    ),
 )
 
 
@@ -227,8 +238,8 @@ def _signal_channels(*values: Any) -> list[tuple[str, Any, str]]:
     """Pair each exogenous channel's config value with its key and producer.
 
     Args:
-        *values: The three channel values **in merge order** — news,
-            funding, social — matching :data:`_SIGNAL_CHANNELS`.
+        *values: The channel values **in merge order** — news, funding,
+            social, order-book depth — matching :data:`_SIGNAL_CHANNELS`.
 
     Returns:
         ``(config_key, value, producer_command)`` triples in merge order.
@@ -630,6 +641,111 @@ def _signal_ages(
     return out
 
 
+def _flatten_orderbook_records(
+    records: list[dict[str, Any]], *, levels: int = 10
+) -> list[dict[str, Any]]:
+    """Reduce nested order-book depth records to flat per-hour scalars.
+
+    The order-book channel's producer (:func:`kraken_trading_bot.depth_recorder
+    .book_to_record`) freezes a schema that stores the raw book verbatim —
+    ``bids``/``asks`` as lists of ``[price, volume, order_ts]`` — and writes
+    none of it back, so the reduction to scalars has to happen reader-side,
+    here, before the join.  Without this step ``pd.DataFrame(records)``
+    yields object cells holding lists, the allow-list intersection in
+    :func:`merge_extra_features` drops every one of them, and the channel
+    is skipped with nothing but a WARNING.
+
+    The depth shape is detected per record by the presence of both
+    ``bids`` and ``asks``; a record without them is passed through
+    unchanged so a mixed list keeps its generic-path rows.
+
+    Each depth record becomes exactly one flat record carrying:
+
+    * ``timestamp`` — from ``recorded_at`` (the recorder's own clock; it
+      floors to ``hour`` on every record, so either gives the same floored
+      key, and ``recorded_at`` preserves the intra-hour stamp);
+    * ``ticker`` — from ``pair`` (the depth record has no ``ticker`` key;
+      without the rename :func:`_filter_ticker` treats the file as a
+      one-ticker file and the per-ticker filter is silently off);
+    * ``bid_vol`` / ``ask_vol`` — the sum of the top-``levels`` level
+      volumes on each side (default 10; Kraken serves 100);
+    * ``realized_spread_bps`` — ``(best_ask - best_bid) / mid * 1e4`` from
+      the top of book.  Emitted under this reserved name and **never**
+      as ``spread``: the depth channel merges last, and a ``spread``
+      here would overwrite funding's ``spread`` (last writer wins).
+
+    Guards: an empty ``bids``/``asks`` side sums to ``0.0`` (no
+    ``IndexError``); a record whose ``depth.truncated`` is true is
+    refused — a ``count=1000`` run silently serves 100 levels, so the
+    flattened volumes would change scale with no error anywhere.
+
+    Args:
+        records: Raw signal records as parsed from the JSONL.
+        levels: How many top levels to sum per side.
+
+    Returns:
+        The flat records, one per depth-shaped input record.  Records that
+        are not depth-shaped are passed through unchanged.
+    """
+    if not records:
+        return records
+    flat: list[dict[str, Any]] = []
+    refused = 0
+    for record in records:
+        if not (
+            isinstance(record, dict) and "bids" in record and "asks" in record
+        ):
+            flat.append(record)
+            continue
+        depth = record.get("depth") or {}
+        if depth.get("truncated"):
+            refused += 1
+            _LOGGER.warning(
+                "Refusing depth record for %s at %s: depth.truncated is true "
+                "(requested %s, served %s/%s) — reducing it would silently "
+                "rescale bid_vol/ask_vol",
+                record.get("pair"),
+                record.get("recorded_at"),
+                depth.get("requested_count"),
+                depth.get("bid_levels"),
+                depth.get("ask_levels"),
+            )
+            continue
+        bids = record.get("bids") or []
+        asks = record.get("asks") or []
+        bid_vol = sum(float(level[1]) for level in bids[:levels])
+        ask_vol = sum(float(level[1]) for level in asks[:levels])
+        best_bid = record.get("best_bid")
+        best_ask = record.get("best_ask")
+        mid = record.get("mid")
+        realized_spread_bps = 0.0
+        if best_bid is not None and best_ask is not None and mid is not None:
+            try:
+                mid_f = float(mid)
+                if mid_f > 0:
+                    realized_spread_bps = (
+                        (float(best_ask) - float(best_bid)) / mid_f * 1e4
+                    )
+            except (TypeError, ValueError):  # pragma: no cover - defensive
+                pass
+        flat.append(
+            {
+                "timestamp": record.get("recorded_at"),
+                "ticker": record.get("pair"),
+                "bid_vol": bid_vol,
+                "ask_vol": ask_vol,
+                "realized_spread_bps": realized_spread_bps,
+            }
+        )
+    if refused:
+        _LOGGER.warning(
+            "Refused %d truncated depth record(s) — their hours are "
+            "zero-filled with signal_observed=False",
+            refused,
+        )
+    return flat
+
+
 def merge_extra_features(
     df: pd.DataFrame,
     extra_features_file: str | None = None,
@@ -775,6 +891,13 @@ def merge_extra_features(
 
     # ── build a small DataFrame from the signals ──────────────────────
     signal_df = pd.DataFrame(records)
+    # The order-book channel stores the raw book verbatim — `bids`/`asks`
+    # as lists of [price, volume, order_ts] — which the allow-list
+    # intersection below would drop cell by cell, silently skipping the
+    # merge.  Flatten that shape to per-hour scalars first; every other
+    # shape falls through to the generic path untouched.
+    if {"bids", "asks"}.issubset(signal_df.columns):
+        signal_df = pd.DataFrame(_flatten_orderbook_records(records))
     if "timestamp" not in signal_df.columns:
         _LOGGER.warning("No 'timestamp' column in %s — skipping merge", path)
         return df
@@ -1170,6 +1293,7 @@ def fetch_ohlc_dataframe(
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
     social_features_file: str | None = None,
+    orderbook_features_file: str | None = None,
     signal_max_age_hours: int | None = None,
     signal_require_ticker: bool = True,
 ) -> pd.DataFrame:
@@ -1201,6 +1325,11 @@ def fetch_ohlc_dataframe(
             hour) social/search-trend vectors from the sibling
             ``kraken-social-signals`` project.  Merged after funding
             signals via the same timestamp-floor left-join.
+        orderbook_features_file: Optional path to a JSONL of per-(ticker,
+            hour) order-book depth snapshots from this repo's
+            ``record-depth`` recorder.  Merged **last**; its nested
+            ``bids``/``asks`` are flattened reader-side by
+            :func:`_flatten_orderbook_records` before the join.
         signal_max_age_hours: Staleness bound applied to every merged
             signal file, in hours (the ``signal_max_age_hours`` config
             key).  ``None`` (the config default) derives one hour of
@@ -1241,7 +1370,10 @@ def fetch_ohlc_dataframe(
     # simply comes back at the narrower width.
     df = add_derived_ohlcv_features(df)
     for config_key, signal_file, _producer in _signal_channels(
-        extra_features_file, funding_features_file, social_features_file
+        extra_features_file,
+        funding_features_file,
+        social_features_file,
+        orderbook_features_file,
     ):
         df = merge_extra_features(
             df,
@@ -1633,6 +1765,7 @@ def read_ohlc_dataframe(
     extra_features_file: str | None = None,
     funding_features_file: str | None = None,
     social_features_file: str | None = None,
+    orderbook_features_file: str | None = None,
     signal_max_age_hours: int | None = None,
     signal_require_ticker: bool = True,
     market_data_store: Any = None,
@@ -1674,6 +1807,11 @@ def read_ohlc_dataframe(
             hour) social/search-trend vectors from the sibling
             ``kraken-social-signals`` project.  Merged after funding
             signals via the same timestamp-floor left-join.
+        orderbook_features_file: Optional path to a JSONL of per-(ticker,
+            hour) order-book depth snapshots from this repo's
+            ``record-depth`` recorder.  Merged **last**; its nested
+            ``bids``/``asks`` are flattened reader-side by
+            :func:`_flatten_orderbook_records` before the join.
         signal_max_age_hours: Staleness bound applied to every merged
             signal file, in hours (the ``signal_max_age_hours`` config
             key).  ``None`` (the config default) derives one hour of
@@ -1784,6 +1922,7 @@ def read_ohlc_dataframe(
             extra_features_file=extra_features_file,
             funding_features_file=funding_features_file,
             social_features_file=social_features_file,
+            orderbook_features_file=orderbook_features_file,
             signal_max_age_hours=signal_max_age_hours,
             signal_require_ticker=signal_require_ticker,
         )
@@ -1906,7 +2045,10 @@ def read_ohlc_dataframe(
     # fetch produce the identical column set — the two must never drift.
     df = add_derived_ohlcv_features(df)
     for config_key, signal_file, _producer in _signal_channels(
-        extra_features_file, funding_features_file, social_features_file
+        extra_features_file,
+        funding_features_file,
+        social_features_file,
+        orderbook_features_file,
     ):
         df = merge_extra_features(
             df,

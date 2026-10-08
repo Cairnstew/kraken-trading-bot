@@ -408,11 +408,11 @@ def _read_legs() -> dict[str, ast.FunctionDef]:
     return legs
 
 
-def test_both_read_legs_pass_the_three_values_in_channel_order() -> None:
-    """Both legs hand ``_signal_channels`` news, funding, social — in that order.
+def test_both_read_legs_pass_the_channel_values_in_channel_order() -> None:
+    """Both legs hand ``_signal_channels`` news, funding, social, depth — in order.
 
     Order cannot be proved from the output and is not left to review: the
-    three channels share **no** column name, and the two they do share
+    channels share **no** column name, and the two they do share
     (``signal_age_hours`` / ``signal_observed``) combine by ``max``/``any``,
     so every ordering produces byte-identical output.  The order is carried
     entirely by the positional arguments of the one ``_signal_channels``
@@ -436,6 +436,7 @@ def test_both_read_legs_pass_the_three_values_in_channel_order() -> None:
         "extra_features_file",
         "funding_features_file",
         "social_features_file",
+        "orderbook_features_file",
     ], (
         "_SIGNAL_CHANNELS changed shape; this test and the two AST guards "
         "in test_gc_channel_activation.py / test_rl_signal_config_wiring.py "
