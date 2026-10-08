@@ -1,0 +1,178 @@
+# TRAINING FRICTION AS A NOTIONAL-PROPORTIONAL PENALTY (Phase 4B)
+#
+#   just matrix-plan   configs/matrix.penalty-2024.yaml
+#   just matrix-run    configs/matrix.penalty-2024.yaml
+#   just baselines     configs/matrix.penalty-2024.yaml
+#
+# ── WHAT THIS RUN IS ───────────────────────────────────────────────────
+#
+# Does heavier friction during TRAINING turn the pre-cost edge Phase 3
+# found into NET alpha on the same eval window?
+#
+# There is no new penalty term. `fee_rate`/`slippage` are already charged
+# per notional inside `TradingEnvironment._execute`, they flow through
+# `_equity`, and the training reward is the equity delta
+# (`environment.py:522` buy fill, `:532` sell fill, `:677`
+# `reward = equity_now - last_equity`). Scaling them is therefore already
+# a notional-proportional penalty on realised PnL -- a round trip costs
+# `2 * 0.31%` of the notional it crosses, which is exactly the hurdle
+# Phase 3 measured the policies failing to clear. Nothing in the reward
+# or the environment changed.
+#
+# ── THE ONE PROPERTY THIS EXPERIMENT NEEDS ─────────────────────────────
+#
+# EVERY arm is scored at the SAME 1x eval friction (fee 0.0026, slippage
+# 0.0005) regardless of what it trained at.
+#
+# Without that, the arm is uninterpretable: a 3x-trained policy scored at
+# 3x looks identical to a 1x-trained policy that simply traded less, and
+# "did the penalty bite?" becomes "did turnover drop?".
+#
+# `friction` is in `BACKTEST_EXPRESSIBLE_KEYS`, so a plain friction axis
+# moves BOTH legs. The `.train_friction_mult` axis exists for this: it
+# scales the TRAIN config's friction and leaves the BACKTEST config alone.
+# Every cell additionally records `train_friction_mult` and
+# `eval_friction_mult`, READ BACK from the two written YAMLs rather than
+# from the intent that produced them, so "trained at 3x, scored at 1x" is
+# checkable by opening the files. See `tools/model_matrix.py::
+# TRAIN_FRICTION_MULT_KEY`, `apply_train_friction_mult` and
+# `read_friction_report`, and the guard tests in `tests/test_model_matrix.py`.
+#
+# ── ARMS ───────────────────────────────────────────────────────────────
+#
+#   A    train friction 1x   -- a RE-RUN of the Phase 2 control, so arm A
+#                              is a determinism check against Phase 2
+#                              rather than a new baseline
+#   B3   train friction 3x   -- PRIMARY
+#   B10  train friction 10x  -- dose-response only; it cannot rescue a
+#                              failed B3 (pre-registered)
+#
+# fee_rate and slippage are scaled TOGETHER, so the round-trip hurdle
+# goes 0.31% -> 0.93% -> 3.10% of notional.
+#
+# WHY 3x IS THE PRIMARY ARM -- A JUDGEMENT, NOT A DERIVATION. 3x is the
+# smallest level whose round-trip hurdle (0.93%) exceeds by roughly 3x the
+# best alpha-per-unit-notional Phase 3 measured across the eight control
+# seeds (0.30%, seed 47), so it is the lowest dose at which a policy with
+# the best edge this substrate has produced would still be net-positive
+# after costs IF the penalty changes behaviour at all. 10x brackets it.
+# Neither number is fitted to an outcome.
+#
+# ── WHAT IS FIXED ──────────────────────────────────────────────────────
+#
+# Everything except `train_friction_mult` is identical to
+# `configs/matrix.control-2024.yaml`, which is the spec Phase 2 ran:
+#
+#   window  2020-01-01T00:00Z .. 2025-01-01T00:00Z
+#   split   eval_split 0.79953 -> cut = 35,033 on the 43,817 present bars
+#   TRAIN   2020-01-01T00:00Z .. 2023-12-31T23:00Z
+#   EVAL    2024-01-01T00:00Z .. 2024-12-31T23:00Z, 8,760 replayed bars
+#
+# Re-verified against the store's parquet for this run (Phase 4A.4
+# content hashes, sha256 over the timestamps plus open/high/low/close/
+# volume as float64, after the 24-bar warm-up drop):
+#
+#   TRAIN  35,009 bars  2020-01-02T00:00Z .. 2023-12-31T23:00Z
+#          a95e54598ad112e894616be2b58b59479270865ef4dbc8cee9a7a3c49a530d03
+#   EVAL    8,760 bars  2024-01-02T00:00Z .. 2024-12-31T23:00Z
+#          27880c6e3ddd4f8aa1af8bd6238ed39587ea18ab6719a1a5ca406ad724ad5676
+#   COMBINED
+#          170125b1be79c2f68ded883d68bd63f7003981bef2824d1be5f56caca7670802
+#
+# Leakage, measured not asserted: eval first bar 2024-01-02T00:00Z >
+# train last bar 2023-12-31T23:00Z, and the train/eval bar sets intersect
+# in 0 bars. (The 24-bar warm-up comes off the EVAL head, so the replayed
+# eval slice starts 2024-01-02T00:00Z -- that is why the hash's first bar
+# is not 2024-01-01.)
+#
+# The 31 missing hourly bars inside this window (43,817 present vs 43,848
+# on the grid, in 23 gaps) are unrepairable -- they are 4+ years behind
+# Kraken's 721-bar REST ceiling. Features are bar-relative, so a gap
+# widens the wall-clock span without fabricating a price move.
+#
+# Single ticker, single venue. The store holds ETH_USD 60m only, and those
+# bars are Binance-USDT spot seeded by kraken-deep-history while the
+# friction charged is Kraken taker. Nothing here supports a cross-asset
+# or cross-venue claim.
+name: penalty-2024
+description: "ETH/USD Phase 4B: does training friction, as a notional-proportional penalty on realised PnL, convert the Phase 3 pre-cost edge into net alpha at a common 1x eval friction?"
+
+run:
+  base_config: configs/deep-ab.base.yaml
+
+  # Scratch space -- NEVER commit anything under models/.
+  results: /tmp/ktb-matrix/penalty-2024/cells.jsonl
+  models_root: /tmp/ktb-matrix/penalty-2024/models
+
+  min_bar_ratio: 0.5
+  # 0 for the same reason as the control spec: a never-trading policy
+  # returns exactly 0.0% absolute, i.e. it IS the flat row, so excluding
+  # 0-trade cells would remove the most degenerate arm -- which is exactly
+  # what this run has to be able to report.
+  min_trades: 0
+  timeout: 3600
+
+  cell_pause_seconds: 3.0
+
+  train_seconds: 90
+  backtest_seconds: 40
+
+axes:
+  # ONE ticker; the store holds no other. Not a cross-asset claim.
+  ticker: [ETH_USD]
+
+  # The SAME 8 seeds as the control, because arm A must be comparable to
+  # Phase 2 seed for seed. 8 is also the pre-registered n: the decision
+  # rule is a one-sided sign test at >= 7 of 8.
+  seed: [42, 43, 44, 45, 46, 47, 48, 49]
+
+  pages: [3]
+
+  # TRAIN-ONLY (a CLI flag with no config key), so the backtest leg never
+  # receives it and every arm replays the SAME 8,760-bar eval slice.
+  episode_bars: [1440]
+
+  # 60,000 timesteps, matching the control spec so arm A is comparable.
+  timesteps: [60000]
+
+  action_space: [discrete]
+
+  # THE EVAL FRICTION, FIXED AT 1x FOR EVERY ARM. This axis is the
+  # backtest-side friction and is held at one level on purpose -- it is
+  # what "every arm is scored at the same 1x" means mechanically. Only
+  # `.train_friction_mult` below moves.
+  friction:
+    - {fee_rate: 0.0026, slippage: 0.0005}
+
+  # THE TREATMENT. Scales the TRAIN config's fee_rate and slippage
+  # together; leaves the BACKTEST config at the `friction` level above.
+  #
+  #   1   -> arm A, a re-run of the Phase 2 control
+  #   3   -> arm B3, the PRIMARY arm
+  #   10  -> arm B10, dose-response only
+  #
+  # Round-trip hurdle by arm: 0.31% / 0.93% / 3.10% of notional.
+  .train_friction_mult: [1, 3, 10]
+
+  # Identical to the control spec: the shipped feature_groups.
+  .feature_groups:
+    - ["price", "technical", "volume", "microstructure", "signals"]
+
+  # THE SPLIT. Byte-identical to the control spec; eval_split 0.79953
+  # lands the cut on 2024-01-01T00:00Z inside this window.
+  .data_window:
+    - since: "2020-01-01T00:00:00Z"
+      until: "2025-01-01T00:00:00Z"
+      eval_split: 0.79953
+
+# ── Derived, not written here ───────────────────────────────────────────
+#
+# cells = 1 ticker x 8 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 1 episode_bars x 1 friction x 3 train_friction_mult
+#         x 1 feature_groups x 1 window
+#       = 24 cells
+#
+# `just matrix-plan configs/matrix.penalty-2024.yaml` reports the cell
+# count and the estimate; the harness notes a real PPO run is slower.
+#
+# NO algo AXIS: rl/agent.py is a thin SB3 PPO wrapper.

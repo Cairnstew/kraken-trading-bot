@@ -1,0 +1,40 @@
+# Signal-channel COVERAGE check. Hourly, on the minute after the three
+# channel pulls (funding :17, news :23, social :29) so every producer has
+# already fired.
+#
+# This timer exists because a producer exiting 0 does NOT mean the channel is
+# intact. Measured 2026-10-04: kraken-trading-bot-social.service reported
+# 0/SUCCESS hourly while StockTwits returned HTTP 403 on every call — the
+# sibling CLI still resolved Fear & Greed, so it exited clean and wrote a
+# record that annotated the bars with a partially-failed fetch. The channel
+# ended the day with 4 holes (16h, 3h, 2h, 2h) and no check noticed, because
+# `store_gap_scan.py` scans the PRICE store, not the signal files.
+#
+# The holes are PERMANENT for news and social: neither has a historical
+# endpoint, so an hour not written cannot be fetched later. That makes this
+# check the only thing standing between a Cloudflare challenge and silent,
+# irreversible signal loss — which is why it is a TIMER and not a recipe
+# somebody has to remember.
+#
+# It fails (exit 1) whenever an interior hole is 2 hours or wider, so an
+# hourly producer that misses one fire is caught. Expect it RED right now:
+# social and news are both incomplete, and that is the correct reading.
+#
+# Installed/started by `just signal-gaps-timer`, or manually:
+#   systemctl --user enable --now kraken-trading-bot-signal-gaps.timer
+#   systemctl --user list-timers kraken-trading-bot-signal-gaps.timer --no-pager
+[Unit]
+Description=Hourly signal-channel coverage check for kraken-trading-bot
+
+[Timer]
+# :47 — clear of the three channel pulls (:17 funding, :23 news, :29 social)
+# and of the depth recorder at :41.
+OnCalendar=*-*-* *:47:00
+# A check that catches up after a suspend is worthless for a channel whose
+# holes cannot be repaired, so the delay is deliberately NOT randomised:
+# Persistent=true covers the missed window and the holes get recorded.
+Persistent=true
+Unit=kraken-trading-bot-signal-gaps.service
+
+[Install]
+WantedBy=timers.target

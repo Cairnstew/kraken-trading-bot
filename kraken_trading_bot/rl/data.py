@@ -1254,6 +1254,374 @@ def fetch_ohlc_dataframe(
     return df
 
 
+REST_OHLC_CEILING_BARS = 721
+"""Bars Kraken's REST OHLC endpoint will serve, newest-first, at most.
+
+The same ceiling the rest of this module describes in prose ("up to 720
+of the most recent entries", "~721 recent bars"); named here because
+:func:`_guard_refresh_coverage` needs it as arithmetic.  Its one job is
+to answer *which missing bars a refresh could have supplied*: the fetch
+leg pages newest-first from ``since=None``, so it can only ever touch
+the trailing ``REST_OHLC_CEILING_BARS`` of the store, and anything older
+is unreachable by fetching, not by skipping it.
+"""
+
+
+def expected_grid_window(
+    since: int,
+    until: int,
+    interval: int,
+) -> tuple[int, int]:
+    """``(first_grid_bar, n_expected)`` for ``[since, until)`` on the bar grid.
+
+    The grid is epoch-aligned -- one bar per ``interval`` minutes counted
+    from the epoch -- which is how the store buckets its months (verified
+    against the seeded ``ETH_USD`` 60-minute store: every bar but one
+    2018 block satisfies ``t % 3600 == 0``).  ``until`` is exclusive, so
+    a window aligned to the grid yields ``(until - since) / step``.
+
+    Args:
+        since: Inclusive window start, epoch seconds.
+        until: Exclusive window end, epoch seconds.
+        interval: Candle interval in minutes.
+
+    Returns:
+        The first grid point at or after ``since``, and how many grid
+        points fall before ``until`` (zero when ``until`` is not after
+        ``since``).
+    """
+    step = max(int(interval), 1) * 60
+    first = int(since) - (int(since) % step)
+    if int(until) <= first:
+        return first, 0
+    return first, -((first - int(until)) // step)
+
+
+def store_tail_epoch(
+    store: Any,
+    pair: str,
+    interval: int,
+    fallback: int | None = None,
+) -> int | None:
+    """Newest bar start the store holds for ``pair``/``interval``, epoch seconds.
+
+    Read from the **store**, never from the API -- the whole point of
+    asking is to decide whether a fetch could add anything, and a fetch
+    is the thing being avoided.
+
+    Prefers the sibling's ``stats()``, which is parquet *metadata* only
+    (~47 ms for 106 month files here) and so costs no bar decode; falls
+    back to the caller's own last-bar time, then to ``None`` for a
+    store-like object that offers neither.
+
+    Args:
+        store: A resolved store (path already resolved by the caller).
+        pair: Kraken pair notation, ``"ETH/USD"`` or ``"ETH_USD"``.
+        interval: Candle interval in minutes.
+        fallback: Used when the store cannot report a tail.
+
+    Returns:
+        Epoch seconds of the newest stored bar, or ``None``.
+    """
+    wanted = {str(pair).upper().replace("/", "_"), str(pair).upper()}
+    try:
+        for row in store.stats():  # type: ignore[attr-defined]
+            if int(getattr(row, "interval_min", -1)) != int(interval):
+                continue
+            name = str(getattr(row, "pair", "")).upper()
+            pair_id = str(getattr(row, "pair_id", "")).upper()
+            if name not in wanted and pair_id not in wanted:
+                continue
+            last = getattr(row, "last_time", None)
+            if last is not None:
+                return int(last)
+    except Exception as exc:  # noqa: BLE001 - metadata is best-effort
+        _LOGGER.debug(
+            "store.stats() could not report a tail for %s/%d (%s); "
+            "falling back to the read frame",
+            pair,
+            interval,
+            exc,
+        )
+    return fallback
+
+
+def _guard_refresh_coverage(
+    df: pd.DataFrame,
+    *,
+    pair: str,
+    interval: int,
+    since: int | None,
+    until: int | None,
+    store: Any,
+) -> None:
+    """Refuse to return a frame shorter than the window ``refresh=False`` asked for.
+
+    Skipping the fetch is only safe if the store is *verified* rather
+    than trusted, so with ``refresh=False`` this checks the window
+    bar-for-bar: the expected count comes from the interval grid
+    (:func:`expected_grid_window`), and every grid point counts as
+    covered when a bar starts anywhere inside it (so a bar the store
+    carries off-grid -- the 2018 block at 09:28:14 -- still covers its
+    hour).
+
+    **What raises, and why only that.**  The failure worth refusing is
+    a frame trimmed at either end, or a hole a refresh would have
+    filled.  A missing bar is *repairable by refreshing* only when it
+    sits inside the trailing ``REST_OHLC_CEILING_BARS`` of the store,
+    because the fetch leg pages newest-first and Kraken states outright
+    that older data cannot be retrieved regardless of ``since``.
+    Inside that trailing band a hole is a real skip -- this raises
+    :class:`PinnedWindowUnavailableError`.  Outside it, the same hole is
+    a **pre-existing property of the store that no fetch could ever
+    repair**, so it is reported loudly and not raised: refusing there
+    would fail reads that the ``refresh=True`` path performs happily,
+    which would be a regression dressed as a guard.  (The seeded
+    ``ETH_USD`` 60-minute store has 31 such bars inside 2020-01-01 ..
+    2025-01-01, in 23 holes, so this is not a hypothetical.)
+
+    Raises:
+        ValueError: If neither ``since`` nor ``until`` bounds the window
+            -- there is nothing to verify against, and an unverifiable
+            skip is exactly what this exists to prevent.
+        PinnedWindowUnavailableError: If any missing bar is one the
+            skipped fetch could have supplied.
+    """
+    window_since = since
+    window_until = until
+    if window_since is None and window_until is None:
+        raise ValueError(
+            "read_ohlc_dataframe(refresh=False) cannot verify coverage: the "
+            "read has no `since`/`until`, so there is no requested window "
+            "to check the store against. Pass the pinned window as "
+            "`since`/`until` (or `coverage=`), or use refresh=True."
+        )
+    if window_since is None or window_until is None:
+        tail = store_tail_epoch(store, pair, interval)
+        if window_since is None:
+            if tail is None:
+                raise ValueError(
+                    "read_ohlc_dataframe(refresh=False) cannot verify "
+                    "coverage: no `since` and the store reports no tail."
+                )
+            # One bar below the tail: the oldest grid point the store can
+            # be expected to hold, so the check spans what exists.
+            window_since = tail - max(int(interval), 1) * 60
+        if window_until is None:
+            if tail is None:
+                raise ValueError(
+                    "read_ohlc_dataframe(refresh=False) cannot verify "
+                    "coverage: no `until` and the store reports no tail."
+                )
+            window_until = tail + max(int(interval), 1) * 60
+
+    first_grid, expected = expected_grid_window(
+        int(window_since), int(window_until), interval
+    )
+    if expected <= 0:
+        return
+
+    step = max(int(interval), 1) * 60
+    index = df.index if isinstance(df, pd.DataFrame) else None
+    if index is None or len(index) == 0:
+        present = 0
+    else:
+        if not isinstance(index, pd.DatetimeIndex):
+            index = pd.to_datetime(index, utc=True)
+        # `to_numpy(dtype="datetime64[s]")` pins the unit explicitly:
+        # pandas keeps an index in whatever unit it arrived in, and this
+        # store's is *seconds*, so a bare `astype("int64") // 10**9`
+        # would silently floor every bar to 1970 and report the whole
+        # window as missing.
+        seconds = index.to_numpy(dtype="datetime64[s]").astype("int64")
+        # A grid point is covered when some bar starts inside its bucket,
+        # so an off-grid bar still covers the hour it sits in.
+        covered = np.unique((seconds[seconds >= first_grid] - first_grid) // step)
+        covered = covered[(covered >= 0) & (covered < expected)]
+        present = int(len(covered))
+    missing = expected - present
+    if missing <= 0:
+        _LOGGER.info(
+            "refresh=False coverage OK: %d/%d bars of [%s, %s) present for "
+            "%s/%d",
+            present,
+            expected,
+            pd.Timestamp(first_grid, unit="s", tz="UTC").isoformat(),
+            pd.Timestamp(int(window_until), unit="s", tz="UTC").isoformat(),
+            pair,
+            interval,
+        )
+        return
+
+    tail = store_tail_epoch(store, pair, interval, fallback=_last_bar_epoch(index))
+    refresh_floor = (
+        tail - REST_OHLC_CEILING_BARS * step if tail is not None else first_grid
+    )
+    unrepairable = min(missing, max(0, (refresh_floor - first_grid) // step))
+    repairable = missing - unrepairable
+    window_text = (
+        f"[{pd.Timestamp(first_grid, unit='s', tz='UTC').isoformat()}, "
+        f"{pd.Timestamp(int(window_until), unit='s', tz='UTC').isoformat()})"
+    )
+    if repairable > 0:
+        raise PinnedWindowUnavailableError(
+            f"the store is missing {repairable} bar(s) of the requested "
+            f"window that the skipped fetch could have supplied -- the "
+            f"trailing {REST_OHLC_CEILING_BARS} bar(s) end at "
+            f"{pd.Timestamp(refresh_floor, unit='s', tz='UTC').isoformat()}",
+            window=window_text,
+            requested_range=window_text,
+            available_span=_bar_span_for_guard(df),
+            n_available=present,
+        )
+    _LOGGER.warning(
+        "refresh=False coverage: %d of %d bar(s) of %s are MISSING for "
+        "%s/%d, and all %d are older than the %d-bar REST ceiling the "
+        "skipped fetch could reach (floor %s) -- i.e. no fetch could have "
+        "supplied them, so this is a pre-existing hole in the store, not "
+        "a consequence of skipping the refresh. The frame below is "
+        "returned as-is and is shorter than the grid at those hours.",
+        missing,
+        expected,
+        window_text,
+        pair,
+        interval,
+        missing,
+        REST_OHLC_CEILING_BARS,
+        pd.Timestamp(refresh_floor, unit="s", tz="UTC").isoformat(),
+    )
+
+
+def refresh_for_window(
+    *,
+    since: pd.Timestamp | None,
+    until: pd.Timestamp | None,
+    is_pinned: bool,
+    window_label: str,
+    pair: str,
+    interval: int,
+    store_setting: Any,
+) -> dict[str, Any]:
+    """Should this read skip the fetch leg?  ``{"refresh": ..., "coverage": ...}``.
+
+    The read pages Kraken's REST OHLC endpoint and **upserts** the result
+    on every call, including for a window the store already holds
+    completely.  A pinned-window backtest measured **6 OHLC calls and 731
+    bars upserted** for a 2020-06 .. 2022-12 window -- rate limit spent,
+    trailing months of the store written, then every one of those bars
+    discarded by the window clip.  ``train.py`` pays the same toll
+    before slicing its ``training_frame``, so a matrix run pays it twice
+    per cell.
+
+    Skip the fetch exactly when the fetch cannot add anything: the window
+    is **pinned**, **ends at or before the store's own tail**, and a store
+    is configured.  All three are required --
+
+    * unpinned means "the trailing live window", which is the one case
+      the fetch exists for (``paper_trade``'s per-tick read);
+    * a window reaching past the tail asks for bars the store has not got,
+      and only a fetch can get them;
+    * no store means no local read at all, so ``refresh=False`` is refused
+      by :func:`read_ohlc_dataframe`.
+
+    The tail comes from the **store** (:func:`store_tail_epoch`, parquet
+    metadata), never from the API -- asking the API would defeat the
+    point, and would spend the very rate limit being saved.
+
+    ``coverage`` hands the pinned window to the coverage guard so it is
+    verified bar-for-bar even though the *read* stays unbounded: the
+    callers need the whole frame so the train/eval split can be measured
+    (and its available span reported) before clipping.
+
+    Lives here, not in ``backtest.py``, because ``train.py`` needs the same
+    decision and ``backtest`` imports ``train`` (the reverse would be a
+    cycle).  Takes timestamps rather than a ``DataWindow`` so ``data``
+    stays free of a ``data_window`` import, which is deliberately
+    dependency-free.
+
+    Args:
+        since: Inclusive window bound, or ``None``.
+        until: Exclusive window bound, or ``None``.
+        is_pinned: Whether the run's window is pinned at all.
+        window_label: The window's own description, for log lines.
+        pair: Pair notation, for the store lookup.
+        interval: Candle interval in minutes.
+        store_setting: The resolved ``market_data_store`` value.
+
+    Returns:
+        Keyword arguments for :func:`read_ohlc_dataframe`.
+    """
+    if store_setting is None or not is_pinned:
+        return {"refresh": True}
+    if since is None or until is None:
+        # A half-open pin has no end to compare with the tail against, and
+        # an open end is precisely the trailing-live-window case.
+        return {"refresh": True}
+
+    try:
+        store = _resolve_store(store_setting)
+    except Exception as exc:  # noqa: BLE001 - never fail a run over this
+        _LOGGER.info(
+            "Could not resolve the market-data store (%s); keeping the "
+            "fetch leg for %s/%d",
+            exc,
+            pair,
+            interval,
+        )
+        return {"refresh": True}
+    tail = store_tail_epoch(store, pair, interval)
+    if tail is None:
+        _LOGGER.info(
+            "Store reports no tail for %s/%d; keeping the fetch leg",
+            pair,
+            interval,
+        )
+        return {"refresh": True}
+
+    until_epoch = int(pd.Timestamp(until).timestamp())
+    if until_epoch > tail:
+        _LOGGER.info(
+            "Window %s ends after the store tail (%s); keeping the fetch leg",
+            window_label,
+            pd.Timestamp(tail, unit="s", tz="UTC").isoformat(),
+        )
+        return {"refresh": True}
+
+    _LOGGER.info(
+        "Pinned window %s ends at or before the store tail (%s): skipping "
+        "the fetch leg and reading the store as-is",
+        window_label,
+        pd.Timestamp(tail, unit="s", tz="UTC").isoformat(),
+    )
+    return {
+        "refresh": False,
+        "coverage": (int(pd.Timestamp(since).timestamp()), until_epoch),
+    }
+
+
+def _last_bar_epoch(index: pd.Index | None) -> int | None:
+    """Epoch seconds of the last bar in ``index``, or ``None`` when empty."""
+    if index is None or len(index) == 0:
+        return None
+    try:
+        return int(pd.Timestamp(index[-1]).timestamp())
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _bar_span_for_guard(df: pd.DataFrame) -> str | None:
+    """``first .. last (n bars)`` for the coverage guard's error text."""
+    if not isinstance(df, pd.DataFrame) or len(df) == 0:
+        return None
+    index = df.index
+    if not isinstance(index, pd.DatetimeIndex):
+        try:
+            index = pd.to_datetime(index, utc=True)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return f"<{len(df)} bars>"
+    return f"{index[0].isoformat()} .. {index[-1].isoformat()} ({len(df)} bars)"
+
+
 def read_ohlc_dataframe(
     pair: str,
     interval: int,
@@ -1270,6 +1638,8 @@ def read_ohlc_dataframe(
     market_data_store: Any = None,
     market_data_store_venue: str | None = None,
     market_data_source: Any = None,
+    refresh: bool = True,
+    coverage: tuple[int | None, int | None] | None = None,
 ) -> pd.DataFrame:
     """Read OHLCV through the local market-data store, or fall back to live.
 
@@ -1327,6 +1697,44 @@ def read_ohlc_dataframe(
             ``manager``.  Anything exposing ``ohlc(pair, interval, since)
             -> (candles, last)`` works (a live ``KrakenManager``, the
             store's own thin client, or a fake in tests).
+        refresh: ``True`` (the default, and unchanged behaviour) runs the
+            **fetch -> upsert** leg before reading.  ``False`` reads the
+            store and nothing else — **zero** API calls — which is what a
+            read of a window the store already holds should cost.
+
+            The fetch leg is not free and not always wanted: it pages
+            Kraken's REST OHLC endpoint (up to ``pages`` calls) and
+            *upserts into the store*, so a read of an old pinned window
+            both spends rate limit and writes 700-odd bars into the
+            trailing months that the caller is about to throw away.  A
+            pinned-window backtest measured **6 OHLC calls and 731 bars
+            upserted** for a window that the store already covered
+            completely, every one of them discarded.  With
+            ``refresh=False`` that read is a pure local parquet read.
+
+            ``refresh=False`` is only honest if the store is *checked*
+            rather than trusted, so with it this function verifies the
+            requested window bar-for-bar against the interval grid
+            (:func:`_guard_refresh_coverage`) and **raises** rather than
+            returning a frame shorter than what was asked for.  The check
+            is scoped to what the skipped fetch could have supplied: a
+            bar older than the REST endpoint's ~721-bar window is not
+            repairable by refreshing at all (Kraken cannot serve it), so
+            a pre-existing hole there is reported rather than raised --
+            see :func:`_guard_refresh_coverage` for the arithmetic.
+
+            Requires a store: ``refresh=False`` with no
+            ``market_data_store`` raises :class:`ValueError`, because
+            without one the only way to get bars is to fetch them.
+        coverage: The window ``refresh=False`` must cover, as
+            ``(since_epoch, until_epoch)``, defaulting to ``since`` and
+            ``until``.  It exists because those two bound the *read*
+            while a caller may hold a pinned window wider than the read
+            it wants -- ``backtest_model`` reads the whole store so that
+            :func:`~kraken_trading_bot.rl.data_window.evaluate_scope` can
+            measure both halves and report the span that was available,
+            yet it still wants its ``data_window`` checked bar-for-bar.
+            Ignored when ``refresh`` is true.
 
     Returns:
         The same DataFrame shape :func:`fetch_ohlc_dataframe` returns
@@ -1342,17 +1750,31 @@ def read_ohlc_dataframe(
         TypeError: If ``market_data_store`` is neither null, a path, nor a
             store-like object.
         NotEnoughDataError: If the read window is empty.
+        PinnedWindowUnavailableError: If ``refresh=False`` and the store
+            does not hold every bar of the requested window that the
+            skipped fetch leg could have supplied.  Never returned as a
+            silently shortened frame.
+        ValueError: If ``refresh=False`` without a store.
         SignalTickerMismatchError: Propagated from
             :func:`merge_extra_features` when a ticker-tagged signal file
             holds no record for ``pair``.
 
-    .. todo:: Follow-up integration pass (see ``kraken-market-data/
-       INTEGRATION.md``): honour ``since``/``until`` from config; drive
+.. todo:: Follow-up integration pass (see ``kraken-market-data/
+       INTEGRATION.md``): honour ``since``/until`` from config; drive
        train/eval split and walk-forward through the currently-unused
-       ``TradingEnvironment.reset(options=...)``; let backtest skip the
-       re-fetch and paper trade collapse to append + tail read.
+       ``TradingEnvironment.reset(options=...)``; let paper trade
+       collapse to append + tail read.  (``backtest_model``'s pinned
+       leg now does skip the re-fetch via ``refresh=False``.)
     """
     if market_data_store is None:
+        if not refresh:
+            raise ValueError(
+                "read_ohlc_dataframe(refresh=False) needs a store to read "
+                "from: with `market_data_store` unset the only source of "
+                "bars is the live fetch, which is exactly what "
+                "`refresh=False` asks to skip. Pass the store root (or a "
+                "store-like object), or drop `refresh=False`."
+            )
         return fetch_ohlc_dataframe(
             pair,
             interval=interval,
@@ -1425,33 +1847,59 @@ def read_ohlc_dataframe(
         venue,
     )
 
-    source = market_data_source if market_data_source is not None else manager
-    if source is None:  # deferred import: only needed for live fetching
-        from kraken_api import KrakenManager
-
-        source = KrakenManager.from_env()
-
     # fetch -> upsert: page the window from the source and append it to the
     # store, so the read below covers both pre-existing history and the
     # just-fetched bars.
-    candles = _page_candles(pair, interval, pages, source, since)
-    if candles:
-        store.upsert(pair, interval, candles)
-        _LOGGER.info(
-            "Upserted %d %d-minute %s bars into market-data store",
-            len(candles),
-            interval,
-            pair,
-        )
+    #
+    # `refresh=False` skips exactly this block -- no paging, no API call,
+    # no store write -- and reads what is already there.  The guard below
+    # then proves the read covers what was asked for, so skipping the
+    # fetch cannot silently shorten the frame.
+    if refresh:
+        source = market_data_source if market_data_source is not None else manager
+        if source is None:  # deferred import: only needed for live fetching
+            from kraken_api import KrakenManager
+
+            source = KrakenManager.from_env()
+
+        candles = _page_candles(pair, interval, pages, source, since)
+        if candles:
+            store.upsert(pair, interval, candles)
+            _LOGGER.info(
+                "Upserted %d %d-minute %s bars into market-data store",
+                len(candles),
+                interval,
+                pair,
+            )
+        else:
+            _LOGGER.warning(
+                "market-data store fetch returned no candles for %s/%d — "
+                "reading whatever the store already has",
+                pair,
+                interval,
+            )
     else:
-        _LOGGER.warning(
-            "market-data store fetch returned no candles for %s/%d — "
-            "reading whatever the store already has",
-            pair,
+        _LOGGER.info(
+            "refresh=False: reading %d-minute %s from the store with NO "
+            "fetch and NO upsert (%d OHLC API calls skipped)",
             interval,
+            pair,
+            pages,
         )
 
     df = store.read(pair, interval, since=since, until=until)
+    if not refresh:
+        cov_since, cov_until = (
+            coverage if coverage is not None else (since, until)
+        )
+        _guard_refresh_coverage(
+            df,
+            pair=pair,
+            interval=interval,
+            since=cov_since,
+            until=cov_until,
+            store=store,
+        )
     if isinstance(df, pd.DataFrame) and df.empty:
         raise NotEnoughDataError(1, 0, what="OHLC candles")
     # Same derivation as the live leg above, so the store and the direct

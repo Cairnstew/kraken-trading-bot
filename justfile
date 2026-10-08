@@ -453,6 +453,36 @@ matrix-run spec="configs/matrix.example.yaml" *ARGS="":
 matrix-report spec="configs/matrix.example.yaml" *ARGS="":
   {{dev}} 'python tools/model_matrix.py report {{spec}} {{ARGS}}'
 
+# Signal-channel coverage and gap check. No network. Exits 1 when any hour
+# is missing, so it is gateable rather than decorative.
+#
+# Run it BEFORE quoting any matrix number, and before believing a signal
+# channel is present. Measured 2026-10-04: the social timer was exiting
+# 0/SUCCESS hourly while StockTwits 403'd on every call, and nothing
+# detected it — this tool reported a 16h hole and news a 22h one on its
+# first run.
+#
+# Ask the window question a matrix actually asks:
+#   just signal-gaps --window-since 2026-09-10T15:00:00Z \
+#                    --window-until 2026-10-01T15:00:00Z
+signal-gaps *ARGS="":
+  {{dev}} 'python tools/signal_gap_scan.py {{ARGS}}'
+
+# Null-policy baselines against a finished matrix run: never-trade, a random
+# policy MATCHED ON TRADE COUNT (many draws, so the answer is a distribution
+# rather than one number), and two momentum rules. Replays the same pinned
+# window at the same fee/slippage the cells used, so the comparison is
+# like-for-like. A model that cannot beat a same-turnover random policy has
+# no edge, whatever its return looks like next to buy-and-hold.
+#
+# `run.results` is resolved by the TOOL, not by shell yaml: plain python3
+# outside the dev shell has no pyyaml, so an inline read here silently
+# produced an empty path. Extra args pass through (--draws / --json).
+# e.g. just baselines configs/matrix.eth-highseed.yaml
+#      just baselines configs/matrix.eth-highseed.yaml --draws 500 --json
+baselines spec="configs/matrix.eth-highseed.yaml" *ARGS="":
+  {{dev}} 'python tools/null_baselines.py --spec {{spec}} {{ARGS}}'
+
 # ── Deep-history store (market_data_store) ───────────────────────────────
 # `market_data_store: null` in configs/default.yaml is a LIVE fetch, and
 # Kraken's REST API serves up to 720 of the most recent candles — older
@@ -967,3 +997,39 @@ depth-checkpoint-timer output="signals/eth_usd_orderbook.jsonl" remote="https://
   echo "  systemctl --user start kraken-trading-bot-depth-checkpoint.service"
   echo "  just depth-verify-offmachine"
   echo "  just depth-gaps    # checkpoint age must read 0.00 days, or RED past 10d"
+
+# Enable the hourly SIGNAL-COVERAGE check as a systemd.user timer.
+#
+# This is not the same as `signal-gaps`, which is a recipe you have to
+# remember to run. Measured 2026-10-04: the social timer exited 0/SUCCESS
+# hourly while StockTwits 403'd on every call, and the channel silently ended
+# the day with 4 holes — unrepairable, because neither StockTwits nor the
+# news producer has a historical endpoint. A check nobody runs is not a gate.
+#
+# Expect this unit to FAIL as soon as it is enabled: social and news are both
+# incomplete today, and a red unit is the correct reading, not a misinstall.
+# The funding channel's own 7 historical holes are 2025-11..2026-05 — outside
+# any evaluation window, and repairable with `just funding-backfill` if you
+# ever want a window that reaches back that far.
+#
+# Fires at :47, clear of the four other channel minutes (:17 funding, :23
+# news, :29 social, :41 depth).
+signal-gaps-timer:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  unit_dir="$HOME/.config/systemd/user"
+  root="{{justfile_directory()}}"
+  mkdir -p "$unit_dir"
+  sed -e "s|@ROOT@|$root|g" \
+      "$root/systemd/kraken-trading-bot-signal-gaps.service.in" \
+      > "$unit_dir/kraken-trading-bot-signal-gaps.service"
+  ln -sf "$root/systemd/kraken-trading-bot-signal-gaps.timer" \
+      "$unit_dir/kraken-trading-bot-signal-gaps.timer"
+  systemctl --user daemon-reload
+  systemctl --user enable --now kraken-trading-bot-signal-gaps.timer
+  echo "enabled. Next fire:"
+  systemctl --user list-timers kraken-trading-bot-signal-gaps.timer --no-pager
+  echo
+  echo "checking now (exit 1 here means a gap, which is expected today):"
+  systemctl --user start kraken-trading-bot-signal-gaps.service || true
+  journalctl --user -u kraken-trading-bot-signal-gaps.service -n 30 --no-pager

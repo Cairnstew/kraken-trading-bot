@@ -295,6 +295,15 @@ class PaperTrader:
         """
         if self._data_fetcher is not None:
             return self._data_fetcher(self.pair, self.ohlcv_interval_minutes)
+        # refresh=True is DELIBERATE here: this is the live per-tick read
+        # of the trailing window, and the fetch is the entire reason the
+        # read exists. It is also the one leg for which a fetch is
+        # unavoidable -- `data.refresh_for_window` refuses refresh=False on
+        # an unpinned window, which is exactly what this one is. Stated
+        # explicitly because the default is also True, and
+        # `tests/test_rl_signal_config_wiring.py::
+        # test_every_read_ohlc_dataframe_call_site_states_refresh_explicitly`
+        # now refuses a call site that leaves it to the default.
         return read_ohlc_dataframe(
             self.pair,
             interval=self.ohlcv_interval_minutes,
@@ -315,6 +324,7 @@ class PaperTrader:
             # test_every_read_ohlc_dataframe_call_site_forwards_venue`
             # is what keeps this line from being dropped again.
             market_data_store_venue=self.config.get("market_data_store_venue"),
+            refresh=True,
         )
 
     def _build_observation(self, df: pd.DataFrame) -> np.ndarray:
@@ -396,6 +406,42 @@ class PaperTrader:
         if df is None or (isinstance(df, pd.DataFrame) and df.empty):
             raise NotEnoughDataError(1, 0, what="live OHLC bars")
 
+        # NOTE (2026-10-05, Phase 4A.3): `df["close"].iloc[-1]` below is
+        # the close of the MOST RECENT bar, and nothing on the read path
+        # drops the in-progress one. Verified, not assumed:
+        #
+        #   * `data.read_ohlc_dataframe`'s fetch leg pages Kraken's OHLC
+        #     endpoint and upserts whatever comes back (`data.py:1866`),
+        #     and Kraken returns the current, still-forming bucket as the
+        #     final element;
+        #   * `market_data_store.upsert` dedupes on bar `time` with
+        #     `keep="last"`, so a LATER fetch heals the bar -- which is why
+        #     a store read long after the last write shows only completed
+        #     bars, and why that is a property of WHEN the store was
+        #     written, not of the read path;
+        #   * `store.read` clips only on an explicit `since`/`until`, and
+        #     this call passes neither;
+        #   * there is no `iloc[:-1]`, no `now`-relative time filter, and
+        #     no "last complete bar" step anywhere in `data.py` or here.
+        #
+        # So at, say, 22:47 UTC on hourly bars the fill price is the close
+        # of the 22:00 bar with 47 minutes of trading still to come, and
+        # the observation (`_build_observation`, which takes
+        # `features.to_numpy()[-1]`) is built from that same partial bar.
+        #
+        # CONSEQUENCE FOR ANY READ OF PAPER-TRADE NUMBERS: a live fill at a
+        # still-forming close is NOT comparable to the backtest, and is
+        # strictly more optimistic than it -- the backtest fills at a
+        # CLOSED bar's close (`environment.py:330`), whereas this fills at
+        # a close that will be revised upward or downward before the bar
+        # ends. It is not even the backtest's `d=0`, which Phase 3
+        # measured at the same-bar convention; paper trade is one step
+        # past that, into the future of the bar it is trading. Treat any
+        # paper-trade return as unquantified until a closed-bar read
+        # exists. No behaviour change is made here: this note records what
+        # the code does, and
+        # `tests/test_paper_trade_refresh_and_bar_freshness.py` pins both
+        # the absence of a drop and the note above.
         self._last_close = float(df["close"].iloc[-1])
         obs = self._build_observation(df)
         action = self.agent.predict(obs, deterministic=True)

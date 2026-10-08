@@ -24,8 +24,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tools.model_matrix as model_matrix  # noqa: E402
 from tools.model_matrix import (  # noqa: E402
     BACKTEST_EXPRESSIBLE_KEYS,
+    TRAIN_FRICTION_MULT_KEY,
     RESERVED_AXES,
     REQUIRED_BACKTEST_FIELDS,
     Cell,
@@ -1604,6 +1606,98 @@ def test_report_empty_results_file_exits_nonzero(tmp_path, capsys):
     assert "No records" in capsys.readouterr().out
 
 
+# ── one measurement per cell (the --force double-count) ─────────────────
+#
+# `run --force` APPENDS to the results file rather than replacing it, and a
+# cell id is a hash of the parameter tuple, so re-running the same spec
+# produces the SAME ids. `run` dedupes before deciding what to skip
+# (`done_cell_ids`), but `report` used to read every line, so a re-run was
+# counted twice: measured 2026-10-04, 12 recorded instead of 6, every
+# per-group n doubled, and the dispersion gate's pooled within-group IQR
+# widened from +1.47% to +2.21% on numbers that had not changed.
+
+
+def test_report_counts_a_rerun_cell_once_not_twice(tmp_path, capsys):
+    """A `--force` re-run appends; the report must not count a cell twice."""
+    path = tmp_path / "cells.jsonl"
+    original = _seeded_records()
+    doubled = original + original
+    path.write_text(
+        "".join(json.dumps(r) + "\n" for r in doubled), encoding="utf-8"
+    )
+    assert cmd_report(_Args(spec=None, results=str(path), min_bar_ratio=0.5,
+                            min_trades=1, json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cells_recorded"] == len(original), (
+        "a re-run appended a second line per cell_id; report must dedupe "
+        "last-wins the way run's skip logic already does"
+    )
+    # Same invalid set as the undoubled file: the fixture carries exactly one
+    # degenerate cell, so the valid count must be unchanged too. Comparing
+    # against a hardcoded 12 would hide the fixture's deliberate invalid cell.
+    baseline_path = tmp_path / "single.jsonl"
+    baseline_path.write_text(
+        "".join(json.dumps(r) + "\n" for r in original), encoding="utf-8"
+    )
+    cmd_report(_Args(spec=None, results=str(baseline_path),
+                     min_bar_ratio=0.5, min_trades=1, json=True))
+    baseline = json.loads(capsys.readouterr().out)
+    assert payload["cells_valid"] == baseline["cells_valid"]
+    assert payload["cells_invalid"] == baseline["cells_invalid"]
+
+
+def test_report_keeps_the_LATEST_record_for_a_repeated_cell_id(tmp_path, capsys):
+    """Last-wins is not cosmetic: the newer measurement must be the one read."""
+    window = {
+        "since": "2026-09-01T00:00:00Z",
+        "until": "2026-09-20T00:00:00Z",
+        "eval_split": 0.7,
+    }
+    stale = _record("dup001", total_return=-0.90, excess_return=-0.95,
+                    n_bars=504)
+    fresh = _record("dup001", total_return=0.70, excess_return=0.65,
+                    n_bars=504)
+    for rec in (stale, fresh):
+        rec["config_overrides"] = {"data_window": window}
+    path = tmp_path / "cells.jsonl"
+    path.write_text(
+        json.dumps(stale) + "\n" + json.dumps(fresh) + "\n", encoding="utf-8"
+    )
+    cmd_report(_Args(spec=None, results=str(path), min_bar_ratio=0.5,
+                     min_trades=1, json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cells_recorded"] == 1
+    excess = [
+        g for row in payload["per_ticker"]
+        if row["metric"] == "excess_return"
+        for g in row["groups"]
+    ]
+    assert excess, "expected an out-of-sample excess_return group"
+    # The FRESH value is 0.65; the stale one is -0.95. A first-wins or
+    # keep-both dedupe reports -0.95 (or a median of both), so this fails.
+    assert excess[0]["summary"]["median"] == pytest.approx(0.65)
+
+
+def test_report_does_not_drop_a_record_that_has_no_cell_id(tmp_path, capsys):
+    """`done_cell_ids` keys on cell_id, so it drops unidentified records.
+
+    That is right for `run` (it only skips work it can identify) and wrong
+    for `report`: a hand-written or older results file would lose rows
+    without a word. An unidentifiable line is not a duplicate of anything,
+    so it is still a measurement and must survive.
+    """
+    path = tmp_path / "cells.jsonl"
+    orphan = _record("abc123")
+    del orphan["cell_id"]
+    path.write_text(json.dumps(orphan) + "\n", encoding="utf-8")
+    cmd_report(_Args(spec=None, results=str(path), min_bar_ratio=0.5,
+                     min_trades=1, json=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["cells_recorded"] == 1, (
+        "a record with no cell_id vanished from the report"
+    )
+
+
 # ── CLI surface ─────────────────────────────────────────────────────────
 
 
@@ -2238,3 +2332,150 @@ def test_correctly_dotted_axis_is_not_flagged(tmp_path):
         )
     )
     assert "axis_needs_dot" not in _codes(path)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4B: training friction as a notional-proportional penalty.
+#
+# The experiment needs every arm scored at ONE eval friction regardless of
+# what it trained at. The harness cannot express that by default:
+# `materialize_configs` builds the TRAIN config from the cell's FULL
+# `config_overrides` and the BACKTEST config from only the expressible
+# subset, so a plain `friction:` axis moves BOTH legs. An arm trained at
+# 3x would then also be scored at 3x, which is indistinguishable from a
+# policy that simply traded less -- the whole question.
+#
+# `.train_friction_mult` scales the train config's friction and leaves the
+# backtest config alone. These tests pin the property that makes the arm
+# interpretable, and the property that would break it silently.
+# ---------------------------------------------------------------------------
+
+
+def _spec_with_mult(mult, tmp_path, base_friction=True):
+    spec = {
+        "name": "penalty",
+        "base_config": "configs/deep-ab.base.yaml",
+        "models_root": str(tmp_path / "models"),
+        "axes": {
+            "seed": [42],
+            "ticker": ["ETH_USD"],
+            "pages": [6],
+            "timesteps": [1000],
+            "friction": [{"fee_rate": 0.0026, "slippage": 0.0005}]
+            if base_friction
+            else [],
+            ".train_friction_mult": [mult],
+        },
+    }
+    path = tmp_path / f"spec-{mult}.yaml"
+    path.write_text(yaml.safe_dump(spec))
+    return model_matrix.load_spec(path)
+
+
+def test_a_train_friction_mult_axis_scales_only_the_train_config(tmp_path):
+    """The load-bearing property: 3x in, 1x out for the backtest leg."""
+    spec = _spec_with_mult(3, tmp_path)
+    cells = model_matrix.expand_cells(spec)
+    assert len(cells) == 1
+    train_cfg, backtest_cfg = model_matrix.materialize_configs(
+        cells[0], spec, tmp_path / "configs"
+    )
+    train = yaml.safe_load(train_cfg.read_text())
+    backtest = yaml.safe_load(backtest_cfg.read_text())
+
+    assert train["fee_rate"] == pytest.approx(0.0026 * 3)
+    assert train["slippage"] == pytest.approx(0.0005 * 3)
+    assert backtest["fee_rate"] == pytest.approx(0.0026), (
+        "the EVAL leg must stay at 1x whatever the arm trained at"
+    )
+    assert backtest["slippage"] == pytest.approx(0.0005)
+
+
+def test_the_backtest_leg_really_wins_the_friction_precedence(tmp_path):
+    """`backtest_model` resolves friction from the RUN CONFIG first.
+
+    Not a config-file assertion: this proves the 1x in the backtest config
+    is what the leg would actually use, rather than being overridden by the
+    model's own (3x) `config.yaml`.
+    """
+    run_cfg = {"fee_rate": 0.0026, "slippage": 0.0005}
+    record_cfg = {"fee_rate": 0.0078, "slippage": 0.0015}  # trained at 3x
+    from kraken_trading_bot.rl.backtest import _resolve_env_setting
+
+    for key in ("fee_rate", "slippage"):
+        got = _resolve_env_setting(key, {}, run_cfg, record_cfg, 0.0)
+        assert got == pytest.approx(run_cfg[key]), (
+            f"{key}: the run config must beat the model's own 3x config"
+        )
+
+
+def test_train_friction_mult_is_popped_from_both_written_configs(tmp_path):
+    """Neither YAML may carry a key the RL side would try to honour."""
+    spec = _spec_with_mult(10, tmp_path)
+    cell = model_matrix.expand_cells(spec)[0]
+    train_cfg, backtest_cfg = model_matrix.materialize_configs(
+        cell, spec, tmp_path / "configs"
+    )
+    for path in (train_cfg, backtest_cfg):
+        loaded = yaml.safe_load(path.read_text())
+        assert model_matrix.TRAIN_FRICTION_MULT_KEY not in loaded, (
+            f"{path.name}: the multiplier survived into the written config"
+        )
+
+
+def test_the_report_states_both_multipliers_read_back_from_the_files(tmp_path):
+    """`cells.jsonl` must say 3x train / 1x eval for a 3x arm."""
+    spec = _spec_with_mult(3, tmp_path)
+    cell = model_matrix.expand_cells(spec)[0]
+    train_cfg, backtest_cfg = model_matrix.materialize_configs(
+        cell, spec, tmp_path / "configs"
+    )
+    report = model_matrix.read_friction_report(train_cfg, backtest_cfg)
+    assert report["train_friction_mult"] == pytest.approx(3.0)
+    assert report["eval_friction_mult"] == pytest.approx(1.0)
+    assert report["train_fee_rate"] == pytest.approx(0.0078)
+    assert report["eval_fee_rate"] == pytest.approx(0.0026)
+    assert report["train_config_has_mult_key"] is False
+    assert report["backtest_config_has_mult_key"] is False
+
+
+def test_the_report_would_notice_a_moved_eval_friction(tmp_path):
+    """A spec that DID move the eval friction must not report 1.0.
+
+    The guard on the guard: without this, `eval_friction_mult` is a
+    constant that always reads 1.0 and proves nothing.
+    """
+    spec = _spec_with_mult(3, tmp_path)
+    spec.axes["friction"] = [{"fee_rate": 0.0026 * 5, "slippage": 0.0005 * 5}]
+    cell = model_matrix.expand_cells(spec)[0]
+    train_cfg, backtest_cfg = model_matrix.materialize_configs(
+        cell, spec, tmp_path / "configs"
+    )
+    report = model_matrix.read_friction_report(train_cfg, backtest_cfg)
+    assert report["eval_friction_mult"] == pytest.approx(5.0), (
+        "an eval leg moved off 1x must be visible in the record"
+    )
+
+
+def test_no_mult_axis_is_a_plain_1x_cell(tmp_path):
+    """A spec with no multiplier must behave exactly as before the axis."""
+    spec = _spec_with_mult(1, tmp_path)
+    cell = model_matrix.expand_cells(spec)[0]
+    train_cfg, backtest_cfg = model_matrix.materialize_configs(
+        cell, spec, tmp_path / "configs"
+    )
+    train = yaml.safe_load(train_cfg.read_text())
+    assert train["fee_rate"] == pytest.approx(0.0026)
+    assert train["slippage"] == pytest.approx(0.0005)
+    report = model_matrix.read_friction_report(train_cfg, backtest_cfg)
+    assert report["train_friction_mult"] == pytest.approx(1.0)
+
+
+def test_the_multiplier_does_not_reach_expected_bars_or_the_cli(tmp_path):
+    """It is a config-scale knob, not a CLI flag and not a bar-count input."""
+    spec = _spec_with_mult(3, tmp_path)
+    cell = model_matrix.expand_cells(spec)[0]
+    assert "train_friction_mult" not in cell.cli_params
+    # and it is not silently absent: it IS in the config overrides, which is
+    # the only place materialize_configs looks for it.
+    assert cell.config_overrides["train_friction_mult"] == 3

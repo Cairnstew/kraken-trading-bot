@@ -108,6 +108,7 @@ __all__ = [
     "load_spec",
     "main",
     "materialize_configs",
+    "paired_difference",
     "pooled_within_spread",
     "replicated_groups",
     "split_cell_overrides",
@@ -121,8 +122,19 @@ __all__ = [
 
 #: Axis names that map onto a CLI flag rather than a config-file key.
 #: Everything else in ``axes:`` is deep-merged into the per-cell config.
+#:
+#: ``episode_bars`` is here because it is a TRAIN-ONLY CLI flag with no
+#: config key at all: ``rl.train`` takes it as an argument and never reads
+#: ``cfg["episode_bars"]``, so an ``episode_bars:`` axis written as a
+#: config merge would land in the per-cell YAML where nothing reads it --
+#: a silently ignored axis, which is worse than an unsupported one.
+#: It bounds the single episode (and the normalization fit) inside the
+#: training slice, so it is the axis that decides how much history the
+#: policy actually sees. The BACKTEST leg must NOT receive it: the
+#: backtest replays the whole evaluation slice regardless, which is what
+#: keeps an OOS arm's ``n_bars`` comparable across episode lengths.
 RESERVED_AXES: frozenset[str] = frozenset(
-    {"ticker", "seed", "pages", "timesteps"}
+    {"ticker", "seed", "pages", "timesteps", "episode_bars"}
 )
 
 #: Train fraction the RL side applies when a config names ``data_window``
@@ -610,6 +622,16 @@ class MatrixSpec:
     min_trades: int = 1
     interval_minutes: int = 60
     timeout: float | None = None
+    #: Seconds to wait BETWEEN cells.  Zero by default, which is fine for a
+    #: 6-cell spec and wrong for a 60-cell one: every cell refetches OHLC
+    #: from Kraken twice (train + backtest), and a high-seed matrix fires
+    #: 120 requests back to back with nothing between them.  Measured
+    #: 2026-10-04: 21 of 60 cells died on ``EGeneral:Too many requests``.
+    #: The harness classified them INVALID rather than dropping them
+    #: silently — correct, and still a wasted run. Set this to a couple of
+    #: seconds on any spec whose cell count is high enough to hit the
+    #: limit.
+    cell_pause_seconds: float = 0.0
     train_seconds: float = 60.0
     backtest_seconds: float = 15.0
     question: str = ""
@@ -732,6 +754,7 @@ def load_spec(path: str | Path) -> MatrixSpec:
         min_trades=int(run.get("min_trades", 1)),
         interval_minutes=int(run.get("interval_minutes", interval) or 60),
         timeout=(float(run["timeout"]) if run.get("timeout") else None),
+        cell_pause_seconds=float(run.get("cell_pause_seconds", 0.0) or 0.0),
         train_seconds=float(run.get("train_seconds", 60.0)),
         backtest_seconds=float(run.get("backtest_seconds", 15.0)),
         question=str(raw.get("question") or raw.get("description") or ""),
@@ -1304,6 +1327,128 @@ def split_cell_overrides(
     return backtest_side, sorted(train_only)
 
 
+#: The multiplier axis, and the keys it scales.
+#:
+#: ``.train_friction_mult: [1, 3, 10]`` as a matrix axis scales
+#: ``fee_rate``/``slippage`` in the cell's TRAIN config by that factor and
+#: leaves the BACKTEST config alone, so every arm is scored at one common
+#: eval friction no matter what it trained at. Without it a friction axis
+#: moves BOTH legs -- ``train_merged`` takes the full
+#: ``cell.config_overrides`` while ``backtest_merged`` takes only the
+#: expressible subset -- so "train at 3x friction" would silently also
+#: evaluate at 3x and could not be distinguished from a policy that simply
+#: traded less.
+#:
+#: The axis is popped before either config is written, so neither YAML
+#: carries a key the RL side would try to honour. `train_friction_mult`
+#: and `eval_friction_mult` are recorded on every cell instead, which is
+#: what makes "this arm trained at 3x and was scored at 1x" checkable from
+#: ``cells.jsonl`` rather than from the config files.
+TRAIN_FRICTION_MULT_KEY = "train_friction_mult"
+TRAIN_FRICTION_SCALED_KEYS = ("fee_rate", "slippage")
+
+#: The 1x reference friction of the control-2024 / deep-ab experiments
+#: (fee 0.0026, slippage 0.0005). The denominators for
+#: `read_friction_report`'s multipliers, so a cell record states "trained
+#: at 3x, scored at 1x" against the same reference the experiment fixed.
+_REFERENCE_FRICTION = {"fee_rate": 0.0026, "slippage": 0.0005}
+
+
+def apply_train_friction_mult(
+    train_merged: dict[str, Any],
+) -> tuple[float, float]:
+    """Scale a train config's friction in place; return (train, eval) mults.
+
+    Pops :data:`TRAIN_FRICTION_MULT_KEY` so the written YAML carries only
+    keys the RL side understands, and returns both multipliers so the cell
+    record can state them.
+
+    The EVAL multiplier is the ratio of the backtest config's friction to
+    the base's -- which is 1.0 whenever the backtest config was written
+    from the same ``friction`` axis level the base carries. It is computed
+    from the two dicts rather than assumed, so a spec that DID move the
+    backtest friction would report ``eval_friction_mult`` != 1.0 instead of
+    quietly claiming a common eval friction it does not have.
+    """
+    mult = train_merged.pop(TRAIN_FRICTION_MULT_KEY, None)
+    if mult is None:
+        return 1.0, 1.0
+    mult = float(mult)
+    for key in TRAIN_FRICTION_SCALED_KEYS:
+        if train_merged.get(key) is not None:
+            train_merged[key] = float(train_merged[key]) * mult
+    return mult, 1.0
+
+
+def read_friction_report(
+    train_config_path: Path, backtest_config_path: Path
+) -> dict[str, Any]:
+    """Read back what each leg was actually told, from the FILES on disk.
+
+    Deliberately not derived from the intent that produced them. A cell
+    record that says "trained at 3x, scored at 1x" has to be checkable by
+    opening the two YAMLs; deriving both numbers from the same dict that
+    wrote them would report the plan, not the run.
+
+    ``eval_friction_mult`` is the backtest config's friction over the 1x
+    reference the experiment fixes (fee 0.0026, slippage 0.0005), so a
+    spec that accidentally moved the eval friction reports != 1.0 instead
+    of claiming a common eval friction it does not have.
+    """
+    def _load(path: Path) -> dict[str, Any]:
+        with path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+        return dict(loaded) if isinstance(loaded, Mapping) else {}
+
+    train_cfg = _load(train_config_path)
+    backtest_cfg = _load(backtest_config_path)
+
+    def _ratio(cfg: dict[str, Any], key: str) -> float:
+        want = _REFERENCE_FRICTION.get(key)
+        got = cfg.get(key)
+        if want in (None, 0) or got is None:
+            return 1.0
+        return float(got) / float(want)
+
+    def _multiplier(cfg: dict[str, Any]) -> tuple[float, float]:
+        """``(multiplier, spread)`` for one config.
+
+        The multiplier is the ratio on ONE key, not the product of the
+        ratios: the axis scales fee and slippage by the SAME factor, so the
+        product of two equal ratios is the square of the multiplier (a 3x
+        arm reporting 9x, which is what the first draft of this did).
+
+        The spread is the disagreement between the two keys' ratios. A
+        non-zero spread means the arm's friction is not a clean multiple of
+        the reference, which is worth seeing rather than averaging away.
+        """
+        ratios = {key: _ratio(cfg, key) for key in TRAIN_FRICTION_SCALED_KEYS}
+        values = list(ratios.values())
+        return values[0], (max(values) - min(values))
+
+    train_mult, train_spread = _multiplier(train_cfg)
+    eval_mult, eval_spread = _multiplier(backtest_cfg)
+
+    return {
+        "train_friction_mult": round(train_mult, 9),
+        "eval_friction_mult": round(eval_mult, 9),
+        # Non-zero means the arm's fee and slippage are not the same
+        # multiple of 1x, i.e. the axis did not scale them together.
+        "train_friction_ratio_spread": round(train_spread, 9),
+        "eval_friction_ratio_spread": round(eval_spread, 9),
+        "train_fee_rate": train_cfg.get("fee_rate"),
+        "train_slippage": train_cfg.get("slippage"),
+        "eval_fee_rate": backtest_cfg.get("fee_rate"),
+        "eval_slippage": backtest_cfg.get("slippage"),
+        # The multiplier must NOT survive into either YAML: the RL side
+        # would try to honour a key it does not know.
+        "train_config_has_mult_key": TRAIN_FRICTION_MULT_KEY in train_cfg,
+        "backtest_config_has_mult_key": (
+            TRAIN_FRICTION_MULT_KEY in backtest_cfg
+        ),
+    }
+
+
 def materialize_configs(
     cell: Cell, spec: MatrixSpec, dest_dir: Path
 ) -> tuple[Path, Path]:
@@ -1344,18 +1489,34 @@ def materialize_configs(
     train_merged = deep_merge(base, cell.config_overrides)
     train_merged["model_name"] = cell.model_name
     train_merged["ticker"] = cell.ticker.replace("_", "/")
+    # Scale the TRAIN side's friction, and pop the multiplier so neither
+    # written YAML carries a key the RL side would try to honour. Done
+    # AFTER the merge, so it scales whatever `friction` the axis level set.
+    train_friction_mult, _ = apply_train_friction_mult(train_merged)
     with train_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(train_merged, handle, sort_keys=True)
 
     backtest_merged = deep_merge(base, backtest_overrides)
     backtest_merged["model_name"] = cell.model_name
     backtest_merged["ticker"] = cell.ticker.replace("_", "/")
+    # Defensive: `train_friction_mult` is not in BACKTEST_EXPRESSIBLE_KEYS so
+    # `split_cell_overrides` routes it to the train-only list and it never
+    # reaches here -- but a future key-set edit must not be able to leak a
+    # multiplier into the EVAL config, which would break the one property
+    # this axis exists to guarantee.
+    backtest_merged.pop(TRAIN_FRICTION_MULT_KEY, None)
     # Strip train-only keys the base may carry, so the backtest genuinely
     # defers to the model's own config rather than to ours.
     for key in TRAIN_ONLY_CONFIG_KEYS:
         backtest_merged.pop(key, None)
     with backtest_path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(backtest_merged, handle, sort_keys=True)
+
+    # The EVAL multiplier is deliberately NOT recorded here. It is derived
+    # by the caller from the two WRITTEN files, not from the intent that
+    # produced them, so what lands in `cells.jsonl` is what the legs
+    # actually read. `read_friction_report` does that.
+    train_friction_mult, _ = apply_train_friction_mult(train_merged)
 
     if train_only:
         _LOGGER.debug(
@@ -1385,6 +1546,12 @@ def train_command(
     timesteps = cell.cli_params.get("timesteps")
     if timesteps is not None:
         cmd += ["--timesteps", str(timesteps)]
+    # TRAIN-ONLY (see RESERVED_AXES). Deliberately absent from
+    # backtest_command(): the backtest replays the whole evaluation slice,
+    # so an OOS arm's n_bars stays comparable across episode lengths.
+    episode_bars = cell.cli_params.get("episode_bars")
+    if episode_bars is not None:
+        cmd += ["--episode-bars", str(episode_bars)]
     seed = cell.cli_params.get("seed")
     if seed is not None:
         cmd += ["--seed", str(seed)]
@@ -2002,7 +2169,25 @@ def cmd_run(args: argparse.Namespace) -> int:
     workdir = Path(args.work_dir).expanduser() if args.work_dir else None
 
     known = done_cell_ids(load_records(spec.results))
-    pending = [c for c in cells if args.force or c.cell_id not in known]
+    # A recorded cell that produced NO measurement is not done, it is
+    # unfinished: status "error", or an INVALID verdict, means the cell has
+    # to run again. Skipping those made a crashed run unresumable — measured
+    # 2026-10-04, a 60-cell spec whose tail died on `EGeneral:Too many
+    # requests` reported "60 already recorded, nothing to do", and the only
+    # way forward was --force, which re-ran the 37 good cells and hit the
+    # same limit. Transient failures (rate limits, a dropped connection) are
+    # the common case, and a resumable harness that cannot resume past one
+    # is a trap.
+    #
+    # The distinction is measurement vs no measurement, so it reuses the
+    # same assessment the report does. `--force` still re-runs everything.
+    retriable = [
+        cid
+        for cid, rec in known.items()
+        if rec.get("status") != "ok" or rec.get("invalid_reasons")
+    ]
+    pending = [c for c in cells if args.force or c.cell_id not in known
+               or c.cell_id in retriable]
     if not pending:
         print(
             f"{len(cells)} cell(s) already recorded in {spec.results}. "
@@ -2028,6 +2213,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         if args.limit and executed >= args.limit:
             print(f"  (--limit {args.limit} reached; stopping)")
             break
+        # Pause BETWEEN cells, never before the first. Every cell refetches
+        # OHLC twice, so a high-seed spec fires 2 x len(cells) requests with
+        # nothing in between; measured 2026-10-04, 21 of 60 cells died on
+        # `EGeneral:Too many requests`. Skipped after the last cell too, so
+        # the run does not idle pointlessly on the way out.
+        if spec.cell_pause_seconds > 0 and executed > 0:
+            time.sleep(spec.cell_pause_seconds)
         cell_work = workdir or Path.cwd()
         config_dir = cell_work / "configs"
         train_cfg, backtest_cfg = materialize_configs(cell, spec, config_dir)
@@ -2066,6 +2258,12 @@ def cmd_run(args: argparse.Namespace) -> int:
             "window_pinned": window_is_pinned(cell.config_overrides),
             "eval_split_active": window_has_split(cell.config_overrides),
             "out_of_sample": cell_is_out_of_sample(cell.config_overrides),
+            # Read back from the two WRITTEN files, so this is what the
+            # legs were told rather than what the spec intended. Without
+            # it a cell record cannot distinguish "trained at 3x friction,
+            # scored at 1x" from "trained and scored at 3x", which is the
+            # entire point of the arm.
+            **read_friction_report(train_cfg, backtest_cfg),
             "started_at": _utcnow(),
         }
 
@@ -2209,7 +2407,26 @@ def _build_views(
     trustworthy denominator is what the ticker's other cells actually
     replayed. A cell that replayed 1 bar while its siblings replayed 697
     is degenerate regardless of what it asked for.
+
+    **One measurement per cell.** ``run`` dedupes before deciding what to
+    skip (:func:`done_cell_ids`), but this function used to read *every*
+    line in the results file, so a ``--force`` re-run — which appends
+    rather than replaces — was counted twice: 12 recorded instead of 6,
+    every per-group ``n`` doubled, and the dispersion gate's pooled
+    within-group IQR widened from +1.47% to +2.21% on identical numbers.
+    Measured 2026-10-04. Both paths now share one rule, so a re-run
+    reports the sample size it actually measured.
+
+    ``done_cell_ids`` keys on ``cell_id`` and therefore *drops* a line
+    that has none. That is right for ``run`` (it only ever skips work it
+    can identify) and wrong here: a hand-written or older results file
+    would lose rows from the report without a word. So unidentified
+    records are carried through unchanged — they are not duplicates of
+    anything, and an unidentifiable line is still a measurement.
     """
+    identified = done_cell_ids(records)
+    unidentified = [r for r in records if not r.get("cell_id")]
+    records = list(identified.values()) + unidentified
     peer_max: dict[str, int] = {}
     for record in records:
         backtest = record.get("backtest")
@@ -2448,6 +2665,15 @@ def cmd_report(args: argparse.Namespace) -> int:
         views, oos, insample, invalid, config_axes, has_seeds, spec
     )
 
+    # Paired analysis, over the same out-of-sample cohort every aggregate
+    # above uses. Preference order: the friction axis (the comparison the
+    # design exists for), then any other multi-level axis.
+    paired = None
+    for axis in ["friction", *config_axes]:
+        paired = paired_difference(oos, axis, HEADLINE)
+        if paired is not None:
+            break
+
     if args.json:
         print(
             json.dumps(
@@ -2467,6 +2693,7 @@ def cmd_report(args: argparse.Namespace) -> int:
                         for v in invalid
                     ],
                     "headline_metric": HEADLINE,
+                    "paired": paired,
                     "per_ticker": per_ticker,
                     "per_config": per_config,
                     "per_axis": per_axis,
@@ -2555,6 +2782,44 @@ def cmd_report(args: argparse.Namespace) -> int:
     for claim in claims:
         print(f"  - {claim}")
     print()
+
+    if paired:
+        p = paired
+        print("PAIRED PER-SEED DIFFERENCE  (level_b - level_a, by seed)")
+        print(
+            f"  axis: {p['axis']}   metric: {p['metric']}   "
+            f"n_pairs = {p['n_pairs']}"
+        )
+        print(
+            f"  a = {label(p['level_a'])}\n  b = {label(p['level_b'])}"
+        )
+        print(
+            f"  median diff {p['summary']['median']:+.4%}   "
+            f"mean diff {p['mean_diff']:+.4%}   "
+            f"sd {p['sd_diff']:.4%}"
+        )
+        if p["ci95"] is not None:
+            lo, hi = p["ci95"]
+            verdict = (
+                "excludes 0 — the difference is resolved at this n"
+                if (lo > 0 or hi < 0)
+                else "INCLUDES 0 — still inconclusive at this n"
+            )
+            print(
+                f"  95% CI (normal approximation, n={p['n_pairs']}): "
+                f"[{lo:+.4%}, {hi:+.4%}]  {verdict}"
+            )
+        else:
+            print(
+                f"  95% CI undefined at n={p['n_pairs']} (needs n >= 2 and "
+                "a non-zero spread). No interval is printed rather than a "
+                "degenerate one."
+            )
+        print(
+            f"  all {p['n_pairs']} diffs share one sign: {p['all_same_sign']}"
+        )
+        print(f"  {p['unpaired_note']}")
+        print()
 
     if invalid:
         print(
@@ -2680,6 +2945,130 @@ def _dispersion_claims(oos: Sequence[_CellView]) -> list[str]:
         "does not manufacture power. More power is more seeds."
     )
     return lines
+
+
+# ── paired analysis: the per-seed difference ─────────────────────────────
+#
+# The dispersion gate compares a between-arm gap against the spread INSIDE
+# an arm, which is honest but conservative: the two arms are measured on
+# different seeds, so the seed variance lands in the yardstick twice.  When
+# every seed is run at every level — the paired design the specs actually
+# use — the seed variance cancels.  The paired difference per seed,
+# `level_b - level_a`, then has a spread that is genuinely smaller than
+# either arm's, which is what buys power when the median gap does not clear
+# the pooled IQR.
+#
+# Reported alongside, never instead of, the gate: a paired mean with a
+# normal-approximation CI says how wide the uncertainty still is, which at
+# small n is the honest headline.  A paired test on 3 seeds is suggestive,
+# not decisive, and the CI is what makes that visible rather than implied.
+
+
+def paired_difference(
+    oos: Sequence["_CellView"],
+    axis: str,
+    metric: str = HEADLINE,
+) -> dict[str, Any] | None:
+    """Per-seed differences between two levels of ``axis``.
+
+    Cells are paired on ``seed``; a seed present at one level but not the
+    other is dropped rather than imputed, and the levels compared are the
+    two with the most shared seeds, so the comparison is always between
+    like-for-like runs.
+
+    Returns ``None`` when fewer than two levels share at least one seed —
+    there is no pairing to make, and inventing one would be the exact
+    "compare a gap to a pooled IQR" mistake this exists to avoid.
+    """
+    # (level_key, seed) -> view, for every out-of-sample valid cell.
+    by_level: dict[str, dict[Any, _CellView]] = {}
+    for view in oos:
+        params = view.params
+        if axis not in params:
+            continue
+        seed = params.get("seed")
+        if seed is None:
+            continue
+        by_level.setdefault(_canonical(params.get(axis)), {})[
+            _canonical(seed)
+        ] = view
+    if len(by_level) < 2:
+        return None
+
+    # Score every level pair by how many seeds they share, then take the
+    # best. Ties break on the label so the output is deterministic.
+    best: tuple[int, str, str, list[Any]] | None = None
+    levels = sorted(by_level)
+    for i, la in enumerate(levels):
+        for lb in levels[i + 1:]:
+            shared = sorted(set(by_level[la]) & set(by_level[lb]), key=str)
+            if not shared:
+                continue
+            cand = (len(shared), la, lb, shared)
+            if best is None or cand[0] > best[0]:
+                best = cand
+    if best is None:
+        return None
+
+    _, la, lb, shared = best
+    diffs: list[float] = []
+    rows: list[dict[str, Any]] = []
+    for seed in shared:
+        va, vb = by_level[la][seed], by_level[lb][seed]
+        xa, xb = va.metric(metric), vb.metric(metric)
+        if xa is None or xb is None:
+            continue
+        diffs.append(xb - xa)
+        rows.append(
+            {
+                "seed": seed,
+                "level_a": la,
+                "level_b": lb,
+                "a": xa,
+                "b": xb,
+                "diff": xb - xa,
+            }
+        )
+    if not diffs:
+        return None
+
+    n = len(diffs)
+    mean_diff = sum(diffs) / n
+    var = (
+        sum((d - mean_diff) ** 2 for d in diffs) / (n - 1) if n > 1 else 0.0
+    )
+    sd = var**0.5
+    # SE and the normal-approximation interval are undefined at n < 2 and
+    # degenerate at sd == 0, so both are reported as None rather than a
+    # number that would read as precision the sample cannot support.
+    se = sd / (n**0.5) if n > 1 and sd > 0 else None
+    ci = (
+        [mean_diff - 1.96 * se, mean_diff + 1.96 * se] if se is not None else None
+    )
+    return {
+        "axis": axis,
+        "metric": metric,
+        "level_a": la,
+        "level_b": lb,
+        "n_pairs": n,
+        "summary": summarize(diffs),
+        "mean_diff": mean_diff,
+        "sd_diff": sd,
+        "se_diff": se,
+        "ci95": ci,
+        "all_same_sign": all(d > 0 for d in diffs)
+        or all(d < 0 for d in diffs),
+        "rows": rows,
+        # Paired variance is what this buys; the unpaired yardstick is the
+        # gate's own, so the two are quoted to be compared.
+        "unpaired_note": (
+            "A paired comparison removes the between-seed variance the "
+            "unpaired gate charges to the yardstick. It does NOT add "
+            "replicates: at the same n it only removes a term, so a "
+            "non-overlapping CI here is a real finding and an overlapping "
+            "one is still inconclusive."
+        ),
+    }
 
 
 def _build_claims(

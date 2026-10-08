@@ -1,0 +1,189 @@
+# High-seed paired-friction matrix: is the friction effect real, and is the
+# policy's return distinguishable from a null policy?
+#
+#   just matrix-plan   configs/matrix.eth-highseed.yaml
+#   just matrix-run    configs/matrix.eth-highseed.yaml
+#   just matrix-report configs/matrix.eth-highseed.yaml
+#
+# ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────
+#
+# `matrix.eth-single.yaml` established that the friction gap does not clear
+# the seed noise at n=3 (ratio 0.44x). At three replicates a group IQR is
+# the middle of two order statistics, so that verdict is NECESSARY, NOT
+# SUFFICIENT — the gate cannot resolve anything smaller than the seed
+# spread, and the seed spread was measured wider than the effect. This
+# file buys the only thing that fixes it: REPLICATES.
+#
+# PPO on an identical config has been measured replaying 576 trades in one
+# run and 374 in another, so a single run is an anecdote. 30 seeds per
+# level is cheap here — a cell is ~10s end to end — and it is what makes
+# the paired comparison worth reading rather than merely suggestive.
+#
+# ── THE DESIGN IS PAIRED, and that is the point ──────────────────────────
+#
+# Every seed is run at BOTH friction levels. The report therefore pairs
+# cells on seed and analyses the per-seed difference (friction minus
+# frictionless), rather than comparing a gap between two medians to a
+# pooled within-group IQR. Pairing cancels the between-seed variance,
+# which is the dominant noise term here; it does NOT add replicates, so n
+# still has to be raised, and it is raised for exactly that reason.
+#
+# Read the PAIRED PER-SEED DIFFERENCE block, not the two group medians.
+#
+# ── SIGNALS: WHAT IS AND IS NOT PRESENT IN THE WINDOW ───────────────────
+#
+# MEASURED 2026-10-04, per channel, against this window:
+#
+#   funding   504/504 hours covered (100%)  — `just funding-backfill`
+#             recovered Kraken's own ~366-day hourly history, so the whole
+#             pinned window carries a funding reading on every bar.
+#   news        0/504  — NOT backfillable
+#   social      0/504  — NOT backfillable
+#
+# The news and social producers only look BACKWARD FROM NOW
+# (`--lookback-hours`, default 1h for news and a sliding 24h for social).
+# There is no historical endpoint for either — the funding channel has
+# `/historical-funding-rates` and news/social have nothing. Their earliest
+# records are 2026-10-03T13:00Z and 2026-10-03T07:00Z, i.e. AFTER this
+# window closes, so the gap is PERMANENT for this window rather than an
+# oversight.
+#
+# So this run measures the policy with ONE of three signal channels live.
+# The two absent channels contribute their columns at their historical
+# 0.0 fill with `signal_observed == 0`, which is honest but is NOT the same
+# system as one whose exogenous inputs are present. `plan` cannot see this
+# (it checks that a signal file EXISTS and is tagged for the ticker, not
+# that it covers the window), so it is stated here instead.
+#
+# The three signal timers are now enabled (:17 funding, :23 news, :29
+# social), so coverage accumulates from 2026-10-04 forward. A window that
+# is genuinely signal-complete becomes possible ~24h after that, and is
+# the next run to do — see the trigger in the sibling spec.
+#
+# ── WINDOW ───────────────────────────────────────────────────────────────
+#
+# Same pinned window as the n=3 run, deliberately: changing the window and
+# the seed count together would make the two results incomparable, and the
+# point of raising n is to re-decide THAT question, not a new one.
+#
+#   span        2026-09-10T15:00Z .. 2026-10-01T15:00Z  = 504 bars
+#   train       leading 70% = 353 bars
+#   eval slice  trailing 30% = 151 bars  <- the width-guard denominator
+#   replayed    ~127 bars after the 24-bar warm-up (windows [1, 4, 24])
+#   guard       min_bar_ratio 0.5 of 151 = 75.5 -> 127 clears it
+#
+# The live frame is ~721 bars (~30 days) and Kraken's REST ceiling does
+# NOT scale with --pages, so pages: 3 is over-fetch on purpose: the window
+# bounds are a CLIP on the read, not a push-down, so too few pages yields a
+# silently short window that only n_bars would reveal.
+name: eth-highseed-paired
+description: "ETH/USD, 30 seeds x 2 friction levels, paired per-seed difference: is the cost effect real, and is the policy better than a null?"
+
+run:
+  base_config: configs/default.yaml
+
+  # Scratch space — NEVER commit anything under models/.
+  results: /tmp/ktb-matrix/eth-highseed/cells.jsonl
+  models_root: /tmp/ktb-matrix/eth-highseed/models
+
+  min_bar_ratio: 0.5
+  # A ZERO-TRADE CELL IS A MEASUREMENT, not an absent one. The shipped
+  # default is 1, which marks a 0-trade cell INVALID — and that exclusion is
+  # BIASED AGAINST THE MODEL, because a policy that never trades returns
+  # exactly 0.0% absolute, i.e. excess = -buy_hold = +0.065%, which is the
+  # FLAT row, the best performer in the comparison. Dropping those cells
+  # removes the model's best outcomes.
+  #
+  # MEASURED on this spec, both ways:
+  #   Kraken costs   min_trades=1  n=28  median excess -1.78%  abs -1.85%
+  #   Kraken costs   min_trades=0  n=30  median excess -1.55%  abs -1.61%
+  #   frictionless   min_trades=1  n=29  median excess -0.074% abs -0.139%
+  #   frictionless   min_trades=0  n=30  median excess -0.062% abs -0.127%
+  # and paired (friction minus frictionless):
+  #   min_trades=1  n=28  mean -2.14%  95% CI [-2.84%, -1.43%]
+  #   min_trades=0  n=30  mean -2.00%  95% CI [-2.68%, -1.31%]  still resolved
+  #
+  # So 0 is the honest setting: a never-trading policy is a real policy, and
+  # "this seed converged to doing nothing" is a result about the training,
+  # not a gap in the data. Set it back to 1 to reproduce the strict reading.
+  min_trades: 0
+  timeout: 3600
+
+  # MEASURED, not precautionary: the first attempt at this spec ran all 60
+  # cells with no pause and 21 of them died on `EGeneral:Too many requests`
+  # — 120 OHLC refetches back to back with nothing between them. Kraken
+  # rate-limits the counter, and the harness correctly marked them INVALID
+  # rather than dropping them silently, but a 37-of-60 survivor set is
+  # biased toward whichever seeds ran before the limit bit. 3s between
+  # cells costs ~3 minutes and removes the failure mode.
+  cell_pause_seconds: 3.0
+
+  # Runtime ESTIMATES for `plan`'s projection only. Measured 2026-10-04: a
+  # cell is ~10s end to end on this frame (3000 timesteps, 353 train bars),
+  # so these are close to real rather than a floor.
+  train_seconds: 10
+  backtest_seconds: 2
+
+axes:
+  # ── Which market? ───────────────────────────────────────────────────
+  # ONE ticker, and that is a LIMITATION, not a simplification: it makes
+  # the cross-section unanswerable, so nothing here can support a
+  # "generalises across assets" claim. SOL is absent because all three
+  # signal keys point at ETH-only files with signal_require_ticker: true,
+  # and `plan` BLOCKERs a cell whose ticker its signal files do not carry.
+  # Giving SOL its own files is real data work; it is not matrix work.
+  ticker: [ETH_USD]
+
+  # ── How many times? ─────────────────────────────────────────────────
+  # THE AXIS THIS FILE EXISTS FOR. 30 replicates per level, so the paired
+  # per-seed difference has a usable standard error and the dispersion
+  # gate has a yardstick that is not itself the middle of two order
+  # statistics. Seeds are 42..71.
+  seed: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57,
+         58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71]
+
+  # ── How much data? ──────────────────────────────────────────────────
+  # Does not buy depth on the live arm (the REST ceiling is ~720 candles
+  # and does not scale with it). 3 over-fetches on purpose.
+  pages: [3]
+
+  # ── How long to train? ──────────────────────────────────────────────
+  # One level: this axis contributes nothing until it has two, and adding
+  # levels would cost cells without answering this file's question.
+  timesteps: [3000]
+
+  # ── Which action space? ─────────────────────────────────────────────
+  # discrete (buy/hold/sell). One level; changing it changes the
+  # observation width, so it needs its own matrix if it is ever varied.
+  action_space: [discrete]
+
+  # ── What does it cost to trade? ─────────────────────────────────────
+  # THE HEADLINE AXIS, and it is PAIRED: every seed below runs at BOTH
+  # levels, so the report can difference within a seed instead of
+  # comparing two medians. Level order puts the realistic one first, so a
+  # truncated run still carries the cells that matter.
+  friction:
+    - {fee_rate: 0.0026, slippage: 0.0005} # HEADLINE: 26bp + 5bp, Kraken taker
+    - {fee_rate: 0.0, slippage: 0.0}       # paired control for the same seeds
+
+  # ── Which bars? ─────────────────────────────────────────────────────
+  # Both bounds SET — a key present but null counts as UNSET, and without
+  # both the eval_split below is inert and the whole run is in-sample.
+  .data_window:
+    - since: "2026-09-10T15:00:00Z"
+      until: "2026-10-01T15:00:00Z"
+      eval_split: 0.7
+
+# ── Derived, not written here ────────────────────────────────────────────
+#
+# cells = 1 ticker x 30 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 2 friction levels x 1 data_window
+#       = 60 cells  (~12 min at the measured ~10s/cell above)
+#
+# 2 per-config groups (the friction levels), each backed by 30 seeds, and
+# 30 PAIIRS for the difference analysis. n=30 is past the point where a
+# group IQR stops being the middle of two order statistics, which is what
+# the n=3 run could not offer.
+#
+# NO algo AXIS, and there cannot be one today: `rl/agent.py` is a thin SB3
+# PPO wrapper with no other backend, so `plan` emits `no_algo_axis`.

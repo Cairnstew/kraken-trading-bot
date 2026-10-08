@@ -75,7 +75,11 @@ import numpy as np
 import pandas as pd
 
 from .agent import RLAgent
-from .data import add_derived_ohlcv_features, read_ohlc_dataframe
+from .data import (
+    add_derived_ohlcv_features,
+    read_ohlc_dataframe,
+    refresh_for_window,
+)
 from .data_window import (
     IN_SAMPLE_LABEL,
     DataWindow,
@@ -83,7 +87,7 @@ from .data_window import (
     evaluation_frame,
     resolve_data_window,
 )
-from .environment import TradingEnvironment
+from .environment import ECONOMIC_FILL_FRACTION, TradingEnvironment
 from .features import FeaturePipeline, check_feature_width, normalize_ticker_id
 from .registry import ModelRecord, scan_model
 from .train import load_train_config
@@ -219,6 +223,37 @@ class BacktestResult:
     )
     n_train_bars: int = 0
     n_eval_bars: int = 0
+    # ── Turnover and exposure accounting (added 2026-10-05) ──────────────
+    # WHY these exist: `num_trades` alone cannot say whether a policy
+    # traded, because the discrete "buy 20% of balance" action keeps
+    # producing sub-dollar fills once the book is full (measured: seed 45
+    # of the deep-ab matrix logged 3,433 fills of which 3,339 moved under
+    # $1). Friction is charged on traded NOTIONAL -- verified at
+    # cost/notional = 0.003103-0.003104 against a modelled 0.0031 -- so a
+    # report needs notional, not a fill count. And `excess_return` alone
+    # cannot separate skill from de-risking: on a falling window a policy
+    # that simply holds less cash beats buy-and-hold without being right
+    # about anything, which is why `mean_exposure` is reported beside it.
+    #
+    # mean_exposure: Mean over replayed bars of ``abs(position * price) /
+    #   equity`` at that bar's close, AFTER that bar's order. This is the
+    #   x an exposure-matched baseline is built from.
+    # time_in_market: Fraction of replayed bars with ``abs(position) > 0``.
+    # total_notional: Sum over fills of ``units * fill`` (gross value
+    #   crossing the book at the fill price).
+    # notional_turnover: ``total_notional / mean_equity``.
+    # economic_trades: Fills whose notional reached
+    #   ``economic_trade_fraction`` of the initial balance.
+    # economic_trade_threshold: That fraction resolved to dollars for THIS
+    #   run, so the count is interpretable without re-deriving it.
+    mean_exposure: float = 0.0
+    time_in_market: float = 0.0
+    total_notional: float = 0.0
+    notional_turnover: float = 0.0
+    mean_equity: float = 0.0
+    economic_trades: int = 0
+    economic_trade_threshold: float = 0.0
+    economic_trade_fraction: float = ECONOMIC_FILL_FRACTION
 
     def to_dict(self) -> dict[str, Any]:
         """A JSON-serializable dict view of the result."""
@@ -248,6 +283,17 @@ class BacktestResult:
             "evaluation_scope_reason": self.evaluation_scope_reason,
             "n_train_bars": self.n_train_bars,
             "n_eval_bars": self.n_eval_bars,
+            # Turnover / exposure accounting. ADDITIVE: every key above is
+            # untouched, so a consumer reading the old shape sees exactly
+            # what it saw before.
+            "mean_exposure": self.mean_exposure,
+            "time_in_market": self.time_in_market,
+            "total_notional": self.total_notional,
+            "notional_turnover": self.notional_turnover,
+            "mean_equity": self.mean_equity,
+            "economic_trades": self.economic_trades,
+            "economic_trade_threshold": self.economic_trade_threshold,
+            "economic_trade_fraction": self.economic_trade_fraction,
         }
 
 
@@ -382,6 +428,30 @@ def _benchmark(
     return total_return, max_drawdown
 
 
+def _refresh_for_window(
+    window: DataWindow,
+    *,
+    pair: str,
+    interval: int,
+    store_setting: Any,
+) -> dict[str, Any]:
+    """Should this read skip the fetch leg?  ``{"refresh": ..., "coverage": ...}``.
+
+    Thin wrapper over :func:`~kraken_trading_bot.rl.data.refresh_for_window`
+    so the decision has one implementation shared with ``train.py`` (which
+    cannot import from here -- ``backtest`` imports ``train``).
+    """
+    return refresh_for_window(
+        since=window.since,
+        until=window.until,
+        is_pinned=window.is_pinned,
+        window_label=window.describe(),
+        pair=pair,
+        interval=interval,
+        store_setting=store_setting,
+    )
+
+
 def backtest_model(
     ticker_id: str,
     model_name: str,
@@ -468,8 +538,26 @@ def backtest_model(
         interval = int(
             (record.config or {}).get("ohlcv_interval_minutes", 60)
         )
+        pair = record.config.get("ticker", ticker_key.replace("_", "/"))
+        # Named keywords, never a `**` splat: the package's own
+        # `test_every_read_ohlc_dataframe_call_site_forwards_venue` refuses
+        # to prove a splatted call forwards anything, and it is right not
+        # to at this seam.
+        store_setting = _resolve_env_setting(
+            "market_data_store",
+            env_kwargs,
+            run_cfg,
+            record.config or {},
+            None,
+        )
+        refresh_kwargs = _refresh_for_window(
+            window,
+            pair=pair,
+            interval=interval,
+            store_setting=store_setting,
+        )
         df = read_ohlc_dataframe(
-            record.config.get("ticker", ticker_key.replace("_", "/")),
+            pair,
             interval=interval,
             pages=pages,
             manager=manager,
@@ -480,13 +568,7 @@ def backtest_model(
             signal_require_ticker=record.config.get("signal_require_ticker", True),
             # A run config may point the read at a different store; absent
             # that key the model's own source is used, unchanged.
-            market_data_store=_resolve_env_setting(
-                "market_data_store",
-                env_kwargs,
-                run_cfg,
-                record.config or {},
-                None,
-            ),
+            market_data_store=store_setting,
             # Provenance label only, same four sources: the model's own
             # config is the record of what its training bars came from,
             # so a run config may not contradict it silently.
@@ -497,6 +579,8 @@ def backtest_model(
                 record.config or {},
                 None,
             ),
+            refresh=bool(refresh_kwargs["refresh"]),
+            coverage=refresh_kwargs.get("coverage"),
         )
     else:
         df = data
@@ -679,6 +763,20 @@ def backtest_model(
         closes, env.start_index, n_replayed
     )
 
+    # ── Turnover / exposure accounting ─────────────────────────────────
+    # Both denominators count REPLAYED bars and exclude the seed equity
+    # point at the head of `equity_curve`, so mean_exposure,
+    # time_in_market and mean_equity all describe the same span as
+    # `n_bars`. Read off the env, which is the only place a fill happens.
+    replayed_equity = eq[1:] if eq.size > 1 else eq
+    mean_equity = float(np.mean(replayed_equity)) if replayed_equity.size else 0.0
+    mean_exposure = (env.exposure_sum / n_replayed) if n_replayed else 0.0
+    time_in_market = (env.bars_in_market / n_replayed) if n_replayed else 0.0
+    total_notional = float(env.total_notional)
+    notional_turnover = (
+        total_notional / mean_equity if mean_equity > 0.0 else 0.0
+    )
+
     result = BacktestResult(
         ticker_id=ticker_key,
         model_name=model_name,
@@ -703,6 +801,16 @@ def backtest_model(
         evaluation_scope_reason=scope.reason,
         n_train_bars=scope.n_train_bars,
         n_eval_bars=scope.n_eval_bars,
+        mean_exposure=mean_exposure,
+        time_in_market=time_in_market,
+        total_notional=total_notional,
+        notional_turnover=notional_turnover,
+        mean_equity=mean_equity,
+        economic_trades=env.economic_trades,
+        economic_trade_threshold=(
+            ECONOMIC_FILL_FRACTION * initial_balance
+        ),
+        economic_trade_fraction=ECONOMIC_FILL_FRACTION,
     )
     _LOGGER.info(
         "Backtest %s/%s [%s]: %d/%d bars replayed, return=%.2f%% "

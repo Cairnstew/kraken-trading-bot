@@ -1,0 +1,177 @@
+# Deep-history A/B: does more data + a leaner observation beat the
+# live-fetch setup on a window that can actually discriminate?
+#
+#   just matrix-plan   configs/matrix.deep-ab.yaml
+#   just matrix-run    configs/matrix.deep-ab.yaml
+#   just matrix-report configs/matrix.deep-ab.yaml
+#   just baselines     configs/matrix.deep-ab.yaml
+#
+# ── WHY THIS FILE EXISTS ────────────────────────────────────────────────
+#
+# The n=60 live-fetch run (`configs/matrix.eth-highseed.yaml`) answered its
+# question honestly: the policy's timing is WORSE than a timing-matched
+# null (beaten by a median 88% of draws) and the paired cost effect is
+# -2.00% [95% CI -2.68%, -1.31%]. But that run CANNOT tell you whether the
+# setup is the problem, for three measured reasons:
+#
+#   1. THE WINDOW CANNOT DISCRIMINATE. Buy-and-hold moved -0.065% over 127
+#      replayed bars. Never trading winning is close to arithmetic there.
+#   2. 353 TRAINING BARS. `market_data_store: null` means a live fetch, and
+#      Kraken's REST ceiling is ~720 candles that do not scale with --pages.
+#      3000 timesteps over a 353-bar episode is ~8.5 passes of one rollout.
+#   3. THE OBSERVATION IS MOSTLY DEAD. Measured on this window: 15 of 26
+#      raw columns are CONSTANT on the training slice, and all 13
+#      signal-channel columns are among them (the news/social producers
+#      have no historical endpoint; the funding file starts 2025-10). The
+#      policy is fitting a 66-dim observation of which a large share is a
+#      constant zero.
+#
+# This file changes the DATA SUBSTRATE first, so the model-setup question
+# becomes answerable, and then varies the two setup knobs that plausibly
+# matter. It does not claim to find a profitable model; it claims to
+# measure whether these two changes move out-of-sample return at all.
+#
+# ── THE SUBSTRATE ───────────────────────────────────────────────────────
+#
+# `configs/deep-ab.base.yaml` turns on the local store: 76,560 ETH/USD 60m
+# bars (2018-01-01 -> 2026-09-30) seeded from the Binance spot archive by
+# kraken-deep-history. Measured: 120 missing bars across 27 gaps, largest
+# 32 bars, and features are z-scored on BAR COUNTS so a hole reads as a
+# 1-bar step. The window below sits clear of every listed gap. `just
+# store-verify` is the check to re-run before trusting any of this.
+#
+# VENUE: these bars are Binance-USDT spot, not Kraken. configs/default.yaml
+# measured the basis at +5.41bp of level shift. Backtested on Binance,
+# traded on Kraken — stated, not corrected.
+#
+# ── THE WINDOW ──────────────────────────────────────────────────────────
+#
+#   span        2020-06-01T00:00Z .. 2022-12-31T00:00Z = 22,611 bars
+#   train       leading 70% = 15,828 bars  (2020-06-01 -> 2022-03-23)
+#   eval slice  trailing 30% =  6,783 bars  (2022-03-24 -> 2022-12-30)
+#   buy&hold    train +1166.9%   EVAL -59.4%
+#
+# The eval slice is 53x the 127 bars the live run replayed, and it is the
+# 2022 bear: buy-and-hold -59.4%, so a flat policy is decisively beaten
+# and a trend follower has something to trend. That is the property the
+# old window lacked. A caveat that comes WITH it: -59.4% is a large move,
+# so a short-biased policy can score well here and still be a bad trade.
+# Read `excess_return` against buy-and-hold and against the null policies,
+# never `total_return`.
+name: deep-ab
+description: "ETH/USD on the deep store: does episode length or dropping the dead signal channels move out-of-sample return on a 6,783-bar bear-market holdout?"
+
+run:
+  base_config: configs/deep-ab.base.yaml
+
+  # Scratch space — NEVER commit anything under models/.
+  results: /tmp/ktb-matrix/deep-ab/cells.jsonl
+  models_root: /tmp/ktb-matrix/deep-ab/models
+
+  min_bar_ratio: 0.5
+  # 0 is the honest setting, same reasoning as the high-seed spec: a
+  # never-trading policy returns exactly 0.0% absolute, i.e. it IS the
+  # flat row, so excluding 0-trade cells removes the model's best cases.
+  min_trades: 0
+  timeout: 3600
+
+  # The store arm re-reads the SAME parquet for every cell, so the
+  # rate-limit that killed 21 of 60 live-fetch cells should not bite.
+  # Kept anyway: each cell still makes live API calls (the fetch->upsert
+  # leg), and 3s costs ~1 minute over 20 cells.
+  cell_pause_seconds: 3.0
+
+  # Measured 2026-10-05 on this frame: ~24s to train 20,000 timesteps on a
+  # 1440-bar episode, plus a backtest over the 6,783-bar eval slice.
+  train_seconds: 75
+  backtest_seconds: 30
+
+axes:
+  # ── Which market? ───────────────────────────────────────────────────
+  # ONE ticker, and that is a LIMITATION. The seeder mapped ETH/USD,
+  # BTC/USD, SOL/USD and XRP/USD; a second ticker is the next run, not
+  # this one. Nothing here supports a cross-asset claim.
+  ticker: [ETH_USD]
+
+  # ── How many times? ─────────────────────────────────────────────────
+  # 5 seeds. Three is the floor; five is where a difference starts to be
+  # worth reading. This repo has measured PPO on an identical config
+  # replaying 576 trades in one run and 374 in another, so n=1 is an
+  # anecdote and n=3 cannot resolve anything inside the seed spread.
+  seed: [42, 43, 44, 45, 46]
+
+  # Over-fetch on purpose. The store returns deep history regardless, and
+  # the window bounds are a CLIP on the read, not a push-down, so too few
+  # pages yields a silently short window that only n_bars would reveal.
+  pages: [3]
+
+  # ── How much history does the policy SEE? ───────────────────────────
+  # THE headline data-ingestion axis. `episode_bars` bounds BOTH the single
+  # episode and the normalization fit window (rl.data.prepare_episode
+  # slices first, then fits), so it is the knob that decides how much
+  # history reaches the policy at all. The live run had it unset: the
+  # whole 353-bar training slice as one rollout.
+  #   1440 = 60 days   4380 = 182 days
+  # It is TRAIN-ONLY (a CLI flag with no config key), and the backtest leg
+  # never receives it, so every arm replays the SAME 6,783-bar eval slice
+  # and n_bars stays comparable across levels.
+  episode_bars: [1440, 4380]
+
+  # ── How long to train? ──────────────────────────────────────────────
+  # FIXED, deliberately, at 20x the live run's 3000. One level: this axis
+  # contributes nothing until it has two, and holding it constant is what
+  # stops the episode and feature comparisons from being confounded by it.
+  # 60,000 timesteps is ~42 episodes at episode_bars=1440 and ~14 at 4380.
+  timesteps: [60000]
+
+  # ── Which action space? ─────────────────────────────────────────────
+  # discrete, matching the n=60 run so the substrate change is not
+  # confounded with an action-space change.
+  action_space: [discrete]
+
+  # ── What does it cost to trade? ─────────────────────────────────────
+  # Kraken taker on EVERY cell. The point of this file is which setup wins
+  # AFTER costs, so friction is held at the realistic level rather than
+  # varied — and a single non-zero level means the "every cell is
+  # frictionless" BLOCKER cannot fire. The paired cost EFFECT is already
+  # measured elsewhere (-2.00%, n=30) and does not need re-measuring here.
+  friction:
+    - {fee_rate: 0.0026, slippage: 0.0005}
+
+  # ── Drop the dead columns? ──────────────────────────────────────────
+  # The measured waste: 15 of 26 raw columns constant on the training
+  # slice, including all 13 signal-channel columns and bid/ask (the
+  # Binance archive carries no book). The wide arm reproduces the shipped
+  # feature_groups; the lean arm drops `signals` AND `microstructure`,
+  # leaving price/technical/volume.
+  #
+  # Dropping a group changes the observation WIDTH, so each level trains
+  # its own model — the harness derives a per-cell model name, so no
+  # artifact is ever shared between levels.
+  .feature_groups:
+    - ["price", "technical", "volume", "microstructure", "signals"]
+    - ["price", "technical", "volume"]
+
+  # ── Which bars? ─────────────────────────────────────────────────────
+  # Both bounds SET. A key present but null counts as UNSET, and without
+  # both the eval_split below is inert and the run is in-sample.
+  .data_window:
+    - since: "2020-06-01T00:00:00Z"
+      until: "2022-12-31T00:00:00Z"
+      eval_split: 0.7
+
+# ── Derived, not written here ───────────────────────────────────────────
+#
+# cells = 1 ticker x 5 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 2 episode_bars x 1 friction x 2 feature_groups x 1 window
+#       = 20 cells (~35 min at the measured per-cell cost above)
+#
+# 4 per-config groups, each backed by 5 seeds, and the marginals are
+# READ ONE AXIS AT A TIME — the two axes are crossed, so the feature
+# marginal pools both episode lengths and vice versa. That is the price
+# of 20 cells instead of 15 for a one-factor-at-a-time design, and it is
+# worth it here: the interaction (does a leaner observation only help
+# once the policy sees more history?) is a real question, not a flaw.
+#
+# NO algo AXIS: rl/agent.py is a thin SB3 PPO wrapper, so `plan` emits
+# `no_algo_axis`.

@@ -72,7 +72,12 @@ initial_balance: 10000.0
 # Simulated execution costs.
 fee_rate: 0.0         # fractional fee per executed order
 slippage: 0.0         # fractional adverse price move on fills
-allow_short: false    # whether sell actions may open a short position
+allow_short: false    # NOT IMPLEMENTED, and a no-op: a sell from a flat
+                      # book computes units = position * sell_frac = 0
+                      # and is skipped, so no short is ever opened.
+                      # Every run is LONG-ONLY. `true` makes training
+                      # refuse; it is `false` here because that is
+                      # what this code actually does.
 
 # --- Environment --------------------------------------------------------
 action_space: "continuous"

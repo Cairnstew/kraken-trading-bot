@@ -1,0 +1,192 @@
+# CONTROL-ONLY GATE (Phase 2) — does the setup have an edge before ANY of
+# A0 / a turnover penalty / feature selection is worth building?
+#
+# DRAFTED, NOT RUN. Phase 1 checkpoint only.
+#
+#   just matrix-plan   configs/matrix.control-2024.yaml
+#   just matrix-run    configs/matrix.control-2024.yaml     <-- Phase 2, needs a go
+#   just baselines     configs/matrix.control-2024.yaml
+#
+# ── WHAT THIS RUN IS ───────────────────────────────────────────────────
+#
+# ONE arm: the control. No penalty, no reward-shape change, no feature
+# work. Its only job is to answer, on a window where the degenerate
+# answers are unavailable:
+#
+#   "Does a model trained on this substrate beat an EXPOSURE-MATCHED
+#    buy-and-hold at its own realised exposure -- at 0x friction, and at
+#    Kraken taker?"
+#
+# The verdict metric is `alpha_vs_x` (tools/null_baselines.py,
+# `exposure_matched`): model total_return minus the x-matched baseline's,
+# where x is that model's OWN realised mean exposure. It cannot be won by
+# de-risking and cannot be won by beta. `alpha_vs_x_adj` (same, plus the
+# model's own friction added back) is reported beside it as a diagnostic.
+#
+# `alpha_vs_x` is a DECOMPOSITION, not an achievable target: nobody can
+# know in advance the mean exposure their own policy will realise. It
+# answers the narrower question -- given how exposed this policy was, was
+# its SELECTION of when to be exposed any good?
+#
+# ── WHY A DIFFERENT WINDOW ─────────────────────────────────────────────
+#
+# The deep-ab window cannot answer this. Its eval slice is the 2022 bear
+# (buy&hold -60.76%), so a policy that simply holds cash scores +60.76%
+# excess and "never trade" wins outright. Measured on that window (Step
+# 0 / 0c, 5 seeds): median excess vs buy&hold +17.16%, but median
+# `alpha_vs_x` -24.30pp -- the apparent edge was de-risking, and the
+# exposure-matched comparison scored it NEGATIVE.
+#
+# This window's eval slice has buy&hold +45.40%, so:
+#   - flat cash scores -45.40% excess  -> hiding is not a solution;
+#   - buy&hold scores +45.40%          -> exposure is rewarded;
+#   - a policy must therefore earn its keep on BOTH beta and timing.
+#
+# It also spans two regimes, which the sub-window sd measurement says is
+# where the noise is lowest (deep window: sd 12.0pp in the crash slice,
+# 16.4pp and 21.9pp in the two later ones -- 0c/Step 0b). The halves are
+# +49.78% and -3.06%.
+#
+# Single ticker, single venue, and that is a LIMITATION: the store holds
+# ETH_USD 60m only (76,676 bars, 2018-01-01 -> 2026-10-05), so nothing here
+# supports a cross-asset claim. Those bars are Binance-USDT spot seeded by
+# kraken-deep-history, backtested here and traded on Kraken.
+#
+# ── THE SPLIT, AND WHY IT IS EXACT ─────────────────────────────────────
+#
+#   window  2020-01-01T00:00Z .. 2025-01-01T00:00Z   (until exclusive)
+#   bars    43,817 present; 43,848 on the hour grid. The seeded store
+#           has 31 MISSING hourly bars inside this window, in 23 gaps
+#           (measured 2026-10-05 by the refresh=False coverage guard).
+#           No fetch can repair them -- they are 4+ years behind
+#           Kraken's 721-bar REST ceiling -- so they are counted
+#           here rather than silently interpolated. Features are
+#           bar-relative (pct_change/rolling on present bars), so a
+#           gap widens the wall-clock span those windows cover
+#           without fabricating a price move.
+#   split   eval_split 0.79953 -> cut = round(43817 * 0.79953) = 35,033  (on the 43,817 PRESENT bars)
+#   TRAIN   2020-01-01T00:00Z .. 2023-12-31T23:00Z    35,033 bars
+#   EVAL    2024-01-01T00:00Z .. 2024-12-31T23:00Z     8,784 bars
+#   replayed after the 24-bar warm-up                  8,760 bars
+#
+# The cut is placed by eval_split rather than by two hand-written windows
+# so that train and eval cannot overlap by construction: `split_index()`
+# takes one clipped frame and slices it at a single index. Verified
+# against the store's own parquet:
+#
+#   - eval first bar (2024-01-01T00:00Z) > train last bar
+#     (2023-12-31T23:00Z)                              -> True
+#   - intersection of train and eval bar sets          -> 0 bars
+#   - the 24-bar feature warm-up is consumed from the EVAL head
+#     (2024-01-01T00:00Z .. 2024-01-01T23:00Z), never reaching back into
+#     train                                             -> True
+#   - normalization statistics come from the stored TRAINING fit
+#     (normalization.npz), not from the eval slice
+#
+# 35,033 training bars hold 24 episodes at episode_bars=1440 and 7 at
+# 4380. episode_bars is fixed at 1440 here so the arm count stays at 8:
+# this run measures the substrate, and varying episode length would
+# confound that with a second axis.
+name: control-2024
+description: "ETH/USD control-only gate: on a +45.4% buy&hold holdout, does the policy beat an exposure-matched hold at its own realised exposure, before any penalty, reward-shape or feature work?"
+
+run:
+  base_config: configs/deep-ab.base.yaml
+
+  # Scratch space — NEVER commit anything under models/.
+  results: /tmp/ktb-matrix/control-2024/cells.jsonl
+  models_root: /tmp/ktb-matrix/control-2024/models
+
+  min_bar_ratio: 0.5
+  # 0 is the honest setting (a never-trading policy returns exactly 0.0%
+  # absolute, i.e. it IS the flat row, so excluding 0-trade cells removes
+  # the model's best cases). Kept identical to the deep-ab spec so the two
+  # runs differ only in the window.
+  min_trades: 0
+  timeout: 3600
+
+  cell_pause_seconds: 3.0
+
+  # Measured 2026-10-05 on the deep-ab frame: ~24s to train 20,000
+  # timesteps on a 1440-bar episode, ~30s to backtest its eval slice.
+  # THIS eval slice is 8,760 replayed bars against the deep window's 6,759,
+  # so allow a little more; 3,600 is the outer guard above.
+  train_seconds: 90
+  backtest_seconds: 40
+
+axes:
+  # ONE ticker, and the store holds no other. Not a cross-asset claim.
+  ticker: [ETH_USD]
+
+  # 8 seeds. This is the pre-registered n: the Phase 2 decision rule uses a
+  # one-sided sign test at >= 7 of 8 (7/8 gives p ~ 0.035; 6/8 gives
+  # p ~ 0.145 and does not count). 5 seeds cannot express that threshold.
+  seed: [42, 43, 44, 45, 46, 47, 48, 49]
+
+  # Over-fetch on purpose. The store returns deep history regardless and
+  # the window bounds are a CLIP on the read, not a push-down, so too few
+  # pages yields a silently short window that only n_bars would reveal.
+  #
+  # KNOWN COST (measured 2026-10-05): every store read also runs a
+  # fetch -> upsert leg against the live Kraken API — 6 OHLC calls per
+  # backtest, 731 bars appended to the store's TAIL and then discarded
+  # because this window is 2020-2024. At 8 cells that is ~48 calls, plus 6
+  # more per backtest in Phase 2. One of 40 such reads rate-limited with
+  # `EGeneral:Too many requests` on 2026-10-05. Root cause and the
+  # smallest fix are in the Phase 1 report; the harness has no retry yet.
+  pages: [3]
+
+  # TRAIN-ONLY (a CLI flag with no config key), so the backtest leg never
+  # receives it and every arm replays the SAME 8,760-bar eval slice.
+  episode_bars: [1440]
+
+  # 60,000 timesteps, matching the deep-ab spec so the two runs differ
+  # only in the window. ~42 episodes at episode_bars=1440.
+  timesteps: [60000]
+
+  action_space: [discrete]
+
+  # Kraken taker on the TRAINING leg, as in deep-ab. The 0x arm is a
+  # BACKTEST of the same artifact, not a retrain: `friction` is in
+  # BACKTEST_EXPRESSIBLE_KEYS, so Phase 2 replays each trained model at
+  # 0x and 1x with the policy held fixed.
+  friction:
+    - {fee_rate: 0.0026, slippage: 0.0005}
+
+  # ONE arm. The wide arm reproduces the shipped feature_groups. A0
+  # (window hygiene) is a LATER question and is deliberately not mixed in
+  # here: this run exists to decide whether anything is worth optimising.
+  .feature_groups:
+    - ["price", "technical", "volume", "microstructure", "signals"]
+
+  # THE SPLIT. eval_split 0.79953 is not a round number: it is the value
+  # that makes split_index() land on 35,033, the exact bar index of
+  # 2024-01-01T00:00Z inside this window. See the arithmetic above.
+  #
+  # eval_split is documented as "fraction used for TRAINING", which reads
+  # backwards next to the field name; 0.79953 = 79.953% of the window is
+  # training, and the trailing 20.047% (8,784 bars) is replayed.
+  .data_window:
+    - since: "2020-01-01T00:00:00Z"
+      until: "2025-01-01T00:00:00Z"
+      eval_split: 0.79953
+
+# ── Derived, not written here ───────────────────────────────────────────
+#
+# cells = 1 ticker x 8 seeds x 1 pages x 1 timesteps x 1 action_space
+#         x 1 episode_bars x 1 friction x 1 feature_groups x 1 window
+#       = 8 cells
+#
+# `just matrix-plan configs/matrix.control-2024.yaml` reports:
+#     CELLS 8 / ESTIMATED 17m / WINDOWED 8/8
+# which is the number to quote — it is derived from the train_seconds and
+# backtest_seconds above (90 + 40 = 130s per cell). The harness notes a
+# real PPO run is slower than that estimate.
+#
+# Phase 2 then adds backtest-only legs (0x and 1x on the primary window,
+# plus the two halves) at ~40s each: 8 models x 4 slices x 2 frictions =
+# 64 backtests, ~40 min run serially, and each one costs 6 more Kraken
+# API calls (see the `pages` note above).
+#
+# NO algo AXIS: rl/agent.py is a thin SB3 PPO wrapper, so `plan` emits
+# `no_algo_axis`.

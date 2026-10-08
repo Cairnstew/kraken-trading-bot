@@ -162,6 +162,14 @@ def build_export_frame(
     interval = int(cfg.get("ohlcv_interval_minutes", 60))
 
     _LOGGER.info("Exporting %d pages of %s %d-minute OHLC", pages, pair, interval)
+    # refresh=True is DELIBERATE here: this module has no data_window
+    # concept at all, so there is no pinned window to skip a fetch for and
+    # no trailing bar the read might miss. It exports the live trailing
+    # window and the fetch is the point. Stated explicitly because the
+    # default is also True -- an omitted keyword reads as an oversight
+    # rather than a decision, and `tests/test_rl_signal_config_wiring.py::
+    # test_every_read_ohlc_dataframe_call_site_states_refresh_explicitly`
+    # now refuses a call site that leaves it to the default.
     df = read_ohlc_dataframe(
         pair,
         interval=interval,
@@ -174,6 +182,7 @@ def build_export_frame(
         signal_require_ticker=cfg.get("signal_require_ticker", True),
         market_data_store=cfg.get("market_data_store"),
         market_data_store_venue=cfg.get("market_data_store_venue"),
+        refresh=True,
     )
 
     features = FeaturePipeline(

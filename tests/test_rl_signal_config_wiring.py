@@ -1393,3 +1393,122 @@ def test_the_history_recipe_must_run_both_legs_or_spread_goes_dead(
     assert (history_plus_live["bid"] != 0).sum() > 0, (
         "the live leg is what keeps a real quote behind spread"
     )
+
+# ---------------------------------------------------------------------------
+# Phase 4A: every read_ohlc_dataframe call site must STATE its refresh
+# behaviour. An omitted `refresh` is not neutral: the default is True, so
+# the call silently fetches and upserts.
+#
+# The failure this guards is the same shape as the venue one above. A call
+# that forgets `refresh=` does not raise, does not warn, and does not
+# change any number in the report it feeds -- it spends rate limit and
+# appends trailing bars to the store, which then sit outside every replayed
+# window. Measured 2026-10-05: `tools/null_baselines.py` read a pinned
+# 2020-2022 window with the default `refresh=True`, and the store grew
+# 76,677 -> 76,679 bars across two diagnostics runs with nothing in the
+# results to show for it. A silent no-op on the numbers is exactly the kind
+# of defect a structural pin is for.
+# ---------------------------------------------------------------------------
+
+# The two legs allowed to fetch. Each must say `refresh=True` AND write the
+# reason in the comment block above the read, marked with this exact phrase
+# so the assertion is a string check a reader can verify by eye rather than
+# a fuzzy keyword match that a reworded comment can satisfy by accident.
+_DELIBERATE_FETCH_MARKER = "refresh=True is DELIBERATE"
+
+_DELIBERATE_FETCH_LEGS = (
+    "paper_trade.py",
+    "export.py",
+)
+
+
+def _read_ohlc_call_sites(*roots: Path) -> list[tuple[Path, ast.Call]]:
+    """Every ``read_ohlc_dataframe(`` call under ``roots``, as (path, node)."""
+    data_module = __import__("kraken_trading_bot.rl.data", fromlist=["*"])
+    out: list[tuple[Path, ast.Call]] = []
+    for root in roots:
+        files = [root] if root.is_file() else sorted(root.rglob("*.py"))
+        for path in files:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                called = getattr(func, "id", None) or getattr(func, "attr", None)
+                if called == "read_ohlc_dataframe":
+                    out.append((path, node))
+    return out
+
+
+def test_every_read_ohlc_dataframe_call_site_states_refresh_explicitly() -> None:
+    """No call site may leave ``refresh`` to the default.
+
+    ``refresh`` defaults to True, which is a live fetch plus an upsert. A
+    read against a pinned window that has no ``refresh=`` therefore costs
+    six OHLC calls and appends 731 trailing bars it will immediately
+    discard -- see ``data.refresh_for_window``'s docstring for the
+    measurement on ``backtest_model``.
+
+    A ``**`` splat is a failure here for the same reason it is one for the
+    venue key: a call that splats cannot be proved to state anything.
+    ``refresh=`` may not arrive through a splat on ANY call site.
+    """
+    package = Path(
+        inspect.getsourcefile(
+            __import__("kraken_trading_bot.rl.data", fromlist=["*"])
+        )
+        or ""
+    ).parent.parent
+    repo = package.parent
+    gaps: list[str] = []
+    found = 0
+    for path, node in _read_ohlc_call_sites(package, repo / "tools"):
+        found += 1
+        where = f"{path.relative_to(repo)}:{node.lineno}"
+        keywords = {kw.arg for kw in node.keywords if kw.arg}
+        if len(keywords) != len(node.keywords):
+            gaps.append(
+                f"{where}: splats, so no keyword is provable -- state "
+                f"refresh= as a named keyword"
+            )
+            continue
+        if "refresh" not in keywords:
+            gaps.append(
+                f"{where}: no refresh=, so it silently fetches and upserts"
+            )
+    assert found >= 6, (
+        f"found only {found} read_ohlc_dataframe call sites; the scan is "
+        f"narrowing and would pass vacuously"
+    )
+    assert not gaps, "read_ohlc_dataframe call sites with unstated refresh:\n" + "\n".join(gaps)
+
+
+def test_the_two_live_reads_say_so_in_source() -> None:
+    """``paper_trade`` and ``export`` fetch on purpose; the source must say so.
+
+    Not a licence to omit ``refresh=`` -- the guard above applies to them
+    too -- but a licence requires the *reason* to be written at the call,
+    so a later reader does not "fix" a deliberate fetch into a silent one,
+    or a silent one into a deliberate-looking one.
+    """
+    package = Path(
+        inspect.getsourcefile(
+            __import__("kraken_trading_bot.rl.data", fromlist=["*"])
+        )
+        or ""
+    ).parent.parent
+    unannotated: list[str] = []
+    for name in _DELIBERATE_FETCH_LEGS:
+        path = package / "rl" / name
+        lines = path.read_text(encoding="utf-8").splitlines()
+        sites = [node.lineno for _p, node in _read_ohlc_call_sites(path)]
+        assert sites, f"{name}: no read_ohlc_dataframe call site found"
+        for lineno in sites:
+            window = "\n".join(lines[max(0, lineno - 30):lineno])
+            if _DELIBERATE_FETCH_MARKER not in window:
+                unannotated.append(
+                    f"{name}:{lineno}: fetch is deliberate but the comment "
+                    f"block above the read does not say "
+                    f"'{_DELIBERATE_FETCH_MARKER}'"
+                )
+    assert not unannotated, "\n".join(unannotated)

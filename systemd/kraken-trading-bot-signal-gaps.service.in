@@ -1,0 +1,58 @@
+# Template for the signal-coverage check user unit.  Installed (with @ROOT@
+# substituted for the repository path) by `just signal-gaps-timer`; the
+# shipped `.service` next to it is the same unit with the default filled in.
+#
+# WHY THIS UNIT EXISTS.  Measured 2026-10-04: the social timer was exiting
+# 0/SUCCESS every hour while StockTwits returned HTTP 403 (Cloudflare
+# challenge) on every call, because the pull still resolved Fear & Greed. The
+# channel accumulated 4 holes and nothing noticed — `store_gap_scan.py` scans
+# the PRICE store, and before this there was no coverage check on any signal
+# file at all. The loss is PERMANENT: the news and social producers have no
+# historical endpoint, so an hour not written now cannot be fetched later.
+#
+# This is the enforceable gate available in this repo.  The sibling
+# kraken-social-signals CLI is what swallows the 403 and exits 0; that is out
+# of scope here and cannot be fixed from this repository, so instead of
+# trusting the producer's exit status this unit asks the FILE whether the
+# hours are actually there.  A hole makes the unit fail, which systemd
+# records in the timer's status — the silent success cannot recur unnoticed.
+#
+# Installed/started by `just signal-gaps-timer`, or manually:
+#   mkdir -p ~/.config/systemd/user
+#   sed -e 's|@ROOT@|/path/to/repo|' \
+#     systemd/kraken-trading-bot-signal-gaps.service.in \
+#     > ~/.config/systemd/user/kraken-trading-bot-signal-gaps.service
+#   ln -sf "$PWD/systemd/kraken-trading-bot-signal-gaps.timer" \
+#       ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now kraken-trading-bot-signal-gaps.timer
+#
+# `loginctl enable-linger $USER` makes it fire while logged out.
+[Unit]
+Description=Check kraken-trading-bot signal-channel coverage and fail on any gap
+Documentation=file://@ROOT@/signals
+
+[Service]
+Type=oneshot
+# systemd.user units start in $HOME, not the repo, and the scanner resolves
+# both its script path and the signal files relative to the working
+# directory. Without this the unit failed with `can't open file
+# '/home/seanc/tools/signal_gap_scan.py'` — a path error, which is the worst
+# possible failure mode for a gate: it looks like a red check but says
+# nothing about the data.
+WorkingDirectory=@ROOT@
+# No network, no lock, no writes: it reads the JSONL files and asks whether
+# the hours between each file's first and last record are actually present.
+# `--gap-factor 2` flags any interior hole of 2 hours or more, so an hourly
+# producer that misses one fire is caught without firing on benign jitter.
+#
+# Invoked through `nix develop` for the same reason `just` does it: the
+# scanner needs pyyaml/numpy from the dev shell, and a bare `python3` on
+# PATH has neither — which is how an earlier inline yaml read in this
+# justfile silently produced an empty results path.
+#
+# Exit 1 on any gap is the POINT of this unit, not a failure of it. Do not
+# add `|| true`, and do not add it to SuccessExitStatus: that is precisely the
+# silent-success behaviour being fixed.
+ExecStart=/run/current-system/sw/bin/nix develop @ROOT@ --command bash -c 'python tools/signal_gap_scan.py --channel funding --channel news --channel social --gap-factor 2'
+TimeoutStartSec=300

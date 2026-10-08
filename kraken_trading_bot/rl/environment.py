@@ -35,6 +35,21 @@ from .features import (
 
 _LOGGER = logging.getLogger(__name__)
 
+#: A fill counts as *economic* -- as opposed to dust -- when its traded
+#: notional reaches this fraction of the initial balance. Expressed as a
+#: FRACTION rather than a dollar amount so it survives a different account
+#: size; the resolved dollar figure is echoed in the backtest JSON
+#: (`economic_trade_threshold`) so a reader never has to re-derive it.
+#:
+#: Why it exists: `num_trades` counts every fill, including the ones the
+#: discrete "buy 20% of balance" action produces once the book is already
+#: full. Measured 2026-10-05 on seed 45 of the deep-ab matrix (3,433 fills,
+#: $79k total notional): 3,339 of those fills moved under $1 and the median
+#: fill was $0.00. A per-FILL penalty on that count prices noise, so the
+#: report carries `economic_trades` beside it. 1e-4 of a $10,000 balance is
+#: $1.00, which is where that measured distribution separated.
+ECONOMIC_FILL_FRACTION = 1e-4
+
 # Builtin fallback feature set used when no FeaturePipeline is supplied.
 # Everything here is computed from raw OHLCV inside the environment.
 _BUILTIN_FEATURES = (
@@ -135,9 +150,33 @@ class TradingEnvironment(gym.Env):
         slippage: Fractional adverse price move applied on fills.
         reward_spec: Reward weights/configuration, or a dict convertible
             via :meth:`RewardSpec.from_dict`.
-        allow_short: When True, ``sell`` actions may open a short position
-            beyond the current position; otherwise positions are
-            long-only.
+        allow_short: ⚠ NOT IMPLEMENTED. The flag is accepted, plumbed
+            through from config and from every saved model's own
+            ``config.yaml``, and has NO effect on behaviour.
+
+            This docstring used to claim "When True, ``sell`` actions may
+            open a short position". That was wrong. Measured 2026-10-05:
+            ``_execute``'s sell branch computes
+            ``units = self._position * sell_frac``, which is ``0.0`` on a
+            flat book, so the ``if units > 0.0`` guard skips the trade and
+            no short is ever opened. Constructing an environment with
+            ``allow_short=True`` from a flat start and hammering the sell
+            action leaves ``position == 0.0`` and ``trades == 0``, byte
+            for byte the same as ``allow_short=False``.
+
+            So a run carrying this flag is LONG-ONLY, and constructing one
+            logs a WARNING saying so. Do not read a flat or negative
+            position in such a run as a short. Setting the flag is
+            currently a way to lose the information that you are
+            long-only, not a way to short.
+
+            Audit of what it touched (2026-10-05): all 90 saved model
+            configs across every matrix, and all three shipped configs,
+            carry ``allow_short: false``, and no matrix ever used it as an
+            axis -- so no recorded result was affected. Two shipped
+            configs (``default.yaml``, ``deep-history.example.yaml``)
+            still carry the old claim in a comment and should be corrected
+            alongside a real implementation.
     """
 
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 4}
@@ -180,6 +219,23 @@ class TradingEnvironment(gym.Env):
             else RewardSpec.from_dict(reward_spec)
         )
         self.allow_short = bool(allow_short)
+        if self.allow_short:
+            # ALOUD, and deliberately not an exception: `allow_short` is
+            # plumbed through from config and from every saved model's own
+            # `config.yaml`, so raising here would make every artifact
+            # trained with the flag unloadable. Measured 2026-10-05: the
+            # flag is a NO-OP. `_execute`'s sell branch computes
+            # `units = self._position * sell_frac`, which is 0.0 on a flat
+            # book, so the `if units > 0.0` guard skips the trade and no
+            # short is ever opened. A run carrying this flag is LONG-ONLY
+            # and its numbers must be read as such.
+            _LOGGER.warning(
+                "allow_short=True for %s, but shorting is NOT implemented: "
+                "a sell from a flat book computes units = position * "
+                "sell_frac = 0 and is skipped, so this run is LONG-ONLY. "
+                "Do not read a flat/negative position here as a short.",
+                ticker_id,
+            )
 
         # Feature matrix and observation space.
         if self.pipeline is not None:
@@ -235,6 +291,16 @@ class TradingEnvironment(gym.Env):
         self._entry_price: float | None = None
         self._equity_curve: list[float] = []
         self._trades = 0
+        # Turnover / exposure accounting. Not part of the reward: these are
+        # measurement-only counters, read back by `backtest_model` so a
+        # report can see how much the policy actually traded and how much
+        # of the book it held, rather than inferring either from
+        # `num_trades` (which counts sub-dollar dust fills once the book is
+        # full -- see ECONOMIC_FILL_FRACTION).
+        self._total_notional = 0.0
+        self._economic_trades = 0
+        self._exposure_sum = 0.0
+        self._bars_in_market = 0
         self._peak_equity = self.initial_balance
         self._last_equity = self.initial_balance
         self._reward_history: list[float] = []
@@ -265,6 +331,15 @@ class TradingEnvironment(gym.Env):
         self._step_idx += 1
         self._execute(action, price)
         equity_now = self._equity(price)
+
+        # Exposure accounting, defined EXACTLY as the 0c-2 measurement
+        # defined it: the fraction of equity committed to the asset, at
+        # this bar's close, AFTER this bar's order. `abs()` so a future
+        # short arm contributes gross exposure rather than netting to zero.
+        if equity_now > 0.0:
+            self._exposure_sum += abs(self._position * price) / equity_now
+        if abs(self._position) > 1e-12:
+            self._bars_in_market += 1
 
         self._equity_curve.append(equity_now)
         if equity_now > self._peak_equity:
@@ -352,8 +427,45 @@ class TradingEnvironment(gym.Env):
 
     @property
     def num_trades(self) -> int:
-        """Number of executed buy/sell orders this episode."""
+        """Number of executed buy/sell orders this episode.
+
+        Counts every fill, including dust: once the book is full the fixed
+        buy-fraction yields sub-dollar orders that still tick this counter.
+        See :attr:`economic_trades` and ``ECONOMIC_FILL_FRACTION``.
+        """
         return self._trades
+
+    @property
+    def economic_trades(self) -> int:
+        """Fills whose notional reached ``ECONOMIC_FILL_FRACTION`` x balance."""
+        return self._economic_trades
+
+    @property
+    def total_notional(self) -> float:
+        """Sum of ``units * fill`` over every fill this episode (USD)."""
+        return self._total_notional
+
+    @property
+    def exposure_sum(self) -> float:
+        """Sum over stepped bars of ``abs(position * price) / equity``."""
+        return self._exposure_sum
+
+    @property
+    def bars_in_market(self) -> int:
+        """Number of stepped bars on which a position was held."""
+        return self._bars_in_market
+
+    @property
+    def mean_exposure(self) -> float:
+        """Mean exposure over stepped bars; 0.0 before the first step."""
+        stepped = self._step_idx - self._start_index
+        return self._exposure_sum / stepped if stepped > 0 else 0.0
+
+    @property
+    def time_in_market(self) -> float:
+        """Fraction of stepped bars holding a position; 0.0 before the first."""
+        stepped = self._step_idx - self._start_index
+        return self._bars_in_market / stepped if stepped > 0 else 0.0
 
     @property
     def start_index(self) -> int:
@@ -411,6 +523,7 @@ class TradingEnvironment(gym.Env):
                 self._position += units
                 self._update_entry(fill, units)
                 self._trades += 1
+                self._record_notional(units * fill)
         elif sell_frac > 0.0 and (self._position > 0.0 or self.allow_short):
             # Sell: liquidate `sell_frac` of the position.
             units = self._position * sell_frac
@@ -423,6 +536,40 @@ class TradingEnvironment(gym.Env):
                     self._position = 0.0
                     self._entry_price = None
                 self._trades += 1
+                self._record_notional(proceeds)
+
+    def _record_notional(self, notional: float) -> None:
+        """Accumulate one fill's traded notional, and count it if economic.
+
+        ``notional`` is the gross value crossing the book at the fill
+        price -- ``units * fill``. That is the quantity friction is charged
+        on: measured across the 5 deep-ab models on 2026-10-05, the cost
+        actually taken divided by this notional is 0.003103-0.003104 for
+        every model, against a modelled fee+slippage of 0.0031. A fill
+        counts as *economic* when its notional reaches
+        ``ECONOMIC_FILL_FRACTION`` of the initial balance; below that the
+        balance has been invested so thoroughly that the fixed
+        buy-fraction is a rounding error, and charging such a fill a
+        per-trade penalty would price dust.
+
+        **The threshold is a fraction of the INITIAL balance, never of the
+        current one**, and that is load-bearing rather than incidental.
+        A current-balance threshold would *shrink as the book is spent*: by
+        the time the balance had collapsed to ~0.2% of equity, its
+        threshold would be ~$0.002 and the sub-dollar fills that make up
+        3,339 of seed 45's 3,433 fills would start counting as economic
+        again -- the counter would climb back towards ``num_trades``
+        exactly when the trades stopped being trades. Anchored to the
+        initial balance the same fills stay dust for the whole run, which
+        is what reproduces seed 45's measured split of **94 economic trades
+        out of 3,433** ($79k of total notional against a $1.00 threshold,
+        with a $0.00 median fill). ``tests/test_exposure_metrics.py::
+        test_a_sub_dollar_fill_still_counts_as_dust_after_a_balance_collapse``
+        pins the collapse case directly.
+        """
+        self._total_notional += notional
+        if notional >= ECONOMIC_FILL_FRACTION * self.initial_balance:
+            self._economic_trades += 1
 
     def _interpret(self, action: Any) -> tuple[float, float, float]:
         """Return ``(buy_frac, sell_frac, hold_conf)`` for any action."""
@@ -566,7 +713,9 @@ class TradingEnvironment(gym.Env):
             "equity": self.current_equity,
             "drawdown": self.drawdown,
             "trades": self._trades,
+            "total_notional": self._total_notional,
+            "economic_trades": self._economic_trades,
         }
 
 
-__all__ = ["RewardSpec", "TradingEnvironment"]
+__all__ = ["ECONOMIC_FILL_FRACTION", "RewardSpec", "TradingEnvironment"]

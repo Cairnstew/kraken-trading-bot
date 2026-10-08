@@ -17,7 +17,12 @@ from typing import Any
 import yaml
 
 from .agent import RLAgent
-from .data import _resolve_config_path, prepare_episode, read_ohlc_dataframe
+from .data import (
+    _resolve_config_path,
+    prepare_episode,
+    read_ohlc_dataframe,
+    refresh_for_window,
+)
 from .data_window import resolve_data_window, training_frame
 from .environment import TradingEnvironment
 from .features import FeaturePipeline, normalize_ticker_id
@@ -204,6 +209,12 @@ def train_ticker(
 
     Raises:
         NotEnoughDataError: If too few OHLC bars are available.
+        ValueError: If the config sets ``allow_short: true``.  Shorting is
+            not implemented, so such a run would train LONG-ONLY while its
+            artifact recorded a flag claiming otherwise.  Only training
+            refuses: ``backtest_model``/``paper_trade`` read the flag off
+            saved artifacts and keep warning instead, so every existing
+            model still loads.
     """
     cfg = build_train_config(ticker_id, model_name, config_path, **overrides)
 
@@ -212,6 +223,26 @@ def train_ticker(
     action_space = cfg.get("action_space", "continuous")
 
     _LOGGER.info("Fetching %d pages of %s %d-minute OHLC", pages, pair, interval)
+    # The window is resolved *before* the read now, so the read can be
+    # told to skip its fetch leg when the store already holds the whole
+    # pinned window -- otherwise every training run spent 6 OHLC API
+    # calls upserting 731 trailing bars that `training_frame` was about
+    # to clip away.  Unpinned (the default) keeps the fetch: that IS the
+    # trailing live window the fetch exists for.
+    window = resolve_data_window(cfg)
+    # Kept as named keywords rather than a `**` splat: the package's own
+    # `test_every_read_ohlc_dataframe_call_site_forwards_venue` refuses to
+    # prove a splatted call forwards anything ("cannot be proved is not
+    # is fine"), and that rule is the right one at this seam.
+    refresh_kwargs = refresh_for_window(
+        since=window.since,
+        until=window.until,
+        is_pinned=window.is_pinned,
+        window_label=window.describe(),
+        pair=pair,
+        interval=interval,
+        store_setting=cfg.get("market_data_store"),
+    )
     df = read_ohlc_dataframe(
         pair,
         interval=interval,
@@ -224,12 +255,13 @@ def train_ticker(
         signal_require_ticker=cfg.get("signal_require_ticker", True),
         market_data_store=cfg.get("market_data_store"),
         market_data_store_venue=cfg.get("market_data_store_venue"),
+        refresh=bool(refresh_kwargs["refresh"]),
+        coverage=refresh_kwargs.get("coverage"),
     )
 
     # Pinned window + train/eval split.  `training_frame` returns the very
     # same object when the window is unpinned, so the default path reads
     # the whole freshly-fetched frame exactly as it always has.
-    window = resolve_data_window(cfg)
     df = training_frame(df, window)
     if window.is_pinned:
         _LOGGER.info(
@@ -253,6 +285,37 @@ def train_ticker(
         episode_bars=episode_bars,
     )
 
+    if cfg.get("allow_short", False):
+        # RAISE, here and only here.  `allow_short` is a documented no-op:
+        # `TradingEnvironment._execute`'s sell branch computes
+        # `units = self._position * sell_frac`, which is 0.0 on a flat book,
+        # so the `if units > 0.0` guard skips the trade and no short is ever
+        # opened (measured 2026-10-05 -- an `allow_short=True` run from a
+        # flat start hammering sell ends at position 0.0, trades 0, byte for
+        # byte identical to `allow_short=False`).  So a training run
+        # configured to short is silently LONG-ONLY, and its artifact
+        # records `allow_short: true`, which is a lie about what was
+        # traded.
+        #
+        # Training is the one place a *new* artifact is created, so it is
+        # the one place refusing costs nothing.  `backtest_model` and
+        # `paper_trade` keep only a WARNING: both resolve `allow_short`
+        # from the artifact's own `config.yaml`, so raising there would
+        # make every model ever trained with the flag unloadable -- and all
+        # 90 saved configs across every matrix carry `allow_short: false`,
+        # so nothing recorded is affected either way.
+        raise ValueError(
+            f"`allow_short: true` is set in the config for {ticker_id}, but "
+            "shorting is NOT implemented, so this run would be LONG-ONLY "
+            "while its artifact records a flag that says otherwise. "
+            "TradingEnvironment._execute's sell branch computes "
+            "units = position * sell_frac, which is 0 on a flat book, so "
+            "the trade is skipped and no short is ever opened. Set "
+            "`allow_short: false` (the default, and what every shipped "
+            "config and all 90 saved model configs carry), or implement "
+            "the short branch in TradingEnvironment._execute first."
+        )
+
     env = TradingEnvironment(
         ticker_id=ticker_id,
         data=episode_df,
@@ -262,7 +325,7 @@ def train_ticker(
         fee_rate=float(cfg.get("fee_rate", 0.0)),
         slippage=float(cfg.get("slippage", 0.0)),
         reward_spec=cfg.get("reward"),
-        allow_short=bool(cfg.get("allow_short", False)),
+        allow_short=False,
     )
 
     agent = RLAgent(

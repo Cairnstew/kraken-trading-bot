@@ -1943,3 +1943,308 @@ The two live tests run the **real recipe** via `just` against a temp bare remote
 with `nix run "$root"#kraken-trading-bot` stubbed to the already-built CLI on
 PATH — so the whole recipe runs, marker write included, not just the read-back.
 Suite 638 -> 642.
+
+---
+
+# RUN LOG — cost-aware re-run with signals (2026-10-04)
+
+Appended after the depth-checkpoint record above. Process notes live here; the
+result itself is in the matrix spec and the report output.
+
+## 1. Corrections this pass was asked for, and what they changed
+
+Six review points, all of which moved a number or a verdict. Recorded because
+each one was a **misreading of the evidence**, not a missing fact.
+
+1. **"Costs are secondary" was wrong.** After the funding backfill the
+   frictionless median excess is **-0.062%** against a buy-and-hold of
+   **-0.065%** — a gap of 0.002pp with an IQR spanning zero, and 14 of 30
+   frictionless cells were positive. It is a **tie**, not a loss; "the
+   frictionless arm also loses" overstated a tie. The paired cost effect is
+   **-2.00%** (95% CI [-2.68%, -1.31%], n=30), which is **11.7x** the 0.13pp
+   gap from the frictionless arm to a flat policy. **Costs are the primary
+   finding.**
+
+2. **The zero-trade exclusion biased the headline against the model.** A
+   0-trade policy returns exactly 0.0% absolute, i.e. excess = +0.065%, which
+   is the *flat* row — the best performer in the comparison. Excluding those
+   cells removes the model's best outcomes. `min_trades: 0` is now the
+   honest default in `configs/matrix.eth-highseed.yaml`, which takes the run
+   from 57/60 valid to **60/60**, the Kraken-cost median from -1.78% to
+   -1.55%, and the paired n from 28 to 30.
+
+3. **The "next step" was arithmetically impossible.** ~24h of accumulation is
+   ~24 hours of signal, not a signal-complete 30-day window. Measured: a
+   504-bar signal-complete window is available **~2026-10-25** (20 days), a
+   168-bar one ~2026-10-11 (6 days).
+
+4. **The random baseline was too weak to support "relative skill".** It is
+   matched on trade COUNT only, so under costs it mostly measures "trading
+   this much loses money" — which the cost model already says. Added a
+   stronger null: the model's OWN entry/exit bars with each entry skipped at
+   random, holding turnover, holding periods and exposure schedule identical.
+   It moves the model from the 99th percentile of the count-matched
+   distribution to the **92nd** of the timing-matched one, with the median
+   draw at -0.58% against the model's -1.76%.
+
+## 2. Two of my own tools were wrong before they were right
+
+Both were caught by inspecting output rather than trusting it.
+
+- **`random_policy_matched` ignored its `rng` argument** and spaced entries on
+  a fixed stride, so all 200 draws were identical and the "distribution"
+  reported **sd 0.00%**. Now draws without replacement and randomises holding
+  length.
+- **The timing-matched null captured the wrong actions.** SB3 returns a
+  *scalar* for `Discrete(3)`, and `np.asarray(action).argmax()` on a 0-d array
+  collapses to 0 — every step read as "buy", giving `trades_median 1` instead
+  of ~half the model's entries. The symptom was a suspiciously low trade
+  count; the scalar path is now taken first.
+- **`momentum_policy` (6/24 crossover) took ONE trade** on a 127-bar slice,
+  so it compared a near-flat policy against the model. Added a stateful
+  3/12 variant that re-enters, which is a real trend follower.
+- **A "span shortfall" check I added to `tools/signal_gap_scan.py` was dead
+  code** and was removed rather than shipped: timestamps are floored to the
+  hour, so every delta is a whole number of hours, any absent hour implies a
+  >=2h delta, and the interior loop already reports it. A mutation run
+  proved the branch unreachable. This is §5's lesson applied to my own work
+  in this same pass: the test could not fail because the code could not run.
+
+## 3. Three harness defects found by running it at n=60
+
+1. **`matrix-report` read every JSONL line** while `matrix-run` deduped
+   last-wins, so a `--force` re-run reported **12 recorded instead of 6** and
+   widened the pooled within-group IQR from **+1.47% to +2.21%** on numbers
+   that had not changed. Fixed in `_build_views`; unidentified records
+   (no `cell_id`) are carried through rather than dropped, since
+   `done_cell_ids` would silently delete them. 3 regression tests, each
+   proven non-vacuous by mutation.
+2. **A crashed run was unresumable.** A cell with `status: error` counted as
+   done, so the rate-limited run reported *"60 already recorded, nothing to
+   do"* and the only way forward was `--force`, which re-ran the 37 good cells
+   and hit the same limit. A record with non-ok status or any
+   `invalid_reasons` is now retriable; the retry re-ran exactly 23 cells.
+3. **No throttle between cells.** 60 cells fire 120 OHLC refetches
+   back-to-back; **21 of 60 died on `EGeneral:Too many requests`**. Added
+   `run.cell_pause_seconds` (3.0 in the high-seed spec); the retry completed
+   with **0 errors**.
+
+Also: plain `python3` outside the dev shell has no `pyyaml`, so a justfile
+recipe reading the spec's `run.results` inline silently produced an empty
+path. `tools/null_baselines.py --spec` resolves it instead.
+
+## 4. The silent-coverage-loss detector (`tools/signal_gap_scan.py`)
+
+`kraken-trading-bot-social.service` was exiting **0/SUCCESS hourly** while
+StockTwits returned `HTTP 403 (Cloudflare challenge)` on every call, because
+Fear & Greed still resolved. Nothing detected it: `store_gap_scan.py` scans
+the PRICE store, and no signal file had a coverage check.
+
+First run, against the real files:
+
+| channel | records | hours covered | longest hole | in-window (2026-09-10..10-01) |
+|---|---|---|---|---|
+| funding | 8841 | 8839/8847 (99.9%) | 3.0h | **504/504** |
+| news | 24 | 13/34 (38.2%) | **22.0h** | **0/504** |
+| social | 48 | 24/40 (60.0%) | **16.0h** | **0/504** |
+
+So the holes exist, they are invisible to every existing gate, and for news
+and social they are **permanent** — those producers have no historical
+endpoint, so an hour not written now cannot be fetched later. Funding is
+repairable via `/historical-funding-rates`. The tool exits 1 on any gap and
+prints `PERMANENT DATA LOSS` naming which channels are unrecoverable.
+13 tests. Suite 645 -> 658.
+
+## 5. Audit gate
+
+`tools/model_matrix.py` is `MEASUREMENT_TRACK`, so editing it trips the gate.
+This time the check is scoped and says why:
+
+    estimator-symbols  MATCH  all 25 pinned estimator symbol(s) UNCHANGED
+                         additive only: the harness grew, the estimator did not move
+    ast-proof          SELF-TEST OK  (8 mutants detected correctly)
+    suite              PASS  658 passed
+
+`DISPERSION_RATIO_THRESHOLD`, `dispersion_verdict`, `pooled_within_spread`,
+`replicated_groups` and `MIN_REPLICATES_FOR_A_CLAIM` are all byte-identical to
+`97a2a52`, and zero lines were deleted against it. This implements Phase 7
+item 3 (§9): the guard now goes red only when the estimator moves.
+
+## 6. Corrections to my own earlier write-up
+
+Recorded because both were wrong in the same direction — reading a summary
+where the artifact said otherwise:
+
+- **A byte-identical re-run is a REPRODUCIBILITY check, not a replication.**
+  It shows the harness is deterministic under a pinned window and fixed
+  seeds. It says nothing about whether the result holds on new data, and no
+  out-of-sample replication was done.
+- **The first run was run without its signals and should not have been
+  described as complete.** The backfill was step zero, not an optional extra.
+
+---
+
+# RUN LOG — review corrections (2026-10-04, second pass)
+
+A review of the write-up caught eight defects. All eight were in MY text or MY
+tools, never in the run. Recorded here because the write-up must not carry
+process commentary, and because four of these would have shipped silently.
+
+## 1. A percentile whose DIRECTION I stated backwards
+
+`tools/null_baselines.py` computed
+
+    beat = sum(1 for d in draws if d >= model_exc)
+    "model_percentile": beat / len(draws)
+
+so the field is **the share of draws that BEAT the model**. I wrote it up as
+"the model sits at its 92nd percentile" and then concluded "the policy beats
+its own decisions shuffled". Both halves were wrong: a HIGH value means the
+model is near the **BOTTOM** of the shuffled distribution.
+
+Measured, Kraken-cost arm: shuffled median -0.60%, model representative
+-1.34%, and the model is beaten by **88%** of draws. Across all 30 seeds the
+median seed is beaten by **91%** of draws, and only **9/30** seeds beat the
+shuffled median draw. Frictionless: beaten by 73% (rep) / 72% (median seed),
+**7/30** seeds above the shuffled median.
+
+The conclusion INVERTS. The entry timing does not merely fail to beat shuffled
+entries — it is worse than them. The field is now named
+`frac_of_draws_beating_representative` (with
+`representative_percentile_beat_by_draws` for the other direction) and the
+renderer prints the direction in words on every run.
+
+## 2. One model against 300 draws, compared as if it were the distribution
+
+The null was built from a single representative cell (the one whose excess sits
+at the median of the friction arm) — defensible for *generating* the null, but
+I then reported it as though one seed settled the question. Added
+whole-population comparison: every seed in the arm is scored against the same
+300 draws, reported as median/range of "fraction of draws beating it" plus
+`seeds_beating_null_median_draw`. That is the number a claim needs.
+
+## 3. Two different model figures in one document, unexplained
+
+`model_percentile` compared against `-1.76%` while the table said `-1.55%`.
+Both were real and both were mislabelled: **-1.55%** is the median over 30
+seeds; **-1.76%** was one seed's excess. Likewise the null's "median" (-0.58%
+in prose) vs "mean" (-0.64% in a table) were the two different statistics,
+both printed. Every figure is now labelled with what it aggregates over.
+
+## 4. Buy-and-hold's excess printed as its absolute return
+
+`excess = absolute - buy_and_hold`, so buy-and-hold's own excess is 0.00% by
+definition. The verdict line compared a frictionless **excess** (-0.062%)
+against buy-and-hold's **absolute** (-0.0647%) and called it a tie. The tie is
+real but must be argued in absolutes: model absolute **-0.127%** vs
+buy-and-hold absolute **-0.065%**. Buy-and-hold's row is now 0.00% excess /
+-0.06% absolute, and the renderer says so.
+
+## 5. A headline ratio that does not reproduce
+
+"11.7x" came from 2.00 / 0.17. The write-up showed 0.13. Dropped: a ratio of a
+paired mean to an unreported gap, with no interval on either, is not a
+statistic worth publishing. Both quantities appear with CIs instead.
+
+## 6. The cost effect is specific to 20% position sizing
+
+30 trades at 0.26% fee + 0.05% slippage is ~10% if each entry were full-size;
+the measured cost effect is 2.0%. Reconciliation, using
+`_DISCRETE_BUY_FRACTION = 0.2` in `kraken_trading_bot/rl/environment.py`:
+
+    30 trades -> 15 round trips -> turnover 15 x 2 x 0.2 = 6.0x balance
+    cost      = 6.0 x (0.0026 + 0.0005) = 1.86% of balance
+
+Measured 2.0% (95% CI [-2.68%, -1.31%], paired n=30). The reconciliation
+closes to 0.14pp, so the cost number is fully explained by turnover and
+per-trade friction **at this sizing**. It is not a general estimate of what
+costs do to this strategy: full-size entries would be ~9.3%.
+
+## 7. The zero-trade exclusion was still in place, one layer down
+
+`_load_cells` reclassified cells with `min_trades=0` — and then threw away
+exactly the ones it had just rescued:
+
+    if v.valid and v.record.get("status") == "ok"
+
+The three 0-trade cells carry `status: "invalid"` because that is what the run
+wrote under the OLD strict spec. Recomputed validity said `valid=True, reasons=[]`;
+the recorded `status` said otherwise, and the `status` won. So the tool
+reported **28 of 30** friction-bearing cells and printed **-1.78%** — the
+excluding median — in a document whose other half said **-1.55%**. Same
+exclusion I had already fixed in `matrix-report`, reintroduced through a
+different door.
+
+`status` is now honoured only where it means there is no measurement at all
+(`error`, `dry_run`); `invalid` is a judgement about the spec in force at
+execution time and `min_trades` is a judgement about the comparison being asked
+for now. The tool now reports **30 cells / -1.55%**, matching `matrix-report`.
+
+## 8. `--fee 0` silently measured the Kraken arm
+
+Added `--fee`/`--slippage` so the frictionless model row is not left without
+baselines. First implementation filtered the already-narrowed friction-bearing
+pool by `fee == 0`, matched nothing, and an `or pool` fallback returned the
+Kraken cells — so a frictionless run printed the Kraken median in a
+frictionless-looking header. Now selects from the full cell list and raises
+`SystemExit` naming the available fee rates when nothing matches. 5 tests, both
+mutations proven to fail without the fix.
+
+## 9. Decision: evaluate WITHOUT social and news
+
+The 16h social hole and 22h news hole fall at 2026-10-03/04 — **inside** the
+window I proposed waiting for, so waiting would not have fixed them. Measured
+why it never will: the newest social gap ends **2026-10-05T02:00Z**, roughly
+11 hours before the scan, and the channel is 34/53 hours covered. StockTwits is
+Cloudflare-blocked, so social loses hours at an unpredictable rate. News has no
+historical endpoint either.
+
+Deciding with the data rather than the plan: over the pinned window
+`sentiment_score` has **one** unique value across all 151 bars — **0.000**. The
+news and social channels contributed nothing but constant zeros. Only
+`funding_rate` varies (151 unique values). So this run was substantively a
+funding-only run already.
+
+**Decision: evaluate on funding alone.** Dropping news and social costs no
+information on this window, because they carried none. The cost is a
+re-run, because the observation width changes (26 raw columns -> fewer, and
+normalization is refit) — which is cheap, and makes the claim stronger: every
+feature that varies would then be a feature with history. Retaining them
+means no window is ever reproducible, and every new hole invalidates prior
+work. The sibling `kraken-social-signals` CLI is what swallows the 403 and
+exits 0; that is a different repository and out of scope here.
+
+## 10. The gap check is now on a timer
+
+`just signal-gaps` is a recipe somebody has to remember. A check nobody runs is
+not a gate, so `systemd/kraken-trading-bot-signal-gaps.{service.in,timer}`
+plus `just signal-gaps-timer` fire it hourly at :47 — clear of the four other
+channel minutes (:17 funding, :23 news, :29 social, :41 depth). Exit 1 on any
+gap is the point; the unit carries no `|| true` and no `SuccessExitStatus`
+escape, deliberately.
+
+Verified live: the timer installed, fired, and failed with
+`status=1/FAILURE` while printing the real holes and
+`*** PERMANENT DATA LOSS on news, social ***`. One real bug fixed en route —
+systemd.user units start in `$HOME`, so the first version died with
+`can't open file '/home/seanc/tools/signal_gap_scan.py'`. A path error in a
+gate is the worst failure mode available: it looks like a red check while
+saying nothing about the data. `WorkingDirectory=` added.
+
+## 11. Dead code removed rather than shipped
+
+A "span shortfall" check in `signal_gap_scan.py` was proven UNREACHABLE:
+timestamps are floored to the hour, so every delta is a whole number of hours,
+any absent hour implies a >= 2h delta, and the interior loop already reports
+it. A mutation run confirmed no test could fail. Removed with the reasoning
+left in place, because a branch that cannot fail reads as coverage assurance
+while providing none.
+
+## 12. This window cannot discriminate a trending-market edge
+
+Buy-and-hold moved **-0.065%** over 127 bars. In a market that flat, never
+trading winning is close to arithmetic, and a frictionless CI of
+[-0.61%, +0.17%] is weak evidence of equivalence rather than a demonstration
+of it. Stated as a limitation, not as a tie.
+
+Suite 645 -> 658 -> **663** (5 added for arm selection, 13 for the gap scan).

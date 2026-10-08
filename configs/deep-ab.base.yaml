@@ -1,0 +1,71 @@
+# Base config for the deep-history A/B (configs/matrix.deep-ab.yaml).
+#
+# Same as configs/default.yaml EXCEPT the two changes the A/B is built on:
+#
+#   1. market_data_store ON. The shipped default is `null` = live fetch,
+#      and Kraken's REST ceiling is ~720 candles regardless of `since`.
+#      The store holds 76,560 ETH/USD 60m bars (2018-01-01 -> 2026-09-30,
+#      Binance spot archive seeded by kraken-deep-history). Measured on
+#      the shipped store: 120 missing bars across 27 gaps, largest 32 --
+#      and features are z-scored on BAR COUNTS, so a hole reads as a
+#      1-bar step. `just store-verify` is the check; the A/B window below
+#      sits clear of every listed gap.
+#
+#   2. fee_rate/slippage at Kraken taker (0.0026 + 0.0005). The shipped
+#      default is 0.0/0.0, i.e. frictionless, which is the default
+#      failure mode rather than an edge case.
+#
+# `data_window` here is a PLACEHOLDER matching the spec's `.data_window`
+# axis; the axis wins. It is written out rather than left null so that
+# this config on its own is already a valid, pinned, out-of-sample run.
+
+ticker: "ETH/USD"
+ohlcv_interval_minutes: 60
+initial_balance: 10000.0
+
+# Kraken retail taker + half a spread. NOT 0.0: a frictionless Sharpe is
+# not a Sharpe.
+fee_rate: 0.0026
+slippage: 0.0005
+allow_short: false    # NOT IMPLEMENTED, and a no-op: a sell from a flat
+                      # book computes units = position * sell_frac = 0
+                      # and is skipped, so no short is ever opened.
+                      # Every run is LONG-ONLY.
+
+# `discrete` (buy 20% / hold / sell all) to match the arm the earlier
+# n=60 run studied. configs/default.yaml ships `continuous`; changing
+# that here would confound the A/B with an action-space change.
+action_space: "discrete"
+
+reward:
+  mode: "pnl"
+  pnl: 1.0
+  risk_adjusted: 0.0
+  drawdown_penalty: 0.0
+  holding_penalty: 0.0
+  pnl_scale: 0.0001
+  risk_window: 20
+  penalize_drawdown: true
+  hold_confidence_threshold: 0.5
+
+feature_windows: [1, 4, 24]
+# The spec's feature_groups axis overwrites this per cell. The value here
+# is the WIDE arm, matching configs/default.yaml.
+feature_groups: ["price", "technical", "volume", "microstructure", "signals"]
+
+funding_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_funding.jsonl
+extra_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_news.jsonl
+social_features_file: ~/Projects/kraken-trading-bot/signals/eth_usd_social.jsonl
+signal_max_age_hours: 12
+signal_require_ticker: true
+
+market_data_store: /home/seanc/Projects/kraken-market-data/store
+# Label only, and load-bearing for a reader: these bars are Binance-USDT
+# spot, not Kraken. configs/default.yaml measured the basis at +5.41bp of
+# level shift. Backtested here, traded on Kraken.
+market_data_store_venue: "binance-spot-archive-seeded"
+
+data_window:
+  since: "2020-06-01T00:00:00Z"
+  until: "2022-12-31T00:00:00Z"
+  eval_split: 0.7
