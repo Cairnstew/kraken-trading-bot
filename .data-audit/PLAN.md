@@ -1,435 +1,112 @@
-# PLAN — data-pipeline audit, Phase 6 close-out
+# PLAN — data-pipeline audit pass, team `audit-pipeline-1008`
 
-Pass date **2026-10-02/03**. Gate verdict: **PASS** (see `VALIDATION.md`).
-`HEAD = a7a9cbe`. Nothing pushed; the close-out push is the lead's.
-
----
-
-## 1. What this pass was
-
-One outcome type, one target: `IMPROVE-EXISTING`, gap **G2**, the
-one-record-deep funding channel. Phases 1–5 produced `AUDIT.md`,
-`RESEARCH*.md` and `DECISION.md`; Phase 6 ran the gate.
-
-**Audited**: whether the bot now *sees* a live funding series rather than
-2 distinct values on 13 of 721 bars — by running it end to end (seed →
-export → train → backtest, both arms plus a baseline control), not by
-reading the diff. Plus the pre-registered structural gates
-(`just audit-verify` with **two different commits**, the bot suite) and a
-re-derivation of every number two agents had measured differently.
+Pass date **2026-10-08**. Outcome type: **`IMPROVE-EXISTING`**. Chosen target:
+**G-1 — wire the recorded order-book depth into the RL observation.**
+Implementation committed at `745ff4d`. Validation verdict: **PASS**
+(`.data-audit/VALIDATION.md`).
 
 ---
 
-## 2. What was built (all committed before this pass)
+## 1. What was audited
 
-| phase | commit | what |
-|---|---|---|
-| 4B | `8cada4e` | `just funding-backfill`; corrected two factually-wrong "~8-hourly" comments (the series is **hourly**); `data.py` producer hint `&&`; `/tmp` output fix |
-| 5 | `aba7b9b` | seam closed through train/backtest/paper; 8 stale "8-hourly" mentions closed; 252 lines of tests |
-| — | `a7a9cbe` | F-7..F-13 dispositions recorded at `DECISION.md` §7.8 |
+Three parallel surveys (all read-only, all under `.data-audit/`):
 
-Sibling `kraken-funding-rates` @ `dc49847`: `historical_funding_rates()`,
-`FundingHistoryRow`, `@_register("funding_history")`, `backfill`
-subcommand. Keyless, 1 request, ~366 d hourly.
+- `AUDIT.md` — code map of the trading bot, ranked gaps. G-1 was the
+  highest-directness item: the order-book depth was **fetched but not
+  consumed**.
+- `AUDIT-PIPELINE.md` — the RL data pipeline (`rl/*.py`, configs, tests) and
+  its data-quality gaps.
+- `AUDIT-SOURCES.md` — the data-sourcing/ops layer (`tools/`, `systemd/`,
+  `justfile`, flake, Kraken API calls) and cross-category gaps.
 
-**Measured result**: `funding_rate` goes from **2 distinct values on
-13/721 bars → 721 distinct on 721/721 bars**, at **unchanged observation
-width 60**, fitted STD **×6.941**. Coverage **8,792 records**,
-`2025-10-01T08:00Z → 2026-10-02T23:00Z`, measured 2026-10-02; the count
-grows ~1/day because the window is recomputed each call.
+`RESEARCH-{1,2,3}.md` surveyed libraries/APIs for the top three gaps;
+`DECISION.md` picked one `(gap, improvement)` pair and pinned its constants
+and directions (§7) for the gate.
 
----
-
-## 3. Stated plainly: what this pass is worth, and what it is not
-
-**It recovers 1 of 6 columns.** Kraken's `/historical-funding-rates`
-carries only `funding_rate`; all 8,792 backfilled records have
-`basis`, `open_interest`, `funding_rate_prediction`, `vol24h`, `bid`,
-`ask` = **null**. Downstream, five columns that the single live snapshot
-gave 13 real readings on now read as constant zero (`spread` included),
-taking the degenerate-STD count from 3 features to 10. One real
-distribution gained; five lost. That is the honest trade.
-
-**`signal_observed` no longer distinguishes absence per-column (F-2).**
-It is a per-channel OR (`data.py:812`), so it reads 1.0 on 721/721 bars
-while five of six funding columns are zero-fill. `signal_observed` and
-`signal_age_hours` become *correct constants* on a dense file (1.0 and
-0.0) rather than diagnostics. Per-column absence is now only visible by
-comparing a column's distinct-value count against the bar count — which
-is exactly how §3.2 of `VALIDATION.md` reports it, and why that table is
-the artefact to keep.
-
-**Both arms are IN-SAMPLE** (`data_window.since`/`until` both null, the
-shipped default; the bot warns on every run). No predictive claim is
-supported by anything in this pass.
+**Why G-1 won.** `feature_groups` already ships with `"microstructure"`
+enabled (`configs/default.yaml:53`), so the pipeline reserved width for a
+reading it could never populate; the consumer
+(`_add_microstructure_features` → `order_book_imbalance`,
+`features.py:1030-1038`) was already coded; the data was already on disk. Only
+delivery through an existing seam was missing. No new library beat ~30 lines
+of pandas (RESEARCH-1 scored every candidate ≤3/10).
 
 ---
 
-## 4. Deferred, and why
+## 2. What was built (G-1)
 
-Unchanged by this pass. Recorded so the deferral is a decision with a
-reason rather than an omission.
+- `_flatten_orderbook_records` (`kraken_trading_bot/rl/data.py:644`) — pure,
+  reader-side reduction of the recorder's nested depth records to flat
+  per-hour scalars: `timestamp←recorded_at`, `ticker←pair`, `bid_vol`/`ask_vol`
+  (top-10 level-volume sums), `realized_spread_bps`. **Never** `spread`
+  (reserved for the funding channel; depth merges last, so a depth `spread`
+  would overwrite funding's — direction D-2).
+- `bid_vol`/`ask_vol` added to `_SIGNAL_COLUMNS` (`features.py:129-130`) so the
+  seam carries them to the frame, and to `_SIGNAL_BUILDER_INPUT_COLUMNS`
+  (`features.py:161`) so `_add_signals_features` skips them — the raw volumes
+  never reach the observation; only the derived `order_book_imbalance` does.
+- 4th `_SIGNAL_CHANNELS` entry `orderbook_features_file` (`data.py:198-208`),
+  threaded through both read legs (`data.py:1243` fetch, `data.py:1908` store)
+  and all four callers: `train.py:254`, `backtest.py:567`, `export.py:181`,
+  `paper_trade.py:315`. Off by default (`null`).
+- `configs/default.yaml` — new `orderbook_features_file:` key + doc block.
+- 12 offline hermetic tests in `tests/test_orderbook_depth_seam.py`.
 
-### G1 — `order_book_imbalance` has no producer · **NEXT SLICE**
-
-The `microstructure` group is enabled in the shipped config but
-`order_book_imbalance` is unreachable: `_add_microstructure_features`
-computes it only when `bid_vol`/`ask_vol` are present, no producer emits
-them, and `_SIGNAL_COLUMNS` does not list them. Meanwhile
-`data["order_book"] = manager.order_book(pair, count=10)` already runs
-every 60 s and is thrown away by `strategies/base.py:92`.
-
-**Why it is the right next slice.** It is the only remaining gap that
-*widens the observation* rather than deepening one column. G2 recovered a
-series the agent could mostly already see; G1 adds a dimension
-(order-book depth) that is structurally absent from every training run so
-far. Highest remaining information gain per unit of work.
-
-**Why it is UN-backfillable — the reason it was not a G2-shaped fix.**
-G2 worked because Kraken publishes *historical* funding rates, so an
-existing endpoint could be replayed ~366 days into the past. **Kraken's
-order book is a live snapshot only.** There is no historical depth
-endpoint, and a depth log cannot be reconstructed after the fact: the
-`count=10` snapshot at time *t* does not encode what the book looked like
-at *t−1h*. So G1 is **forward-only by physics, not by choice** — it needs
-a recorder plus a timer plus a widening of `_SIGNAL_COLUMNS`, and its
-first bars only exist from the day it is switched on. Running it in
-parallel with the other work is the only way to have any depth at all.
-It also carries the §14 hazard in a sharper form: a forward-only file
-means the *early* training bars of every future run are depth-absent, so
-the recorder must be running before the next G1 slice is worth measuring.
-
-### G3 — no retry / backoff / rate-limit handling
-A partial page-loop failure discards every candle already collected. A
-robustness fix on the fetch path; orthogonal to signal depth, and it
-touches the same function G1's recorder would sit beside, so sequence it
-*after* G1 to avoid two edits to one path in one pass.
-
-### G4 — thin historical depth behind `market_data_store: null`
-Still fully open, and worth being precise about what this pass did
-**not** fix: the funding channel is now ~366 days deep, but the **price**
-frame is still the ~721-bar live REST ceiling, because the pass kept
-`market_data_store: null` deliberately (live-fetch leg). Deep funding on a
-721-bar price frame is still a 721-bar episode. G4 is the gap between
-"the signal is deep" and "the episode is long", and it remains the
-binding constraint on episode length.
-
-### G5 — dead strategy machinery + a wrong bar-interval comment
-Cosmetic/low-risk; a clean standalone slice.
-
-### G6 — shipped config trains and backtests at zero fees and zero slippage
-Both backtest arms in this pass ran at `fee=0.0000% slip=0.0000%`, so
-their returns are gross. Every return figure in `VALIDATION.md` inherits
-that. Do not quote one as achievable.
-
-### G7 — whole data categories with zero presence anywhere
-Needs its own scoping pass before it can be ranked.
+**Validated (`.data-audit/VALIDATION.md`):** 756 passed / 0 failed; on the live
+`signals/eth_usd_orderbook.jsonl` (114 records, 111 hours), with the channel
+configured, `order_book_imbalance` is **present and non-constant** (112
+distinct values, std 0.434) in `normalization.npz` `feature_names`, while
+`bid_vol`/`ask_vol` are **absent**; width Δ vs the same config with the channel
+off is **+1**.
 
 ---
 
-## 5. Findings this pass settled
+## 3. Deferred (named, with the reason)
 
-**F-9 / C8 — resolved (frame mismatch, exact arithmetic).** 684 and 0 are
-the same pipeline measured on two frames. `first_tradable_index = 24`, so
-the tradable slice is 697 bars; `697 − 13` finite `spread` = **684**, and
-on that slice `spread` is the only non-finite column. The integrator's
-**0** is on `observed` (`compute().ffill().fillna(0.0)`) — the frame the
-policy sees, the frame `width_check` hashes, the frame `export-data`
-writes. Both arms: 0. The builder's "identical in baseline and target" is
-**wrong** (684 vs 697 on the same slice).
-
-**F-11 — resolved (one arm, two frames; right edge named).** 13 =
-`computed`, 24 = `observed`, same file. The record sits 23 bars back from
-the frame's right edge, so its 12 readings span offsets −23…−11 and
-`ffill` carries them over the last 11 bars: 13 + 11 = **24**. The
-integrator's "byte-identical both arms" is **wrong** — the backfilled arm
-is 0/721, because its file has no `bid`/`ask` anywhere.
-
-**F-8 — confirmed by measurement; assert nothing.** 52 (all-null) / 60
-(shipped). C1's 57 and C2's 49 are 3 low because the fixture lacked
-`vwap`/`count`. F-13's correction (52 is the all-null width) is confirmed.
-
-**F-10 — confirmed.** `signal_age_hours` max **12.0** on the shipped
-live-snapshot shape (it is `ages.max(axis=1)`, the stalest column, and
-the bound itself is the max); 0.0 on a dense file. C12's "≤ 2.0" is
-unachievable as written, which **confirms F-6 / DEV-2**.
-
-**New, for the lead to record in `DECISION.md` §7.8** (I am read-only on
-source; `just audit-findings` will refuse without them):
-
-- **F-14** — the two new characterisation tests are **vacuous for
-  `069a826..HEAD`**: both pass with `data.py`/`features.py` reverted to
-  the pre-registration commit, because `executable_ast` is byte-equal on
-  both files across the whole pass. Not a defect — the pass made no
-  executable change — but they must not be read as regression coverage of
-  this diff. The genuinely non-vacuous test is the producer-hint pin
-  (`assert "#" not in err.producer`), proven by reverting only that
-  string and watching it fail with the `#` symptom.
-- **F-15** — `width_check.py` calls `compute()` but never
-  `add_derived_ohlcv_features`, so a raw OHLCV parquet reports **49**
-  where every shipped state is 52 or 60. My own `verify --frame` receipt
-  printed it. Same class as F-8, but a **tool** trap rather than a doc
-  trap.
+- **G-2 — trade tape + realized spread (`NEW-DATA-SOURCE`).** Kraken WS `trade`
+  (live) + Binance aggTrades archive (seed); the wrapper already exists
+  uncalled. Deferred because it needs a new recorder **and** a new seam column,
+  the live leg is forward-only, and the only deep seed is Binance-USDT
+  (cross-venue contamination of a USD book). It is the natural **second**
+  feature once G-1's reader pattern exists — RESEARCH-1's Design C explicitly
+  defers the generic reducer registry until the tape lands. **Next slice.**
+- **G-6 — cross-exchange spot basis (`NEW-DATA-SOURCE`).** Keyless, one column
+  `venue_basis_bps`; best done by extending the sibling `kraken-deep-history`
+  with a `basis` subcommand (RESEARCH-3). Deferred: genuinely new sourcing (a
+  producer + a second venue leg + a new config key) for a signal that is
+  orthogonal rather than missing-and-coded. Cleanest `NEW-DATA-SOURCE` if the
+  team wants a second slice.
+- **G-3 — `microstructure` group degenerate** (`bid`/`ask` null on ~99 % of
+  funding records). The cheap form (drop `spread`) shrinks width and adds no
+  signal; the strong form reduces to G-1's depth feed. Not pursued separately.
+- **G-4 — `stt_tilt`/`fng_index` inert.** Only removes dead columns, adds no
+  information. Worth folding into the **same retrain** as G-1, not leading it.
+- **G-9 — bar-count vs wall-clock feature windows.** High data-quality
+  directness, large effort (time-aware windows over a reindexed grid), and
+  only detected today, not fixed. Deferred.
 
 ---
 
-## 6. Concrete next steps
+## 4. Next steps
 
-1. **Record F-14 and F-15** in `DECISION.md` §7.8 (lead), then
-   `just audit-findings` and the ordered close-out push.
-2. **Annotate `width_check.py`'s docstring** (F-15) so a `--frame` receipt
-   is never mistaken for a shipped-width record. Docstring-only, invisible
-   to the `executable-ast` guard.
-3. **Start the G1 depth recorder now**, even before writing the feature
-   work — it is forward-only, so every hour it is not running is an hour
-   of depth that cannot be recovered. Budget the widening of
-   `_SIGNAL_COLUMNS` for `bid_vol`/`ask_vol` as its own commit.
-4. **Decide G6 before any return figure is quoted.** Fees and slippage at
-   zero make every number in `VALIDATION.md` gross.
-5. **Pin `data_window.since`/`until`** for the first genuinely
-   out-of-sample measurement. Both arms here are IN-SAMPLE by shipped
-   default and the bot says so on every run.
-6. **If a report needs a bar count, date it.** 8,792 measured 2026-10-02,
-   growing ~1/day. This repo has shipped an undated count as an error
-   twice.
-7. **G4 remains the binding constraint on episode length** — deep funding
-   does not lengthen the price frame. Consider it alongside G1's
-   recorder, since both want the store populated on a schedule.
+1. **Retrain is required and pending.** `models/` holds only `.gitkeep`, so the
+   retrain cost today is zero — but no model has yet been trained on a
+   +`order_book_imbalance` observation. `normalization.npz`'s `feature_names`
+   is the width authority and `check_feature_width` (`features.py:483`) fails
+   loudly at load time, so an old model cannot silently misalign.
+2. **Enable the depth channel by default once coverage matures.** The live
+   series is **forward-only**: the file covers ~1.1 % of a multi-year window
+   (DECISION §7 C-7), so on the shipped default the column is 0.0 for the vast
+   majority of bars. Keep `orderbook_features_file: null` until the recorder
+   has accumulated enough contiguous hours to matter, then flip it on and
+   retrain. Do not quote a backtest over a mostly-empty column as an effect.
+3. **Measure before trusting.** When the channel is enabled, any claimed
+   improvement must go through the repo's own `model-matrix` skill — multi-seed,
+   out-of-sample — because a single paired run cannot separate a real effect
+   from PPO seed noise. This pass proves **delivery**, not predictive value.
+4. **G-2 next** if a second feature is wanted: the trade tape is the intended
+   follow-on, and G-1's reader-side flattener is the pattern to copy.
 
 ---
 
-## 7. Reproducing this gate
-
-```
-nix develop --command bash -c "python tools/audit_checks.py verify --prereg 069a826 --since 8cada4e"
-nix develop --command bash -c "python -m pytest -q"          # 457 passed
-just funding-backfill ETH/USD /tmp/rev/signals/eth_usd_funding.jsonl
-```
-
-The seeding command is the **production path** — the same
-`nix run ~/Projects/kraken-funding-rates#kraken-funding-rates --` the
-hourly timer's `ExecStart` and the justfile recipe use. My brief
-specified a dev-shell `PATH` lookup, which cannot work (`flake.nix` pins
-only `kraken-python` and `kraken-market-data`); that is a correction of
-the brief, not a deviation, and it produces the artifact the timer
-writes. Assert the sibling is clean at `dc49847` before seeding — the
-choice of a non-flake-input sibling rests on the tree you seed from being
-the committed one.
-
-All scratch (models, stores, exports, frames) under `/tmp/rev/`. Never
-committed. No real API key used — the funding endpoint is keyless.
-
----
-
-## 8. NEXT PASS — ordered, and the first item is time-sensitive
-
-### 8.0 ⚑ A DECISION THE LEAD OWES — not for the team to pick up
-
-**`configs/default.yaml`'s `data_window.since` / `until: null`.** This is
-deliberately left at the top of the next checkpoint as an open decision, not
-a task. Every arm in this pass's integration test was **IN-SAMPLE** because
-those two are null on the shipped default, which is why the return and
-Sharpe rows could not be read as an effect. Related machinery that is
-already present but unused: `data.py:1298-1302` (`.. todo::` — honour
-`since`/`until` from config) and `data_window.eval_split`, which the
-matrix-harness pass showed is **inert unless the window is pinned**.
-
-Deciding it changes what "an effect" can even mean for this bot, so it
-should be settled deliberately, with the store's available depth in hand —
-**after** G4 — rather than picked up opportunistically.
-
-**Status: CONFIRMED at the 2026-10-03 close-out. The shipped default stays
-`null`.** The lead's reasoning, which stands: pinning the window without a
-store yields **0 train and 0 eval bars** — pinning is not a free win, it is
-a way to make the bot refuse to run.
-
-- Unpinned runs are **labelled IN-SAMPLE in the output** (the bot already
-  prints this warning itself on every run).
-- The **documented OOS path** is `configs/deep-history.example.yaml` plus the
-  `just store-plan` / `store-seed` / `store-verify` recipes.
-- **Discoverability was the obligation, and it is discharged** (commit
-  `f9a5e2c`): the README's Usage section opens with a "a default run is NOT an
-  out-of-sample measurement" block naming the recipe that *is*, and the
-  `justfile` header carries the same warning so `just --list` and a bare `just`
-  both surface it. Both name `store-plan`/`store-seed`/`store-verify` and
-  point at the example config's own header for the store-holes caveat.
-
-**§8.0 is CLOSED.** Not to be reopened past the next checkpoint; a future pass
-that wants a pinned *default* must argue it against the 0-bars failure above,
-not against this closure.
-
-*(Note for whoever next edits this file: the OOS recipe is `store-seed`, not
-`deep-history-seed` — there is no recipe by the latter name. An earlier draft
-of the README named one and it was wrong.)*
-
-### 8.1 FIRST ACTION — start the G1 recorder, and do it before any feature work
-
-**The depth is unrecoverable by construction.** Kraken's order book is a
-live snapshot with **no historical endpoint** (Kraken's public archive is
-OHLCVT-only; Binance Vision `bookDepth` was falsified directly against the
-S3 bucket with `KeyCount=0` against a klines control that returned 2), and a
-`count=10` snapshot at *t* does not encode *t−1h*. **Every day without the
-recorder is data that cannot be recovered later.** This is the only
-time-critical item in the whole plan, which is why it goes first and why
-nothing else may precede it.
-
-**Keep the brief small.** The recorder is the deliverable; the feature is
-NOT. Do not touch `rl/features.py`, `_SIGNAL_COLUMNS`,
-`_SIGNAL_BUILDER_INPUT_COLUMNS`, or any observation width in this slice.
-
-1. **Record snapshots.** `kraken-python` already wraps the producer —
-   `manager.order_book(pair, count)` → `client.depth()` → keyless
-   `/0/public/Depth`, plus the keyless `book` channel on `ws.kraken.com/v2`.
-   **No new dependency**: `cryptofeed` is AGPL-3.0-or-later and needs
-   Python ≥3.13; `ccxt` is MIT but unnecessary. Do not build a
-   `kraken-order-book` sibling that re-wraps an existing sibling — the
-   house-style answer is a small recorder inside the funding/producer
-   family, following the "log, not state" convention the JSONL seam
-   already uses.
-2. **Append-only, with your own timestamps.** A book snapshot carries **no
-   timestamp of its own** — each level's timestamp is that order's placement
-   time. The recorder must stamp its own clock, and must **record the depth
-   used**, because depth is not comparable across a `count` change.
-3. **Include a gap counter**, given what F-6 showed about silent holes: a
-   run that stops for a week and appends happily afterwards is
-   indistinguishable from a run that never stopped. Report expected-vs-actual
-   intervals alongside the data, and make a hole visible in the artifact
-   rather than only in stdout.
-4. **Prove the gap counter can go RED before calling this slice done.** Feed
-   it a **deliberately skipped interval** and paste the verbatim report of the
-   hole into the evidence file. This is the guard-must-fire-once rule in the
-   command file's *CHECKPOINT RULE* section: a counter that has only ever
-   printed `0 gaps` is indistinguishable from a counter that cannot count.
-   The red run is part of the deliverable, not a follow-up.
-5. **Do not consume the recorded data in this pass.** No `_SIGNAL_COLUMNS`
-   change, no observation-width change, no merge into the observation. The
-   recorder runs, accumulates, and reports its gap count. Wiring the feature
-   is a later slice, once there is history worth wiring — which is also why
-   it must not be attempted before the recorder has been running for a while.
-
-#### 8.1.1 ⚠️ IT MUST BE SCHEDULED — a recorder that is not running loses the same data as no recorder
-
-Writing the recorder is not the deliverable. **Depth only accumulates if
-something runs it unattended**, and the unrecoverability above makes a
-recorder that merely *exists* worth exactly nothing — the snapshots it was
-built to capture are gone either way. So the scheduling is in scope for this
-slice, not deferred as "ops follow-up".
-
-- **How it runs: a systemd timer.** The repo already has the pattern to copy —
-  `systemd/kraken-trading-bot-funding.service{,.in}` +
-  `kraken-trading-bot-funding.timer` pulls funding hourly, and
-  `nix/module.nix` installs the unit. The recorder's unit should follow the
-  same shape. **Mind the option-namespace trap**: `nix/module.nix` is a
-  **NixOS** module, so `systemd.user.*` (a home-manager option) will not
-  evaluate there — the funding pass had to ship a plain `systemd/user` unit
-  for exactly this reason. Check which namespace the recorder's timer needs
-  before writing it.
-- **The timer's `ExecStart` is the production path**, so the recorder must be
-  runnable exactly the way the unit invokes it. The funding precedent is
-  `nix run <sibling>#<pkg> -- <args>` — a sibling that is **not** a flake
-  input, so it builds from its working tree (`src = ./.`) and an edit is live
-  with no lock bump. Say explicitly in the brief which of the two shapes the
-  recorder uses, because "it works when I run it by hand" and "the timer runs
-  the committed tree" are different claims and only one of them accumulates
-  data.
-- **First-checkpoint evidence: at least TWO real snapshots with DISTINCT
-  timestamps**, taken from a live call, showing the recorder stamps its own
-  clock (a book snapshot has no timestamp of its own — each level's timestamp
-  is that order's placement time, so two snapshots must differ by the
-  interval, not share one). Also show the unit is *installed and enabled*
-  (`systemctl --user list-timers`), because an enabled-but-never-fired timer
-  is the same failure as no timer.
-- **Cadence floor.** Poll no finer than hourly unless the hour-floor in
-  `data.py:757` changes — otherwise you pay 60× the calls to keep one row per
-  hour. Record the depth used in the data, because depth is not comparable
-  across a `count` change.
-
-#### 8.1.2 Minimum depth N — stated at the FIRST checkpoint of the next pass
-
-**Pick N from what a Phase 6 gate needs, not from how long the build takes.**
-Until N is reached, **the recorder is the only deliverable and nothing consumes
-the data** (see §8.1.3 for why that constraint is load-bearing). Stating the
-arithmetic is part of the deliverable — a bare "N days" is not acceptable.
-
-**The arithmetic, at hourly cadence (24 snapshots/day):**
-
-```
-days = bars_needed / 24
-```
-
-Where `bars_needed` comes from the gate, not from convenience:
-
-| input | value | where it is measured |
-|---|---|---|
-| live REST ceiling | 721 bars @ 60 m ≈ **30 days** | `data.py:28`; confirmed 697 tradable after `first_tradable_index = 24` |
-| **this pass's gate could not resolve an effect** | 697 tradable bars, one run per arm | `VALIDATION.md` §2 |
-| matrix-harness finding | within-config seed spread **exceeded** the between-config effect at **178-bar** eval slices, 3 seeds | 2026-10-02 matrix-harness entry |
-| so a floor: train + a disjoint eval slice longer than seed noise | ≥ 1,440 train (60 d) + ≥ 720 eval (30 d) = **2,160 bars** | 60/30 split of the above |
-| **recommended N** | **365 days = 8,760 snapshots** | see below |
-
-**N = 365 days**, justified from the gate rather than from build time:
-
-1. It **matches the funding channel's existing depth** (`/historical-funding-rates`
-   serves ~366 days), so the book series and the funding series can be
-   evaluated over the **same** window. At N = 90 the book series would be the
-   *shorter* one and the comparison would silently be confounded by coverage.
-2. The price side is **not** the binding constraint — the store already holds
-   ~76.5k bars — so waiting costs nothing that a deeper price frame would have
-   bought anyway.
-3. Nothing consumes the data until N is met, so **a longer N is free**; the
-   only cost of over-waiting is latency to first evaluation, and the only cost
-   of under-waiting is a gate that cannot separate signal from noise — which is
-   the failure this repo has already paid for once.
-
-So: **2,160 bars (90 d) is the floor at which a first evaluation becomes
-*possible*; 8,760 (365 d) is what it takes for that evaluation to mean
-something.** The checkpoint should state N = 365 and print the arithmetic, and
-should re-derive `bars_needed` rather than inherit these numbers — per the
-re-derive rule, they are measured figures with a date on them.
-
-#### 8.1.3 Proof the timer is RUNNING — enabled is not enough
-
-At the first checkpoint, in addition to the two distinct-timestamp snapshots,
-show **`systemctl --user list-timers` (or the system-scope equivalent the unit
-actually installs) output including the recorder's timer and its `LAST` and
-`NEXT` elapsed times**, pasted verbatim.
-
-An **enabled** timer is not a **running** timer: `enabled`, `active` and
-"has actually fired" are three different claims, and only the third
-accumulates data. `LAST` in the past relative to `NOW` plus a `NEXT` in the
-future is the evidence that it fires unattended. Two snapshots taken by hand
-minutes apart prove the *recorder* works; they prove nothing about the
-*schedule*. This is the same shape as the non-vacuity rule: demonstrate the
-thing that actually matters, not the adjacent thing that is easy to show.
-
-#### 8.1.4 What this slice must NOT do
-
-The no-consume constraint is load-bearing, not politeness: the recorder's
-value is that it runs **unattended for weeks before** anything depends on its
-output. Consuming it in the same pass creates a reason to change its schema
-the first time an awkward column shows up, and the history already written
-becomes incompatible with itself. Write data; read nothing.
-
-### 8.2 Then, in order
-
-- **G4 — deepen the price frame.** Now formally recorded as **F-18**: funding
-  is 366 d deep while the price frame is 721 bars (~30 days), so funding has
-  ~11× more depth than the episode it is merged into. Funding depth cannot
-  buy episode length until the price side is deepened. G1 and G4 are coupled
-  for the same reason — recorder depth is bounded by whatever episode length
-  the store eventually allows.
-- **G3 — retry / backoff / rate-limit handling.** Still zero. Re-read F-15's
-  note: `tools/width_check.py` fingerprints a raw parquet at 49 where shipped
-  states compose 52/60 (logged proposal, deliberately unchanged, because
-  auto-calling the derived step would invalidate the committed CAND-3a
-  fingerprints).
-- **G5 / G6 / G7** — untouched; G6 in particular means the default run is
-  still frictionless, so every in-sample number in this file is flattered.
-
-### 8.3 Carry into the next architect
-
-**Re-derive every constant and every direction from the artifact before a
-gate is built on it.** This pass produced three sourced, plausible, wrong
-claims — an inverted dedup direction, width constants 3 low, and two
-findings both agents measured wrong. Mark each figure in a decision as
-*measured* or *inferred from a fixture*.
+PLAN COMPLETE
