@@ -280,6 +280,20 @@ changes if cleanup asks.
 
 # PHASE 1 — AUDIT (auditor, read-only)
 
+**BEFORE SPAWNING: check MAIN is clean** (`git status --short`). A worktree
+teammate branches from the last **commit**, so uncommitted MAIN work is invisible
+to it, and `team_merge` refuses outright if MAIN's dirt touches the same files.
+If MAIN is dirty, commit it (its own `chore:` commit, naming any known
+pre-existing failures) or stash it, BEFORE spawning anything with a worktree.
+
+**Split the audit by scope at spawn time if it does not fit one brief.** One
+auditor asked to read `rl/*` + configs + tests + the prior `.data-audit/`
+artifacts timed out with nothing written (2026-10-08). Two auditors with
+disjoint scopes — `rl/` pipeline map → `AUDIT-PIPELINE.md`, sourcing/ops map →
+`AUDIT-SOURCES.md` — both finished comfortably, and the lead assembles
+`AUDIT.md`. Prefer two scopes over one big brief; never have three writers
+target the same artifact.
+
 Do not propose solutions yet.
 
 1. Read the actual code, not just the README: strategies, engine, RL train/backtest code,
@@ -343,6 +357,15 @@ report. End with `RESEARCH COMPLETE`.
 ---
 
 # PHASE 3 — DECISION (architect)
+
+**DECISION.md is rewritten from scratch every pass, and `just audit-findings`
+binds every `F<n>` in `VALIDATION.md` §8's pinned index to a mention in
+DECISION.md — so a rewrite that omits them drops all 16 dispositions and reds
+the suite (2026-10-08).** Brief the architect to **carry the pinned finding
+table forward verbatim** from the current `VALIDATION.md` §8, as its own
+section, with the dispositions quoted from that table. That is the fix the
+instrument itself documents (`tools/audit_checks.py:822`); changing the guard is
+the wrong move.
 
 Do not scaffold yet.
 
@@ -416,9 +439,19 @@ offline tests, `.env.example`, README updates) to the existing target.
 4. Commit in the worktree. If the target repo has a remote, push when `gh` is ready; a fix that
    is pushed first time gets its registry row updated (see registry note above).
 
-Commit everything in the worktree. Report done via `team_message` with the diff and commit hash
+Commit everything in the worktree. **Keep the brief to ONE deliverable** — a
+builder that hits the busy-time limit keeps whatever it committed, and a
+teammate that times out mid-implementation loses the uncommitted remainder
+(two such timeouts on 2026-10-08 cost two full spawn cycles). Report done via
+`team_message` with the diff and commit hash
 (and, for 4A, the new GitHub URL, or "not pushed — no gh/auth" if skipped; for 4B, the repo and
 commit touched, or "not pushed — no gh/auth" if skipped).
+
+If a builder DOES time out: its work is usually intact in its worktree. Take it
+by patch rather than re-implementing —
+`git -C <worktree> diff <base>..HEAD -- <paths> > /tmp/patch`, then
+`git apply --check` in MAIN (which also proves the patch survives MAIN's own
+dirt), then `git apply`.
 
 ---
 
@@ -1195,7 +1228,70 @@ because the lessons generalise to any future pass that spawns builders.
     cutting redundant large-context reads beats cutting turns. proposal: put the verified
     `nix develop` pytest command in every teammate brief as literal text (see above) — two
     hand-built python envs cost more than the `nix develop` builds the briefs told them to skip.
----
+
+- 2026-10-08 — IMPROVE-EXISTING pass (G-1, wire the recorded order-book depth into the RL
+  observation). Gate **PASS**; 8 commits pushed `ccc23ae..ec3c391`; 742 + 2 failed → **756
+  passed / 0 failed**. Detail: `.data-audit/RUN-LOG.md`. The lessons that changed tooling:
+  - **One oversized audit brief times out; the fix is to SPLIT THE AUDIT, not to shrink the
+    brief.** The first auditor (told to read `rl/*` + configs + tests + ~500KB of prior
+    artifacts incl. a 131KB RUN-LOG.md) hit the busy-time limit having written **nothing**.
+    Re-spawning narrower did not fix it either — two builder timeouts followed, each leaving
+    good-but-uncommitted work (`data.py` +123 lines, then `features.py` +6). What worked was
+    **two auditors with disjoint scopes writing separate artifacts**
+    (`AUDIT-PIPELINE.md` / `AUDIT-SOURCES.md`) the lead assembled. **Phase 1 should split the
+    audit by scope at spawn time** (as the 2026-09-28 pass did), and **Phase 4's brief must
+    carry the standing "COMMIT FIRST if you may be near the limit" line** — it was already in
+    this RUN LOG from the matrix-harness pass and I omitted it from both builder briefs.
+  - **A timed-out builder's work is usually intact, and `git apply` from its worktree beats
+    re-implementing it.** Recipe that worked: `git -C <worktree> diff <base>..HEAD -- <paths>
+    > /tmp/patch`, then `git apply --check` in MAIN (confirmed clean **over** the prior pass's
+    uncommitted work), then `git apply`. Same lesson as the 2026-10-01 "untracked files look
+    deleted" note, one level up: **`git diff` against a dirty tree needs `--check`, not
+    eyeballing.**
+  - **MAIN's inherited dirt is part of the merge contract — check it in Phase 1, before
+    spawning any worktree teammate.** This pass inherited ~2000 lines uncommitted from the
+    2026-10-04/05 pass (the RUN LOG said so). `team_merge` refused outright (`local changes to
+    the same files: kraken_trading_bot/rl/data.py`), and a worktree teammate branches from the
+    last **commit** — so the builders saw a tree the audit never read. Committing the inherited
+    work as its own `chore:` commit, with the two known pre-existing failures named in the
+    message, was the only unblocking move.
+  - **Two "green control" tests read live gitignored artifacts and had drifted — neither was a
+    code bug.** `test_the_real_log_is_the_green_control` asserted the live depth log had zero
+    gaps; it had a real missing hour (`2026-10-05T14:00`). Fixed by asserting what the log
+    actually is (`n_gaps >= 1`, `ok is False`, still `short_pattern is False`) plus a
+    `pytest.skip` when absent — not by deleting the test or healing the log. **A test whose
+    subject is a live file must skip when that file is absent.**
+  - **`audit-findings` breaks on EVERY pass that rewrites `DECISION.md`, and the remedy is a
+    carry-forward table, not a guard change.** The guard binds each `F<n>` in `VALIDATION.md` §8
+    to a mention in `DECISION.md`, so a DECISION rewrite drops all 16 dispositions and reds the
+    suite. The fix is the one the code itself documents (`audit_checks.py:822`): **carry the
+    pinned table forward verbatim.** Phase 3's brief should say so — every pass rewrites both
+    files. The pin held throughout (16/16 rows, non-vacuous).
+  - **A channel-count assertion is a deliberate tripwire; adding a channel MUST trip it.** Four
+    guards failed the instant `_SIGNAL_CHANNELS` grew a 4th entry, each naming its own
+    move-together contract. That is the mechanism working. **When adding a signal channel,
+    update the channel-name pins and the "no-consume" seam pins in the same commit.** One
+    (`test_the_feature_seam_is_unchanged_on_disk`, "§8.1.4 forbids touching the feature seam")
+    was a **prior pass's deliberate scope pin** my change legitimately supersedes — that needed a
+    written supersede note, not deletion.
+  - **Null-by-default was forced by test cost and is right anyway.** Enabling
+    `orderbook_features_file` (matching the other three channels) would have meant nulling the
+    key in **nine** test helpers plus a config-comment rewrite. DECISION §6's wording ("shipped
+    default config **plus** a non-null …") already implied opt-in, and the depth series is
+    forward-only. **A forward-only channel ships off by default; do not buy symmetry with the
+    others.**
+  - **`merge_extra_features` mutates its input `df` in place** (`data.py:988`), so any
+    channel-on-vs-off comparison sharing a frame reads the test arm's columns on BOTH arms — the
+    reviewer's first draft produced a false NEEDS_FIX (52 features, `order_book_imbalance`
+    "present" in the control). **Fresh frame per arm, control first.** Pre-existing; recorded in
+    VALIDATION §2.4. proposal: return `df.copy()` so future comparisons are correct by
+    construction — one function, a good Phase 7 slice.
+  - proposal: give `tools/width_check.py` `--derived` / signal-key flags so a channel comparison
+    never hand-rolls the `FeaturePipeline` route again — the reviewer rebuilt it to write the
+    consumed proof.
+  - Efficiency: the run cost **three builder timeouts plus a re-spawn**, each a full multi-turn
+    cycle for a fraction of the work. Splitting the audit by scope at spawn time was the one
+    change that would have saved two of the three.
 
 ## Guardrails
 
